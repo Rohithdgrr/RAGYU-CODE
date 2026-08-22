@@ -87,6 +87,43 @@ pub(super) fn set_limit(arg: &str, app: &mut App) {
     }
 }
 
+pub(super) fn show_tools(arg: &str, app: &mut App) {
+    match arg.trim() {
+        "on" | "off" => {
+            let next = arg.trim() == "on";
+            if !next && app.tool_executor.is_none() {
+                err("tools are unavailable (no executor configured).");
+                return;
+            }
+            app.tools_enabled = next;
+            ok(&format!(
+                "function calling {}.",
+                if next { "enabled" } else { "disabled" }
+            ));
+        }
+        "" => {
+            if !app.tools_enabled {
+                err("function calling is off — '/tools on' to re-enable.");
+                return;
+            }
+            println!("function calling: on");
+            match &app.tool_executor {
+                Some(_) => {
+                    for tool in &app.tool_specs {
+                        println!(
+                            "  {} — {}",
+                            paint(&tool.name, Color::Green),
+                            tool.description
+                        );
+                    }
+                }
+                None => err("no tool executor configured."),
+            }
+        }
+        _ => println!("usage: /tools [on|off]   (currently shows the registry)"),
+    }
+}
+
 pub(super) fn print_history(app: &App) {
     let msgs = app.session.messages();
     if msgs.is_empty() {

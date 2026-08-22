@@ -4,6 +4,15 @@
 use crate::api::Tool;
 use crate::clock;
 use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
+
+/// Deserializes a tool call's raw arguments string into a typed struct.
+///
+/// Every executor should funnel arguments through this so malformed input
+/// surfaces as one consistent error instead of ad-hoc parsing per tool.
+pub fn parse_args<T: DeserializeOwned>(arguments_json: &str) -> Result<T> {
+    serde_json::from_str(arguments_json).context("malformed tool arguments (invalid JSON)")
+}
 
 /// Executes tool calls requested by the model.
 ///
@@ -53,21 +62,21 @@ impl ToolExecutor for BuiltinTools {
         match name {
             "current_time" => Ok(clock::now_iso8601()),
             "count_words" => {
-                let args: serde_json::Value = serde_json::from_str(arguments_json)
-                    .context("invalid JSON arguments for count_words")?;
-                let text = args
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .context("count_words requires a string 'text' argument")?;
+                let args: CountWordsArgs = parse_args(arguments_json)?;
                 Ok(format!(
                     "{{\"words\":{},\"characters\":{}}}",
-                    text.split_whitespace().count(),
-                    text.chars().count()
+                    args.text.split_whitespace().count(),
+                    args.text.chars().count()
                 ))
             }
             other => bail!("unknown tool '{other}'"),
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct CountWordsArgs {
+    text: String,
 }
 
 #[cfg(test)]

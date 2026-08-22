@@ -179,7 +179,11 @@ fn export_markdown(app: &App) -> String {
     for m in app.session.messages() {
         match m.role.as_str() {
             "user" => out.push_str(&format!("## You\n\n{}\n\n", m.content)),
-            "tool" => out.push_str(&format!("## Tool result\n\n{}\n\n", m.content)),
+            "tool" => out.push_str(&format!(
+                "## Tool result ({})\n\n{}\n\n",
+                m.tool_call_id.as_deref().unwrap_or("unknown id"),
+                m.content
+            )),
             _ => {
                 out.push_str("## Assistant\n\n");
                 if !m.content.is_empty() {

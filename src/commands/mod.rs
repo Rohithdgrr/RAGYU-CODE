@@ -1,6 +1,7 @@
 mod display;
 mod generation;
 mod persistence;
+mod todo;
 
 use crate::api;
 use crate::config::Config;
@@ -9,12 +10,13 @@ use crate::session::Session;
 use crate::tools::{BuiltinTools, ToolExecutor};
 use display::{
     print_history, search_history, set_limit, set_or_show_system, set_or_show_theme,
-    set_temperature, set_timeout, show_config, show_stats,
+    set_temperature, set_timeout, show_config, show_stats, show_tools,
 };
 use generation::{compact, generate_variants, models, pick_variant, retry, set_model};
 use persistence::{export, fork_session, list_named_sessions, load_session, save_session};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use todo::Todo;
 
 /// Shared mutable state for the REPL and command handlers.
 pub struct App {
@@ -34,6 +36,14 @@ pub struct App {
     pub pending_variants: Vec<String>,
     /// Executes model-requested tool calls (`None` disables function calling).
     pub tool_executor: Option<Box<dyn ToolExecutor>>,
+    /// Master switch for function calling (toggled via `/tools`); when off,
+    /// no tools are advertised and any calls a rogue server sends are ignored.
+    pub tools_enabled: bool,
+    /// Tool schemas built once at startup (JSON construction per request
+    /// would be pure waste — they never change mid-session).
+    pub tool_specs: Vec<crate::api::Tool>,
+    /// Session-scoped task list (`/todo`), persisted to `.govinda_todo.json`.
+    pub todos: Vec<Todo>,
 }
 
 #[derive(Default)]
@@ -60,6 +70,8 @@ impl App {
         session: Session,
         renderer: Renderer,
     ) -> Self {
+        let tool_executor: Option<Box<dyn ToolExecutor>> = Some(Box::new(BuiltinTools));
+        let tool_specs = tool_executor.as_ref().map_or_else(Vec::new, |e| e.specs());
         Self {
             read_timeout: api::default_read_timeout(),
             max_response_bytes: api::MAX_RESPONSE_BYTES,
@@ -67,7 +79,10 @@ impl App {
             session_name: None,
             stats: Stats::start(),
             pending_variants: Vec::new(),
-            tool_executor: Some(Box::new(BuiltinTools)),
+            tool_executor,
+            tools_enabled: true,
+            tool_specs,
+            todos: todo::load(),
             config,
             http,
             session,
@@ -92,16 +107,37 @@ pub enum Outcome {
     Resend(String),
 }
 
+impl std::fmt::Debug for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Handled => write!(f, "Handled"),
+            Outcome::Exit => write!(f, "Exit"),
+            Outcome::Resend(t) => write!(f, "Resend({t:?})"),
+        }
+    }
+}
+
+/// Splits a `/command rest` line; the command is lowercased so `/HELP`,
+/// `/Help` and `/help` all work. Returns `None` for non-commands and bare
+/// commands without arguments.
+fn split_command(line: &str) -> Option<(String, &str)> {
+    if !line.starts_with('/') {
+        return None;
+    }
+    let (cmd, rest) = line.split_once(char::is_whitespace)?;
+    Some((cmd.to_ascii_lowercase(), rest.trim()))
+}
+
 pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
-    let (cmd, rest) = match line.split_once(char::is_whitespace) {
-        Some((c, r)) => (c, r.trim()),
-        None => (line, ""),
+    let (cmd, rest) = match split_command(line) {
+        Some(pair) => pair,
+        None => (line.trim().to_ascii_lowercase(), ""),
     };
     // Any real turn invalidates un-picked variants.
-    if !matches!(cmd, "/pick" | "/variants") && !app.pending_variants.is_empty() {
+    if !matches!(cmd.as_str(), "/pick" | "/variants") && !app.pending_variants.is_empty() {
         app.pending_variants.clear();
     }
-    match cmd {
+    match cmd.as_str() {
         "/help" | "/?" => {
             help(app);
             Outcome::Handled
@@ -218,6 +254,14 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             set_timeout(rest, app);
             Outcome::Handled
         }
+        "/tools" => {
+            show_tools(rest, app);
+            Outcome::Handled
+        }
+        "/todo" => {
+            todo::handle(rest, app);
+            Outcome::Handled
+        }
         "/limit" => {
             set_limit(rest, app);
             Outcome::Handled
@@ -272,6 +316,8 @@ fn help(app: &App) {
          \x20 /raw               toggle markdown rendering vs live streaming\n\
          \x20 /timeout <secs>    per-request read-stall timeout (current: {}s)\n\
          \x20 /limit <mb>        response size cap in MB (current: {})\n\
+         \x20 /tools [on|off]    list tools the model may call, or toggle function calling (currently {})\n\
+         \x20 /todo [sub]        task list: list | add <text> | done <n> | undo <n> | rm <n> | clear\n\
          \x20 /config            show current settings",
         app.config.model,
         app.config.temperature,
@@ -279,6 +325,7 @@ fn help(app: &App) {
         app.config.context_tokens,
         app.read_timeout.as_secs(),
         app.max_response_bytes / (1024 * 1024),
+        if app.tools_enabled { "on" } else { "off" },
     );
 }
 
@@ -296,9 +343,99 @@ fn err(msg: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::{App, Outcome, dispatch, split_command};
     use crate::commands::display::parse_temperature;
     use crate::commands::persistence::safe_session_path;
+    use crate::config::Config;
+    use crate::provider;
+    use crate::render::Renderer;
+    use crate::session::Session;
     use std::path::PathBuf;
+    use zeroize::Zeroizing;
+
+    fn smoke_app() -> App {
+        let provider = provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
+        let config = Config {
+            api_key: Zeroizing::new(String::new()),
+            model: "test-model".to_owned(),
+            temperature: 0.5,
+            render_markdown: false,
+            system_prompt: "sys".to_owned(),
+            context_tokens: 2048,
+            provider,
+            source_path: None,
+        };
+        App::new(
+            config,
+            reqwest::Client::new(),
+            Session::new("sys"),
+            Renderer::new(false),
+        )
+    }
+
+    #[tokio::test]
+    async fn every_slash_command_dispatches_without_panic() {
+        // Fresh session keeps the network paths on early-return branches
+        // (/compact, /variants); /models and /model fail fast against an
+        // unstarted local Ollama and degrade gracefully.
+        let cases = [
+            "/help",
+            "/?",
+            "/clear",
+            "/history",
+            "/tokens",
+            "/stats",
+            "/config",
+            "/system",
+            "/system new prompt",
+            "/temp 0.3",
+            "/timeout 30",
+            "/limit 8",
+            "/raw",
+            "/theme mono",
+            "/theme nord",
+            "/tools",
+            "/tools off",
+            "/tools on",
+            "/todo",
+            "/todo add write more tests",
+            "/todo list",
+            "/search hi",
+            "/sessions",
+            "/undo",
+            "/retry",
+            "/pick",
+            "/fork",
+            "/save dispatch-smoke",
+            "/load definitely-missing-session",
+            "/export md",
+        ];
+        for cmd in cases {
+            let outcome = dispatch(cmd, &mut smoke_app()).await;
+            assert!(matches!(outcome, Outcome::Handled), "{cmd} -> {outcome:?}");
+        }
+        let _ = std::fs::remove_file("sessions/dispatch-smoke.json");
+    }
+
+    #[tokio::test]
+    async fn commands_are_case_insensitive() {
+        let mut app = smoke_app();
+        for cmd in ["/HELP", "/Help", "/STATS", "/Tokens", "/CLEAR"] {
+            let outcome = dispatch(cmd, &mut app).await;
+            assert!(matches!(outcome, Outcome::Handled), "{cmd} -> {outcome:?}");
+        }
+        assert!(matches!(dispatch("/EXIT", &mut app).await, Outcome::Exit));
+    }
+
+    #[test]
+    fn split_command_lowercases_and_splits() {
+        assert_eq!(
+            split_command("/HELP  write tests "),
+            Some(("/help".to_owned(), "write tests"))
+        );
+        assert_eq!(split_command("/exit"), None);
+        assert_eq!(split_command("hello world"), None);
+    }
 
     #[test]
     fn temperature_parses_and_clamps_range() {

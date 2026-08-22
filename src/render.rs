@@ -67,6 +67,46 @@ pub const THEMES: &[Theme] = &[
         err: Color::Red,
         dim: Color::DarkGrey,
     },
+    Theme {
+        name: "nord",
+        accent: Color::DarkBlue,
+        bot: Color::Cyan,
+        ok: Color::DarkGreen,
+        err: Color::Red,
+        dim: Color::Grey,
+    },
+    Theme {
+        name: "gruvbox",
+        accent: Color::Yellow,
+        bot: Color::DarkYellow,
+        ok: Color::Green,
+        err: Color::DarkRed,
+        dim: Color::DarkGrey,
+    },
+    Theme {
+        name: "tokyo-night",
+        accent: Color::Magenta,
+        bot: Color::Blue,
+        ok: Color::DarkGreen,
+        err: Color::Red,
+        dim: Color::DarkGrey,
+    },
+    Theme {
+        name: "catppuccin",
+        accent: Color::DarkMagenta,
+        bot: Color::Blue,
+        ok: Color::DarkGreen,
+        err: Color::DarkRed,
+        dim: Color::Grey,
+    },
+    Theme {
+        name: "rose",
+        accent: Color::DarkRed,
+        bot: Color::Magenta,
+        ok: Color::Green,
+        err: Color::Red,
+        dim: Color::DarkGrey,
+    },
 ];
 
 static THEME: RwLock<Theme> = RwLock::new(THEMES[0]);
@@ -80,9 +120,9 @@ fn theme_read() -> Theme {
     }
 }
 
-/// Sets the active theme by name; returns false when unknown.
+/// Sets the active theme by name (case-insensitive); returns false when unknown.
 pub fn set_theme(name: &str) -> bool {
-    match THEMES.iter().find(|t| t.name == name) {
+    match THEMES.iter().find(|t| t.name.eq_ignore_ascii_case(name)) {
         Some(t) => {
             *match THEME.write() {
                 Ok(mut g) => g,

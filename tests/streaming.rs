@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use govinda_cli::api::{ChatOptions, Message, Tool, ToolCall, stream_chat_at};
+use govinda_cli::api::{ChatOptions, Message, StreamSink, Tool, ToolCall, stream_chat_at};
 use std::sync::{Arc, Mutex};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SSE_BODY: &str = concat!(
@@ -19,24 +19,28 @@ fn chat_url(server: &MockServer) -> String {
     format!("{}/v1/chat/completions", server.uri())
 }
 
-#[tokio::test]
-async fn streams_deltas_and_accumulates_full_text() {
-    let server = MockServer::start().await;
+async fn mount_sse(server: &MockServer, body: &'static str) {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(SSE_BODY),
+                .set_body_string(body),
         )
-        .mount(&server)
+        .mount(server)
         .await;
+}
+
+#[tokio::test]
+async fn streams_deltas_and_accumulates_full_text() {
+    let server = MockServer::start().await;
+    mount_sse(&server, SSE_BODY).await;
 
     let http = reqwest::Client::new();
     let history = vec![Message::user("hi")];
     let mut out = String::new();
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
-    let sink = seen.clone();
+    let sink_seen = seen.clone();
 
     stream_chat_at(
         &http,
@@ -44,10 +48,9 @@ async fn streams_deltas_and_accumulates_full_text() {
         Some("k"),
         &opts("k"),
         &history,
-        &mut out,
-        &mut Vec::new(),
+        &mut StreamSink::new(&mut out, &mut Vec::new()),
         move |d| {
-            sink.lock().unwrap().push(d.to_owned());
+            sink_seen.lock().unwrap().push(d.to_owned());
         },
     )
     .await
@@ -69,15 +72,7 @@ async fn retries_transient_5xx_then_succeeds() {
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(SSE_BODY),
-        )
-        .mount(&server)
-        .await;
+    mount_sse(&server, SSE_BODY).await;
 
     let http = reqwest::Client::new();
     let history = vec![Message::user("hi")];
@@ -89,8 +84,7 @@ async fn retries_transient_5xx_then_succeeds() {
         Some("k"),
         &opts("k"),
         &history,
-        &mut out,
-        &mut Vec::new(),
+        &mut StreamSink::new(&mut out, &mut Vec::new()),
         |_| {},
     )
     .await
@@ -119,8 +113,7 @@ async fn auth_errors_fail_fast_without_retry() {
         Some("k"),
         &opts("k"),
         &history,
-        &mut out,
-        &mut Vec::new(),
+        &mut StreamSink::new(&mut out, &mut Vec::new()),
         |_| {},
     )
     .await;
@@ -140,15 +133,7 @@ async fn reassembles_tool_calls_from_fragments() {
     );
 
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(TOOL_BODY),
-        )
-        .mount(&server)
-        .await;
+    mount_sse(&server, TOOL_BODY).await;
 
     let http = reqwest::Client::new();
     let history = vec![Message::user("weather in Paris?")];
@@ -161,8 +146,7 @@ async fn reassembles_tool_calls_from_fragments() {
         Some("k"),
         &opts("k"),
         &history,
-        &mut out,
-        &mut tool_calls,
+        &mut StreamSink::new(&mut out, &mut tool_calls),
         |_| {},
     )
     .await
@@ -171,18 +155,12 @@ async fn reassembles_tool_calls_from_fragments() {
     assert_eq!(out, "");
     assert_eq!(
         tool_calls,
-        vec![ToolCall::new(
-            "call_1",
-            "weather",
-            r#"{"city": "Paris"}"#,
-        )]
+        vec![ToolCall::new("call_1", "weather", r#"{"city": "Paris"}"#)]
     );
 }
 
 #[tokio::test]
 async fn tools_are_sent_in_request_body_when_configured() {
-    use wiremock::matchers::body_partial_json;
-
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -218,8 +196,7 @@ async fn tools_are_sent_in_request_body_when_configured() {
         Some("k"),
         &o,
         &history,
-        &mut out,
-        &mut Vec::new(),
+        &mut StreamSink::new(&mut out, &mut Vec::new()),
         |_| {},
     )
     .await

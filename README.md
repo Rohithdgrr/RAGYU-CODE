@@ -5,6 +5,7 @@ A minimal, pure-Rust CLI chatbot with streaming responses, conversation memory, 
 ## Features
 
 - **Multi-provider** — one binary for any OpenAI-compatible backend (`provider = "ollama"` in the config and you're talking to localhost)
+- **Function calling** — the model can invoke locally executed tools (`current_time`, `count_words`); multi-round tool loops with parallel calls, streamed fragment reassembly, and hard caps on call count, argument size, and result size
 - **Token-aware context** — history is trimmed with a real BPE tokenizer against a configurable token budget
 - **Streaming + rendered output** — spinner while generating, then the answer is rendered as terminal markdown (or `/raw` for live token-by-token plain text)
 - **Concurrent variants** — `/variants 3` fires three parallel requests and races them
@@ -94,16 +95,33 @@ cargo run --release -- --resume work   # continue a saved session
 | `/fork [file]` | Snapshot the conversation without leaving it |
 | `/export md\|txt [file]` | Export the conversation as Markdown or plain text |
 | `/stats` | Session statistics (turns, avg latency, errors) |
-| `/theme <name>` | Color theme (`default`, `mono`, `dracula`, `solarized`, `ocean`) |
+| `/theme <name>` | Color theme (`default`, `mono`, `dracula`, `solarized`, `ocean`, `nord`, `gruvbox`, `tokyo-night`, `catppuccin`, `rose`) |
 | `/tokens` | Token usage vs the context budget (real BPE count) |
 | `/raw` | Toggle markdown rendering vs live streaming |
 | `/timeout <secs>` | Per-request read-stall timeout (1–600 s) |
 | `/limit <mb>` | Response size cap in MB (1–64) |
+| `/tools [on\|off]` | List tools the model may call, or toggle function calling |
+| `/todo [sub]` | Persistent task list: `list` · `add <text>` · `done <n>` · `undo <n>` · `rm <n>` · `clear` |
 | `/config` | Show current settings |
 
 Input line supports up/down history recall (persisted to `.govinda_history`) and standard editing keys.
 
 Sessions are saved with real ISO-8601 `created_at` / `updated_at` timestamps, and the current conversation is auto-saved on exit (named sessions keep their name; unnamed ones become `auto-<epoch>`).
+
+## Function calling
+
+Models that support OpenAI-style tools can call built-ins, which execute locally in the REPL:
+
+- `current_time` — the user's local date/time (ISO-8601)
+- `count_words` — word/character counts for a given text
+
+The agent loop runs up to 5 model↔tool rounds per turn: each requested call executes immediately (its invocation and truncated result print dimmed), results go back to the model as `role: "tool"` messages, and tool rounds move atomically in history (`/undo` never splits one). Safety rails:
+
+- `/tools off` stops advertising tools entirely — nothing can be invoked
+- at most 64 parallel calls per turn, 256 KB of arguments per call, 8 K chars per stored result
+- executor failures send only a sanitized error line back to the model
+
+New Rust tools plug in by implementing the `ToolExecutor` trait (`src/tools.rs`) and registering it on `App`.
 
 ## Development
 
@@ -121,4 +139,4 @@ cargo fmt --check
 
 ## Roadmap
 
-Function calling · file attachments/RAG · full-TUI mode · config-file writing (`/config save`)
+User-defined shell tools · file attachments/RAG · full-TUI mode · config-file writing (`/config save`)

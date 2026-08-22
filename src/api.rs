@@ -55,11 +55,16 @@ impl Message {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::with_role("assistant", content)
     }
-    /// Assistant turn that asks the model's caller to run tools.
-    pub fn assistant_with_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
+    /// Assistant turn that asks the model's caller to run tools. `content`
+    /// holds any prose the model streamed before requesting the calls —
+    /// dropping it would silently lose part of the answer.
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
         Self {
             role: "assistant".into(),
-            content: String::new(),
+            content: content.into(),
             tool_calls: Some(tool_calls),
             tool_call_id: None,
         }
@@ -170,6 +175,13 @@ pub struct SseParser {
     pending_tools: Vec<Option<PartialToolCall>>,
 }
 
+/// Hard cap on simultaneous tool-call slots. A hostile or broken server can
+/// send an arbitrary `index`; without a cap one SSE line could force a
+/// gigabyte-scale `Vec` allocation.
+const MAX_PARALLEL_TOOL_CALLS: usize = 64;
+/// Hard cap on buffered tool-call arguments across the whole stream.
+const MAX_TOOL_ARGUMENTS_BYTES: usize = 256 * 1024;
+
 #[derive(Default, Clone)]
 struct PartialToolCall {
     id: String,
@@ -241,7 +253,10 @@ impl SseParser {
             }
             if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
                 for frag in fragments {
-                    self.apply_tool_fragment(frag);
+                    match self.apply_tool_fragment(frag) {
+                        Ok(()) => {}
+                        Err(msg) => return vec![SseEvent::ApiError(msg)],
+                    }
                 }
             }
         }
@@ -253,8 +268,16 @@ impl SseParser {
         events
     }
 
-    fn apply_tool_fragment(&mut self, frag: &Value) {
+    /// Buffers one streamed `delta.tool_calls` fragment; `Err` aborts the
+    /// stream when a server limit would be exceeded.
+    fn apply_tool_fragment(&mut self, frag: &Value) -> Result<(), String> {
         let idx = frag["index"].as_u64().unwrap_or(0) as usize;
+        if idx >= MAX_PARALLEL_TOOL_CALLS {
+            return Err(format!(
+                "server sent tool call index {idx}, exceeding the {}-call limit",
+                MAX_PARALLEL_TOOL_CALLS
+            ));
+        }
         if self.pending_tools.len() <= idx {
             self.pending_tools.resize(idx + 1, None);
         }
@@ -271,7 +294,14 @@ impl SseParser {
         }
         if let Some(args) = frag["function"]["arguments"].as_str() {
             slot.arguments.push_str(args);
+            if slot.arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
+                return Err(format!(
+                    "tool-call arguments exceeded {} KB cap",
+                    MAX_TOOL_ARGUMENTS_BYTES / 1024
+                ));
+            }
         }
+        Ok(())
     }
 }
 
@@ -314,18 +344,33 @@ enum Attempt {
     },
 }
 
-/// Streams one chat completion from `provider`; appends deltas to `out` as
-/// they arrive and any requested tool calls to `tool_calls`.
+/// Caller-owned buffers a stream writes into.
 ///
-/// Because `out` is caller-owned and filled incrementally, text already shown
-/// survives any error — the REPL marks it "(interrupted)" instead of losing it.
+/// Because `out` is filled incrementally, text already shown survives any
+/// error — the REPL marks it "(interrupted)" instead of losing it.
+pub struct StreamSink<'a> {
+    pub out: &'a mut String,
+    pub tool_calls: &'a mut Vec<ToolCall>,
+}
+
+impl<'a> StreamSink<'a> {
+    pub fn new(out: &'a mut String, tool_calls: &'a mut Vec<ToolCall>) -> Self {
+        Self { out, tool_calls }
+    }
+
+    fn has_output(&self) -> bool {
+        !self.out.is_empty() || !self.tool_calls.is_empty()
+    }
+}
+
+/// Streams one chat completion from `provider`; appends deltas to
+/// `sink.out` as they arrive and any requested tool calls to `sink.tool_calls`.
 pub async fn stream_chat(
     http: &reqwest::Client,
     provider: &dyn Provider,
     opts: &ChatOptions<'_>,
     history: &[Message],
-    out: &mut String,
-    tool_calls: &mut Vec<ToolCall>,
+    sink: &mut StreamSink<'_>,
     on_delta: impl FnMut(&str),
 ) -> Result<()> {
     stream_chat_at(
@@ -334,22 +379,19 @@ pub async fn stream_chat(
         provider.auth().token(),
         opts,
         history,
-        out,
-        tool_calls,
+        sink,
         on_delta,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn stream_chat_at(
     http: &reqwest::Client,
     url: &str,
     bearer: Option<&str>,
     opts: &ChatOptions<'_>,
     history: &[Message],
-    out: &mut String,
-    tool_calls: &mut Vec<ToolCall>,
+    sink: &mut StreamSink<'_>,
     mut on_delta: impl FnMut(&str),
 ) -> Result<()> {
     let mut body = json!({
@@ -368,11 +410,11 @@ pub async fn stream_chat_at(
     for attempt in 1..=MAX_RETRIES {
         // Retries are only safe before anything has been emitted, otherwise we
         // would duplicate text the user already saw.
-        match attempt_once(http, url, bearer, &body, opts, out, tool_calls, &mut on_delta).await? {
+        match attempt_once(http, url, bearer, &body, opts, sink, &mut on_delta).await? {
             Attempt::Ok => return Ok(()),
             Attempt::Fatal(e) => return Err(e),
             Attempt::Retryable { error, retry_after } => {
-                if !out.is_empty() || !tool_calls.is_empty() || attempt == MAX_RETRIES {
+                if sink.has_output() || attempt == MAX_RETRIES {
                     return Err(error);
                 }
                 let wait = retry_after.unwrap_or(Duration::from_millis(500 * u64::from(attempt)));
@@ -387,15 +429,13 @@ pub async fn stream_chat_at(
     unreachable!("retry loop always returns within MAX_RETRIES iterations")
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn attempt_once(
     http: &reqwest::Client,
     url: &str,
     bearer: Option<&str>,
     body: &Value,
     opts: &ChatOptions<'_>,
-    out: &mut String,
-    tool_calls: &mut Vec<ToolCall>,
+    sink: &mut StreamSink<'_>,
     on_delta: &mut impl FnMut(&str),
 ) -> Result<Attempt> {
     let mut req = http.post(url).json(body);
@@ -454,16 +494,16 @@ async fn attempt_once(
         for event in parser.feed(&chunk) {
             match event {
                 SseEvent::Delta(text) => {
-                    if out.len() + text.len() > opts.max_response_bytes {
+                    if sink.out.len() + text.len() > opts.max_response_bytes {
                         return Ok(Attempt::Fatal(anyhow::anyhow!(
                             "response exceeded {} MB cap",
                             opts.max_response_bytes / (1024 * 1024)
                         )));
                     }
-                    out.push_str(&text);
+                    sink.out.push_str(&text);
                     on_delta(&text);
                 }
-                SseEvent::ToolCalls(calls) => tool_calls.extend(calls),
+                SseEvent::ToolCalls(calls) => sink.tool_calls.extend(calls),
                 SseEvent::Done => return Ok(Attempt::Ok),
                 SseEvent::ApiError(msg) => {
                     return Ok(Attempt::Fatal(anyhow::anyhow!("API error: {msg}")));
@@ -707,5 +747,53 @@ mod tests {
         let calls = tool_call_events(&events);
         assert_eq!(calls.len(), 1, "flushed on [DONE]: {calls:?}");
         assert_eq!(events.last(), Some(&SseEvent::Done));
+    }
+
+    #[test]
+    fn huge_tool_call_index_is_rejected_not_allocated() {
+        let mut p = SseParser::default();
+        let line = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":{},\"id\":\"x\",\"function\":{{\"name\":\"t\",\"arguments\":\"{{}}\"}}}}]}}}}]}}\n",
+            u64::from(u32::MAX)
+        );
+        let events = p.feed(line.as_bytes());
+        assert!(
+            matches!(events.as_slice(), [SseEvent::ApiError(msg)] if msg.contains("limit")),
+            "expected index-cap error, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn runaway_tool_arguments_are_capped() {
+        let mut p = SseParser::default();
+        // First fragment starts a call; the second pushes it over the cap.
+        let start = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"t\",\"arguments\":\"\"}}]}}]}\n";
+        let events = p.feed(start);
+        assert!(events.is_empty());
+        let chunk = "a".repeat(4096);
+        let mut last = Vec::new();
+        for _ in 0..128 {
+            let line = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"{chunk}\"}}}}]}}}}]}}\n"
+            );
+            last = p.feed(line.as_bytes());
+        }
+        assert!(
+            matches!(last.as_slice(), [SseEvent::ApiError(msg)] if msg.contains("cap")),
+            "expected arguments-cap error, got {} events",
+            last.len()
+        );
+    }
+
+    #[test]
+    fn assistant_with_prose_keeps_content_alongside_calls() {
+        let call = ToolCall::new("c", "f", "{}");
+        let m = Message::assistant_with_tool_calls("thinking aloud", vec![call]);
+        assert_eq!(m.content, "thinking aloud");
+        assert!(m.has_tool_calls());
+        // Serializes with content intact and no tool_call_id.
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["content"], "thinking aloud");
+        assert!(v.get("tool_call_id").is_none());
     }
 }

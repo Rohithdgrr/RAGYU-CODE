@@ -105,6 +105,19 @@ pub(super) fn retry(app: &mut App) -> Option<String> {
     Some(text)
 }
 
+/// Builds the summarizer context: system instruction + full history + a
+/// trailing user turn. Providers (e.g. Mistral) reject requests whose last
+/// message is an assistant turn, which is how histories typically end.
+fn compact_context(history: &[api::Message]) -> Vec<api::Message> {
+    let mut ctx = vec![api::Message::system(
+        "Summarize this conversation into a compact factual brief. \
+         Preserve key decisions, facts and open questions. Reply with the summary only.",
+    )];
+    ctx.extend(history.iter().cloned());
+    ctx.push(api::Message::user("Summarize the conversation above now."));
+    ctx
+}
+
 /// Folds the whole history into a single assistant summary via the API.
 pub(super) async fn compact(app: &mut App) {
     if app.session.messages().len() < 2 {
@@ -112,11 +125,7 @@ pub(super) async fn compact(app: &mut App) {
         return;
     }
     dim("summarizing conversation…");
-    let mut ctx = vec![api::Message::system(
-        "Summarize this conversation into a compact factual brief. \
-         Preserve key decisions, facts and open questions. Reply with the summary only.",
-    )];
-    ctx.extend(app.session.messages().iter().cloned());
+    let ctx = compact_context(app.session.messages());
     let auth = app.config.provider.auth();
     let opts = api::ChatOptions {
         max_response_bytes: app.max_response_bytes,
@@ -124,13 +133,14 @@ pub(super) async fn compact(app: &mut App) {
         ..api::ChatOptions::new(auth.token(), &app.config.model, app.config.temperature)
     };
     let mut out = String::new();
+    let mut no_calls = Vec::new();
+    let mut sink = api::StreamSink::new(&mut out, &mut no_calls);
     match api::stream_chat(
         &app.http,
         app.config.provider.as_ref(),
         &opts,
         &ctx,
-        &mut out,
-        &mut Vec::new(),
+        &mut sink,
         |_| {},
     )
     .await
@@ -202,7 +212,9 @@ pub(super) async fn generate_variants(arg: &str, app: &mut App) {
         let ctx = ctx.clone();
         async move {
             let mut out = String::new();
-            api::stream_chat(&http, provider.as_ref(), &opts, &ctx, &mut out, &mut Vec::new(), |_| {})
+            let mut no_calls = Vec::new();
+            let mut sink = api::StreamSink::new(&mut out, &mut no_calls);
+            api::stream_chat(&http, provider.as_ref(), &opts, &ctx, &mut sink, |_| {})
                 .await
                 .map(|_| out)
         }
@@ -259,5 +271,29 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
     } else {
         let cut: String = s.chars().take(max_chars).collect();
         format!("{cut}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_context_always_ends_on_a_user_turn() {
+        // Real histories typically end with an assistant reply; Mistral
+        // rejects summarization requests whose last role is assistant.
+        let history = vec![
+            api::Message::user("q"),
+            api::Message::assistant("a"),
+            api::Message::assistant_with_tool_calls(
+                "",
+                vec![crate::api::ToolCall::new("c", "f", "{}")],
+            ),
+            api::Message::tool("c", "result"),
+        ];
+        let ctx = compact_context(&history);
+        assert!(matches!(ctx.last(), Some(m) if m.role == "user"));
+        assert_eq!(ctx.first().map(|m| m.role.as_str()), Some("system"));
+        assert_eq!(ctx.len(), history.len() + 2);
     }
 }

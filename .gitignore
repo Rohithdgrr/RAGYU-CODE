@@ -2,3 +2,4 @@
 .env
 sessions/
 .govinda_history
+.govinda_todo.json

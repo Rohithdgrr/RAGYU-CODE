@@ -223,103 +223,145 @@ async fn handle_line(line: &str, app: &mut App) -> Result<bool> {
 /// Upper bound on model↔tool round trips per user turn, so a confused model
 /// can never loop forever.
 const MAX_TOOL_ROUNDS: usize = 5;
+/// Cap on a single tool result stored in history (display truncation is
+/// separate); a huge result would otherwise wreck the context budget.
+const MAX_TOOL_RESULT_CHARS: usize = 8 * 1024;
+/// Characters of a tool result shown on screen.
+const TOOL_RESULT_DISPLAY_CHARS: usize = 200;
 
 async fn run_turn(app: &mut App, input: &str) {
     app.session.push_user(input);
     let raw = !app.renderer.markdown_enabled();
+    let mut rounds_elapsed = std::time::Duration::ZERO;
 
     for _round in 0..MAX_TOOL_ROUNDS {
         let history = app.session.window(app.config.context_tokens);
         let auth = app.config.provider.auth();
-        let tools = app
-            .tool_executor
-            .as_ref()
-            .map_or_else(Vec::new, |t| t.specs());
-        let opts = ChatOptions {
-            max_response_bytes: app.max_response_bytes,
-            read_timeout: app.read_timeout,
-            tools,
-            ..ChatOptions::new(
-                auth.token(),
-                app.config.model.as_str(),
-                app.config.temperature,
-            )
-        };
-
-        let spinner = Spinner::start("thinking…", !raw);
-        let mut out = String::new();
-        let mut tool_calls = Vec::new();
+        let opts = chat_options(app, &auth);
         let started = Instant::now();
         // Everything the session held before this stream attempt; an error
         // with nothing emitted rolls back to exactly this state.
         let resume_len = app.session.messages().len();
-
-        let result = {
-            let http = &app.http;
-            let provider = app.config.provider.clone();
-            tokio::select! {
-                res = api::stream_chat(http, provider.as_ref(), &opts, &history, &mut out, &mut tool_calls, |delta| {
-                    if raw {
-                        print!("{delta}");
-                        let _ = std::io::stdout().flush();
-                    }
-                }) => res,
-                _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("interrupted")),
-            }
-        };
-        spinner.stop().await;
+        let (result, out, tool_calls) = stream_round(app, &history, &opts).await;
+        rounds_elapsed += started.elapsed();
 
         match result {
-            Ok(()) if !tool_calls.is_empty() => {
-                app.record_turn(started.elapsed());
-                run_tool_round(app, &tool_calls);
+            Ok(()) if !tool_calls.is_empty() && app.tools_enabled => {
+                show_round_prose(app, raw, &out);
+                run_tool_round(app, &out, &tool_calls);
                 continue; // stream again so the model sees the results
             }
-            Ok(()) => break_final_answer(app, raw, started, out),
-            Err(e) => {
-                app.record_error();
-                println!();
-                if !out.is_empty() {
-                    // Keep what was already generated; mark it clearly.
-                    let kept = format!("{out}\n\n*(interrupted)*");
-                    app.session.push_assistant(kept.clone());
-                    if raw {
-                        println!("{out}");
-                    } else {
-                        app.renderer.render_answer(&kept);
-                    }
-                    eprintln!(
-                        "{}",
-                        paint(format!("error: {e:#}"), govinda_cli::render::err_color())
-                    );
-                } else {
-                    // Roll back to the pre-round state, then drop the trailing
-                    // user prompt (only present before any tool rounds ran).
-                    app.session.truncate_messages(resume_len);
-                    app.session.pop_user();
-                    eprintln!(
-                        "{}",
-                        paint(format!("error: {e:#}"), govinda_cli::render::err_color())
-                    );
-                }
+            Ok(()) => {
+                finish_text_answer(app, raw, out);
+                show_timeline(app, rounds_elapsed);
+                app.record_turn(rounds_elapsed);
             }
+            Err(e) => handle_round_error(app, raw, out, resume_len, e),
         }
         return;
     }
+    app.record_turn(rounds_elapsed);
+    show_timeline(app, rounds_elapsed);
     println!(
         "{}",
         paint(
-            format!(
-                "stopped after {MAX_TOOL_ROUNDS} tool rounds — ask again to continue."
-            ),
+            format!("stopped after {MAX_TOOL_ROUNDS} tool rounds — ask again to continue."),
             govinda_cli::render::dim_color()
         )
     );
 }
 
-/// Executes each requested call locally and commits the assistant tool-call
-/// message plus one `tool` result per call to the session.
-fn run_tool_round(app: &mut App, calls: &[api::ToolCall]) {
+/// Per-request options from current settings; tool schemas come from the
+/// specs cached at startup.
+fn chat_options<'a>(app: &'a App, auth: &'a govinda_cli::provider::Auth) -> ChatOptions<'a> {
+    ChatOptions {
+        max_response_bytes: app.max_response_bytes,
+        read_timeout: app.read_timeout,
+        tools: if app.tools_enabled {
+            app.tool_specs.clone()
+        } else {
+            Vec::new()
+        },
+        ..ChatOptions::new(
+            auth.token(),
+            app.config.model.as_str(),
+            app.config.temperature,
+        )
+    }
+}
+
+/// One stream attempt (spinner + Ctrl+C race included). Nothing is committed
+/// here; the caller decides what survives.
+async fn stream_round(
+    app: &App,
+    history: &[api::Message],
+    opts: &ChatOptions<'_>,
+) -> (anyhow::Result<()>, String, Vec<api::ToolCall>) {
+    let raw = !app.renderer.markdown_enabled();
+    let mut out = String::new();
+    let mut tool_calls = Vec::new();
+
+    let spinner = Spinner::start("thinking…", !raw);
+    let result = {
+        let http = &app.http;
+        let provider = app.config.provider.clone();
+        let mut sink = api::StreamSink::new(&mut out, &mut tool_calls);
+        tokio::select! {
+            res = api::stream_chat(http, provider.as_ref(), opts, history, &mut sink, |delta| {
+                if raw {
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                }
+            }) => res,
+            _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("interrupted")),
+        }
+    };
+    spinner.stop().await;
+    (result, out, tool_calls)
+}
+
+/// Shows prose the model streamed before requesting tool calls. Raw mode has
+/// already printed it live — only the separator is added there.
+fn show_round_prose(app: &App, raw: bool, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    println!();
+    if !raw {
+        app.renderer.render_answer(text);
+    }
+}
+
+/// Error policy for one failed round: keep any partially generated answer
+/// (marked interrupted), or roll the session back to the pre-round state.
+fn handle_round_error(app: &mut App, raw: bool, out: String, resume_len: usize, e: anyhow::Error) {
+    app.record_error();
+    println!();
+    let err_paint = || paint(format!("error: {e:#}"), govinda_cli::render::err_color());
+    if !out.is_empty() {
+        // Keep what was already generated; mark it clearly. Raw mode has
+        // already streamed the text live, so only markdown re-renders.
+        let kept = format!("{out}\n\n*(interrupted)*");
+        app.session.push_assistant(kept.clone());
+        if !raw {
+            app.renderer.render_answer(&kept);
+        }
+        eprintln!("{}", err_paint());
+    } else {
+        // Roll back, then drop the trailing user prompt (only present
+        // before any tool rounds ran).
+        app.session.truncate_messages(resume_len);
+        app.session.pop_user();
+        eprintln!("{}", err_paint());
+    }
+}
+
+/// Executes each requested call locally and commits the assistant turn
+/// (prose included) plus one `tool` result per call to the session.
+///
+/// The model only ever sees a sanitized failure line; the detailed error
+/// chain is printed locally so it never leaks file paths or internals.
+fn run_tool_round(app: &mut App, prose: &str, calls: &[api::ToolCall]) {
     for call in calls {
         println!(
             "{}",
@@ -329,29 +371,54 @@ fn run_tool_round(app: &mut App, calls: &[api::ToolCall]) {
             )
         );
     }
-    app.session.push_tool_calls(calls.to_vec());
+    let mut results = Vec::with_capacity(calls.len());
     for call in calls {
         let outcome = match app.tool_executor.as_ref() {
             Some(executor) => executor.execute(&call.function.name, &call.function.arguments),
             None => Err(anyhow::anyhow!("no tool executor configured")),
         };
-        let output = match outcome {
-            Ok(value) => value,
-            Err(e) => format!("error: {e:#}"),
-        };
-        println!(
-            "{}",
-            paint(
-                format!("← {}", truncate_line(&output, 200)),
-                govinda_cli::render::dim_color()
-            )
-        );
-        app.session.push_tool_result(call.id.clone(), output);
+        match outcome {
+            Ok(value) => {
+                println!(
+                    "{}",
+                    paint(
+                        format!("← {}", truncate_line(&value, TOOL_RESULT_DISPLAY_CHARS)),
+                        govinda_cli::render::dim_color()
+                    )
+                );
+                results.push((call.id.clone(), truncate_result(&value)));
+            }
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    paint(
+                        format!("tool '{}' failed: {e:#}", call.function.name),
+                        govinda_cli::render::err_color()
+                    )
+                );
+                results.push((
+                    call.id.clone(),
+                    format!("error: tool '{}' failed", call.function.name),
+                ));
+            }
+        }
     }
+    app.session.commit_tool_round(prose, calls, &results);
 }
 
-fn break_final_answer(app: &mut App, raw: bool, started: Instant, out: String) {
-    app.record_turn(started.elapsed());
+/// Dimmed footer printed after every completed answer: model, wall time,
+/// and how many agent rounds it took — a mini timeline for the turn.
+fn show_timeline(app: &App, elapsed: std::time::Duration) {
+    println!(
+        "{}",
+        paint(
+            format!("── {} · {:.1}s", app.config.model, elapsed.as_secs_f32()),
+            govinda_cli::render::dim_color()
+        )
+    );
+}
+
+fn finish_text_answer(app: &mut App, raw: bool, out: String) {
     if out.trim().is_empty() {
         println!(
             "{}",
@@ -375,5 +442,15 @@ fn truncate_line(s: &str, max_chars: usize) -> String {
     } else {
         let cut: String = first.chars().take(max_chars).collect();
         format!("{cut}…")
+    }
+}
+
+/// Cap applied *before* a tool result enters the session history.
+fn truncate_result(s: &str) -> String {
+    if s.chars().count() <= MAX_TOOL_RESULT_CHARS {
+        s.to_owned()
+    } else {
+        let cut: String = s.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+        format!("{cut}\n…(truncated)")
     }
 }

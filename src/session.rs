@@ -52,9 +52,30 @@ impl Session {
         self.messages.push(Message::assistant(content));
     }
 
-    /// Commits an assistant turn that requests tool executions.
-    pub fn push_tool_calls(&mut self, calls: Vec<crate::api::ToolCall>) {
-        self.messages.push(Message::assistant_with_tool_calls(calls));
+    /// Commits an assistant turn that requests tool executions. `content`
+    /// holds any prose the model streamed before requesting the calls.
+    pub fn push_tool_calls(
+        &mut self,
+        content: impl Into<String>,
+        calls: Vec<crate::api::ToolCall>,
+    ) {
+        self.messages
+            .push(Message::assistant_with_tool_calls(content, calls));
+    }
+
+    /// Commits one finished tool round atomically: the assistant prose +
+    /// tool-call message, then each executed result paired to its call id.
+    /// Results are `(tool_call_id, output)` pairs.
+    pub fn commit_tool_round(
+        &mut self,
+        content: &str,
+        calls: &[crate::api::ToolCall],
+        results: &[(String, String)],
+    ) {
+        self.push_tool_calls(content, calls.to_vec());
+        for (id, output) in results {
+            self.push_tool_result(id.clone(), output.clone());
+        }
     }
 
     /// Appends one executed tool result (paired to its call via id).
@@ -335,8 +356,7 @@ mod tests {
     fn undo_removes_whole_tool_round() {
         let mut s = sample();
         let call = crate::api::ToolCall::new("c1", "lookup", "{}");
-        s.push_tool_calls(vec![call.clone()]);
-        s.push_tool_result("c1", "result");
+        s.commit_tool_round("", &[call], &[("c1".to_owned(), "result".to_owned())]);
         // The tool round + the user prompt that triggered it vanish together.
         assert!(s.undo());
         assert_eq!(s.messages().len(), 6);
