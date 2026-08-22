@@ -64,7 +64,7 @@ async fn followup_request_carries_committed_tool_result() {
         .await;
 
     let http = reqwest::Client::new();
-    let executor = BuiltinTools;
+    let executor = BuiltinTools::default();
     let mut session = Session::new("sys");
     session.push_user("what time is it?");
 
@@ -90,15 +90,14 @@ async fn followup_request_carries_committed_tool_result() {
 
     // Commit exactly like the REPL's run_tool_round does.
     assert_eq!(session.messages().len(), 1);
-    let results: Vec<(String, String)> = tool_calls
-        .iter()
-        .map(|c| {
-            let output = executor
-                .execute(&c.function.name, &c.function.arguments)
-                .unwrap();
-            (c.id.clone(), output)
-        })
-        .collect();
+    let mut results: Vec<(String, String)> = Vec::new();
+    for c in &tool_calls {
+        let output = executor
+            .execute(&c.function.name, &c.function.arguments)
+            .await
+            .expect("tool execution should succeed");
+        results.push((c.id.clone(), output));
+    }
     session.commit_tool_round(&out, &tool_calls, &results);
 
     // Round 2: the server matcher above fails the test unless the request

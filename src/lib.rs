@@ -4,6 +4,7 @@
 pub mod api;
 pub mod clock;
 pub mod commands;
+pub mod completions;
 pub mod config;
 pub mod provider;
 pub mod render;

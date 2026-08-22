@@ -3,6 +3,7 @@ use crate::clock;
 use crate::render::{accent, paint};
 use crate::session::Session;
 use crate::sessions;
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 /// Rejects absolute paths and any `..` component, then anchors relative paths
@@ -215,4 +216,146 @@ fn export_text(app: &App) -> String {
         out.push_str(&format!("{label}: {}\n\n", m.content));
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// /config save — persist runtime settings back into config.toml
+// ---------------------------------------------------------------------------
+
+/// Runtime values worth persisting; split out from file I/O so the merge is
+/// unit-testable.
+pub(super) struct RuntimeSnapshot {
+    pub model: String,
+    pub temperature: f32,
+    pub system_prompt: String,
+    pub render_markdown: bool,
+    pub theme: String,
+    pub timeout_secs: u64,
+    pub limit_mb: u64,
+}
+
+impl RuntimeSnapshot {
+    pub fn from_app(app: &App) -> Self {
+        Self {
+            model: app.config.model.clone(),
+            temperature: app.config.temperature,
+            system_prompt: app.session.system().to_owned(),
+            render_markdown: app.renderer.markdown_enabled(),
+            theme: crate::render::active_theme().name.to_owned(),
+            timeout_secs: app.read_timeout.as_secs(),
+            limit_mb: (app.max_response_bytes / (1024 * 1024)) as u64,
+        }
+    }
+}
+
+/// Updates the keys Govinda owns inside an existing TOML table, leaving every
+/// other key (including `[[tools]]` blocks) untouched.
+fn merge_snapshot(table: &mut toml::Table, s: &RuntimeSnapshot) {
+    table.insert("model".into(), toml::Value::from(s.model.clone()));
+    table.insert("temperature".into(), toml::Value::from(s.temperature));
+    table.insert(
+        "system_prompt".into(),
+        toml::Value::from(s.system_prompt.clone()),
+    );
+    table.insert(
+        "render_markdown".into(),
+        toml::Value::from(s.render_markdown),
+    );
+    table.insert("theme".into(), toml::Value::from(s.theme.clone()));
+    table.insert(
+        "timeout_secs".into(),
+        toml::Value::from(s.timeout_secs as i64),
+    );
+    table.insert("limit_mb".into(), toml::Value::from(s.limit_mb as i64));
+}
+
+/// Resolves where `/config save` writes: `GOVINDA_CONFIG` > the file that was
+/// loaded > the default location.
+fn save_target_path(app: &App) -> anyhow::Result<PathBuf> {
+    if let Some(p) = std::env::var_os("GOVINDA_CONFIG") {
+        return Ok(PathBuf::from(p));
+    }
+    if let Some(p) = &app.config.source_path {
+        return Ok(p.clone());
+    }
+    crate::config::default_config_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine a config path (no HOME set?)"))
+}
+
+/// Writes current runtime settings to config.toml. The existing file is
+/// parsed generically and re-serialized, so unknown keys survive.
+pub(super) fn save_runtime_config(app: &App) -> anyhow::Result<PathBuf> {
+    let path = save_target_path(app)?;
+    let mut table: toml::Table = match std::fs::read_to_string(&path) {
+        Ok(raw) => {
+            toml::from_str(&raw).with_context(|| format!("cannot parse {}", path.display()))?
+        }
+        Err(_) => toml::Table::new(),
+    };
+    let snapshot = RuntimeSnapshot::from_app(app);
+    merge_snapshot(&mut table, &snapshot);
+    std::fs::write(&path, toml::to_string_pretty(&table)?)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod save_config_tests {
+    use super::*;
+
+    #[test]
+    fn merge_updates_owned_keys_only() {
+        let mut table: toml::Table = toml::from_str(
+            r#"
+model = "old-model"
+temperature = 0.9
+custom_key = "keep me"
+
+[[tools]]
+name = "gh_pr"
+description = "d"
+command = "gh"
+args_template = ["pr", "list"]
+"#,
+        )
+        .unwrap();
+        let snapshot = RuntimeSnapshot {
+            model: "new-model".into(),
+            temperature: 0.2,
+            system_prompt: "be brief".into(),
+            render_markdown: false,
+            theme: "dracula".into(),
+            timeout_secs: 45,
+            limit_mb: 8,
+        };
+        merge_snapshot(&mut table, &snapshot);
+        let out = toml::to_string_pretty(&table).unwrap();
+
+        assert!(out.contains("model = \"new-model\""), "{out}");
+        assert!(out.contains("temperature = 0.2"), "{out}");
+        assert!(out.contains("theme = \"dracula\""), "{out}");
+        assert!(out.contains("timeout_secs = 45"), "{out}");
+        assert!(out.contains("limit_mb = 8"), "{out}");
+        // unknown keys and [[tools]] survive the round-trip
+        assert!(out.contains("custom_key = \"keep me\""), "{out}");
+        assert!(out.contains("[[tools]]"), "{out}");
+        assert!(out.contains("name = \"gh_pr\""), "{out}");
+    }
+
+    #[test]
+    fn merge_into_empty_table_yields_valid_config() {
+        let mut table = toml::Table::new();
+        let snapshot = RuntimeSnapshot {
+            model: "m".into(),
+            temperature: 0.5,
+            system_prompt: "s".into(),
+            render_markdown: true,
+            theme: "default".into(),
+            timeout_secs: 30,
+            limit_mb: 16,
+        };
+        merge_snapshot(&mut table, &snapshot);
+        let out = toml::to_string_pretty(&table).unwrap();
+        crate::config::parse_file_config_for_test(&out).expect("saved config should load cleanly");
+    }
 }
