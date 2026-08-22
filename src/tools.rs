@@ -49,13 +49,14 @@ const MAX_SHELL_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Largest single argument value accepted from the model, in characters.
 const MAX_ARG_VALUE_CHARS: usize = 8 * 1024;
 /// Names reserved by built-in implementations; user tools cannot shadow them.
-const BUILTIN_TOOL_NAMES: [&str; 6] = [
+const BUILTIN_TOOL_NAMES: [&str; 7] = [
     "current_time",
     "count_words",
     "read_file",
     "write_file",
     "list_files",
     "grep",
+    "scan_project",
 ];
 /// `{placeholder}` tokens inside shell-tool `args_template` words.
 #[allow(clippy::expect_used)] // static, hand-checked patterns
@@ -145,14 +146,17 @@ impl ToolExecutor for BuiltinTools {
             ),
             Tool::new(
                 "read_file",
-                "Reads a text file from the workspace with line numbers. Workspace-relative \
-                 paths only; absolute paths and '..' are rejected.",
+                "Reads a text file from the workspace with line numbers. For source files it \
+                 first returns a symbol outline (functions, types, imports) computed from the \
+                 whole file, so partial reads stay navigable. Workspace-relative paths only; \
+                 absolute paths and '..' are rejected.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "Workspace-relative file path"},
                         "offset_line": {"type": "integer", "description": "1-based first line to return (default 1)"},
-                        "max_lines": {"type": "integer", "description": "Maximum lines to return (default 2000)"}
+                        "max_lines": {"type": "integer", "description": "Maximum lines to return (default 2000)"},
+                        "include_outline": {"type": "boolean", "description": "Prepend a symbol outline for source files (default true)"}
                     },
                     "required": ["path"],
                     "additionalProperties": false
@@ -196,6 +200,16 @@ impl ToolExecutor for BuiltinTools {
                         "max_matches": {"type": "integer", "description": "Maximum matches to return (default 50)"}
                     },
                     "required": ["pattern"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "scan_project",
+                "Builds a structured overview of the workspace: project types, entry points, \
+                 dependencies, file statistics, and git branch/status. Read-only.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
                     "additionalProperties": false
                 }),
             ),
@@ -250,6 +264,11 @@ impl ToolExecutor for BuiltinTools {
                     let args: GrepArgs = parse_args(arguments_json)?;
                     grep(&cwd, &args)
                 }
+                "scan_project" => {
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    Ok(crate::scan::scan(&cwd).await)
+                }
                 other => match self.shell_tools.iter().find(|t| t.name == other) {
                     Some(def) => run_shell_tool(def, arguments_json).await,
                     None => bail!("unknown tool '{other}'"),
@@ -269,6 +288,9 @@ struct ReadFileArgs {
     path: String,
     offset_line: Option<usize>,
     max_lines: Option<usize>,
+    /// Prepend a symbol/import outline (computed from the whole file, so it
+    /// stays useful when only a line range is returned). Default: true.
+    include_outline: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -535,8 +557,20 @@ fn display_rel(base: &Path, p: &Path) -> String {
         .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"))
 }
 
-/// Collects files up to `depth` levels below `root`, skipping build dirs.
-fn walk_files(root: &Path) -> Vec<PathBuf> {
+/// Collects files up to `MAX_WALK_DEPTH` levels below `root`, skipping build
+/// dirs and anything excluded by `.govindaignore`. `base` is the workspace
+/// root that relative paths (and the ignore file itself) resolve against.
+pub(crate) fn walk_files(base: &Path, root: &Path) -> Vec<PathBuf> {
+    let ignore = crate::ignore::IgnoreRules::load(base);
+    // `display_rel` normalizes separators to '/', so basenames split on '/'.
+    let excluded = |path: &Path, is_dir: bool| -> bool {
+        let rel = display_rel(base, path);
+        if is_dir && SKIP_DIRS.contains(&rel.rsplit('/').next().unwrap_or(&rel)) {
+            return true;
+        }
+        ignore.matches(&rel, is_dir)
+    };
+
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
@@ -553,11 +587,11 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
                 break;
             }
             let Ok(ft) = entry.file_type() else { continue };
-            let name = entry.file_name().to_string_lossy().to_string();
+            if excluded(&entry.path(), ft.is_dir()) {
+                continue;
+            }
             if ft.is_dir() {
-                if !SKIP_DIRS.contains(&name.as_str()) {
-                    stack.push((entry.path(), depth + 1));
-                }
+                stack.push((entry.path(), depth + 1));
             } else if ft.is_file() {
                 out.push(entry.path());
             }
@@ -590,6 +624,20 @@ fn read_file(base: &Path, args: &ReadFileArgs) -> Result<String> {
     let text = String::from_utf8_lossy(&bytes);
     let total_lines = text.lines().count();
 
+    let mut out = String::new();
+    if args.include_outline.unwrap_or(true)
+        && let Some(lang) = crate::outline::detect_language(&args.path)
+    {
+        let outline = crate::outline::outline(lang, &text);
+        if !outline.is_empty() {
+            out.push_str(&outline);
+            out.push_str(&format!(
+                "[file: {} — {} lines total]\n",
+                args.path, total_lines
+            ));
+        }
+    }
+
     let start = args.offset_line.unwrap_or(1).max(1);
     anyhow::ensure!(
         start <= total_lines.saturating_add(1),
@@ -609,7 +657,7 @@ fn read_file(base: &Path, args: &ReadFileArgs) -> Result<String> {
         "no lines in range (file has {total_lines} lines)"
     );
 
-    let mut out = selected.join("\n");
+    out.push_str(&selected.join("\n"));
     let shown = selected.len();
     if out.chars().count() > MAX_READ_CHARS {
         out = out.chars().take(MAX_READ_CHARS).collect();
@@ -658,6 +706,7 @@ fn list_files(base: &Path, args: &ListFilesArgs) -> Result<String> {
         .clamp(1, MAX_LIST_ENTRIES);
 
     let mut lines = Vec::new();
+    let ignore = crate::ignore::IgnoreRules::load(base);
     let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {
         if lines.len() >= max_entries {
@@ -677,14 +726,17 @@ fn list_files(base: &Path, args: &ListFilesArgs) -> Result<String> {
             }
             let Ok(ft) = entry.file_type() else { continue };
             let name = entry.file_name().to_string_lossy().to_string();
+            let rel = display_rel(base, &entry.path());
+            if (ft.is_dir() && SKIP_DIRS.contains(&name.as_str()))
+                || ignore.matches(&rel, ft.is_dir())
+            {
+                continue;
+            }
             if ft.is_dir() {
-                if SKIP_DIRS.contains(&name.as_str()) {
-                    continue;
-                }
-                lines.push(format!("{}/", display_rel(base, &entry.path())));
+                lines.push(format!("{rel}/", rel = rel));
                 stack.push(entry.path());
             } else if ft.is_file() {
-                lines.push(display_rel(base, &entry.path()));
+                lines.push(rel);
             }
         }
     }
@@ -707,7 +759,7 @@ fn grep(base: &Path, args: &GrepArgs) -> Result<String> {
     let root_arg = args.path.as_deref().unwrap_or(".");
     let root = resolve_in(base, root_arg)?;
     let files = if root.is_dir() {
-        walk_files(&root)
+        walk_files(base, &root)
     } else {
         vec![root.clone()]
     };
@@ -862,6 +914,7 @@ mod tests {
             path: "sub/a.txt".into(),
             offset_line: Some(2),
             max_lines: Some(1),
+            include_outline: None,
         };
         let out = read_file(&ws.0, &read_args).unwrap();
         assert!(out.starts_with("    2| two"), "{out}");
@@ -886,6 +939,7 @@ mod tests {
                 path: "c.txt".into(),
                 offset_line: None,
                 max_lines: Some(3),
+                include_outline: None,
             },
         )
         .unwrap();
@@ -903,6 +957,7 @@ mod tests {
                 path: "b.bin".into(),
                 offset_line: None,
                 max_lines: None,
+                include_outline: None,
             },
         );
         assert!(err.unwrap_err().to_string().contains("binary"));
@@ -913,10 +968,84 @@ mod tests {
                     path: "nope.txt".into(),
                     offset_line: None,
                     max_lines: None,
+                    include_outline: None,
                 },
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn read_file_prepends_symbol_outline_for_source_files() {
+        let ws = TempWs::new("outline");
+        let src = "use std::io;\n\nfn main() {\n    helper();\n}\n\nfn helper() {}\n";
+        write_file(
+            &ws.0,
+            &WriteFileArgs {
+                path: "app.rs".into(),
+                content: src.into(),
+            },
+        )
+        .unwrap();
+
+        let args = |outline: Option<bool>| ReadFileArgs {
+            path: "app.rs".into(),
+            offset_line: None,
+            max_lines: None,
+            include_outline: outline,
+        };
+
+        let with = read_file(&ws.0, &args(None)).unwrap();
+        assert!(with.contains("[outline]"), "{with}");
+        assert!(with.contains("| fn main"), "{with}");
+        assert!(with.contains("| fn helper"), "{with}");
+        assert!(with.contains("[file: app.rs — 7 lines total]"), "{with}");
+
+        let without = read_file(&ws.0, &args(Some(false))).unwrap();
+        assert!(!without.contains("[outline]"), "{without}");
+    }
+
+    #[test]
+    fn govindaignore_hides_files_from_list_and_grep() {
+        let ws = TempWs::new("ignore");
+        fs::write(ws.0.join(".govindaignore"), "secrets/\n*.tmp\n").unwrap();
+        fs::create_dir_all(ws.0.join("secrets")).unwrap();
+        fs::write(ws.0.join("secrets/key.txt"), "hidden token here\n").unwrap();
+        fs::write(ws.0.join("cache.tmp"), "junk\n").unwrap();
+        fs::write(ws.0.join("visible.txt"), "token here\n").unwrap();
+
+        let listed = list_files(
+            &ws.0,
+            &ListFilesArgs {
+                path: None,
+                max_entries: None,
+            },
+        )
+        .unwrap();
+        assert!(listed.contains("visible.txt"), "{listed}");
+        assert!(!listed.contains("secrets/"), "{listed}");
+        assert!(!listed.contains("cache.tmp"), "{listed}");
+
+        let hits = grep(
+            &ws.0,
+            &GrepArgs {
+                pattern: "token".into(),
+                path: None,
+                max_matches: None,
+            },
+        )
+        .unwrap();
+        assert!(hits.contains("visible.txt"), "{hits}");
+        assert!(!hits.contains("secrets"), "{hits}");
+    }
+
+    #[tokio::test]
+    async fn scan_project_runs_through_executor() {
+        let tools = BuiltinTools::default();
+        let out = tools.execute("scan_project", "{}").await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["files"]["total"].is_u64(), "{out}");
+        assert!(!tools.requires_confirmation("scan_project"));
     }
 
     #[test]
