@@ -10,6 +10,16 @@ pub const DEFAULT_MODEL: &str = "mistral-small-latest";
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant. Answer concisely.";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_RENDER_MARKDOWN: bool = true;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_LIMIT_MB: u64 = 16;
+
+/// Parses a config TOML string through the real schema. Test hook used to
+/// prove `/config save` output loads cleanly.
+#[cfg(test)]
+pub(crate) fn parse_file_config_for_test(raw: &str) -> Result<()> {
+    let _: FileConfig = toml::from_str(raw)?;
+    Ok(())
+}
 
 /// Settings as written in `~/.config/govinda/config.toml`.
 /// Every field is optional; missing keys fall back to defaults.
@@ -28,6 +38,14 @@ struct FileConfig {
     api_key_env: Option<String>,
     /// Token budget per request (real tokenizer counts).
     context_tokens: Option<usize>,
+    /// User-defined shell tools, one `[[tools]]` block each.
+    tools: Vec<crate::tools::ShellToolDef>,
+    /// Default color theme (default | mono | dracula | solarized | ocean).
+    theme: Option<String>,
+    /// Read-stall timeout in seconds (1-600).
+    timeout_secs: Option<u64>,
+    /// Response size cap in MB (1-64).
+    limit_mb: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -41,6 +59,14 @@ pub struct Config {
     pub provider: Arc<dyn Provider>,
     /// The config file that was read, if any (shown by `/config`).
     pub source_path: Option<PathBuf>,
+    /// Validated user-defined shell tools from `[[tools]]` blocks.
+    pub shell_tools: Vec<crate::tools::ShellToolDef>,
+    /// Default theme name (applied by the caller at startup).
+    pub theme: Option<String>,
+    /// Read-stall timeout in seconds, clamped 1-600.
+    pub timeout_secs: u64,
+    /// Response size cap in MB, clamped 1-64.
+    pub limit_mb: u64,
 }
 
 impl Config {
@@ -90,6 +116,14 @@ impl Config {
             .system_prompt
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
 
+        crate::tools::validate_shell_tools(&file.tools).context("invalid [[tools]] definition")?;
+
+        let timeout_secs = file
+            .timeout_secs
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, 600);
+        let limit_mb = file.limit_mb.unwrap_or(DEFAULT_LIMIT_MB).clamp(1, 64);
+
         Ok(Self {
             api_key,
             model,
@@ -99,6 +133,10 @@ impl Config {
             context_tokens,
             provider,
             source_path,
+            shell_tools: file.tools,
+            theme: file.theme,
+            timeout_secs,
+            limit_mb,
         })
     }
 
@@ -182,6 +220,37 @@ mod tests {
         assert!(empty.model.is_none());
         let partial: FileConfig = toml::from_str("# just a comment\n").unwrap();
         assert!(partial.temperature.is_none());
+        assert!(partial.tools.is_empty());
+    }
+
+    #[test]
+    fn shell_tools_parse_from_toml() {
+        let raw = r#"
+[[tools]]
+name = "gh_pr"
+description = "list open pull requests"
+command = "gh"
+args_template = ["pr", "list", "--repo", "{repo}"]
+timeout_secs = 15
+max_output_bytes = 8192
+
+[[tools]]
+name = "git_status"
+description = "show git status"
+command = "git"
+args_template = ["status", "--short"]
+"#;
+        let cfg: FileConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.tools.len(), 2);
+        assert_eq!(cfg.tools[0].name, "gh_pr");
+        assert_eq!(cfg.tools[0].args_template.len(), 4);
+        assert_eq!(cfg.tools[0].timeout_secs, Some(15));
+        assert_eq!(cfg.tools[0].max_output_bytes, Some(8192));
+        assert_eq!(cfg.tools[1].timeout_secs, None);
+        assert_eq!(
+            crate::tools::validate_shell_tools(&cfg.tools).map_err(|e| e.to_string()),
+            Ok(())
+        );
     }
 
     #[test]

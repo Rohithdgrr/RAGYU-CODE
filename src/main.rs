@@ -6,10 +6,35 @@ use govinda_cli::config::Config;
 use govinda_cli::render::{Renderer, Spinner, accent, paint};
 use govinda_cli::session::Session;
 use govinda_cli::sessions;
-use reedline::{FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal};
+use reedline::{
+    FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal, Span,
+};
 use std::borrow::Cow;
 use std::io::Write;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Completes slash commands as the user types `/mod` → `/models`, `/model`.
+struct SlashCompleter;
+
+impl reedline::Completer for SlashCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> reedline::CompletionResult {
+        let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
+        let partial = &line[start..pos];
+        if start != 0 || !partial.starts_with('/') {
+            return reedline::CompletionResult::fresh(Vec::new());
+        }
+        let suggestions: Vec<reedline::Suggestion> = commands::SLASH_COMMANDS
+            .iter()
+            .filter(|c| c.starts_with(partial))
+            .map(|c| reedline::Suggestion {
+                value: (*c).to_owned(),
+                span: Span::new(start, pos),
+                ..Default::default()
+            })
+            .collect();
+        reedline::CompletionResult::fresh(suggestions)
+    }
+}
 
 struct CliPrompt;
 
@@ -44,8 +69,15 @@ impl Prompt for CliPrompt {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
+    if let Some(shell) = &args.completion {
+        govinda_cli::completions::emit(shell)?;
+        return Ok(());
+    }
     let config = Config::load().context("startup failed")?;
     let http = Config::http_client().context("startup failed")?;
+    if let Some(theme) = &config.theme {
+        govinda_cli::render::set_theme(theme);
+    }
     let renderer = Renderer::new(config.render_markdown);
 
     // Resume a named session, or start fresh.
@@ -75,6 +107,12 @@ async fn main() -> Result<()> {
         app.session_name = Some(name.clone());
     }
 
+    // One-shot mode: answer the prompt (plus any piped stdin), then exit.
+    // No banner, no REPL, no session autosave.
+    if let Some(prompt) = args.query {
+        return run_query(&mut app, &prompt).await;
+    }
+
     println!(
         "{}",
         paint(
@@ -93,7 +131,9 @@ async fn main() -> Result<()> {
     let history_path = std::env::current_dir()?.join(".govinda_history");
     let history =
         FileBackedHistory::with_file(1000, history_path).context("could not open history file")?;
-    let mut rl = Reedline::create().with_history(Box::new(history));
+    let mut rl = Reedline::create()
+        .with_history(Box::new(history))
+        .with_completer(Box::new(SlashCompleter));
 
     loop {
         match rl.read_line(&CliPrompt) {
@@ -131,11 +171,15 @@ async fn main() -> Result<()> {
 
 struct Args {
     resume: Option<String>,
+    query: Option<String>,
+    completion: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
     let mut argv = std::env::args().skip(1);
     let mut resume = None;
+    let mut query = None;
+    let mut completion = None;
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--resume" | "-r" => {
@@ -145,6 +189,19 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("--resume needs a session name"))?;
                 resume = Some(name);
             }
+            "--query" | "-q" => {
+                let prompt = argv
+                    .next()
+                    .filter(|p| !p.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("-q needs a prompt (quote it)"))?;
+                query = Some(prompt);
+            }
+            "--completion" => {
+                let shell = argv
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--completion needs a shell name"))?;
+                completion = Some(shell);
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -152,12 +209,16 @@ fn parse_args() -> Result<Args> {
             other => anyhow::bail!("unknown argument '{other}' — try --help"),
         }
     }
-    Ok(Args { resume })
+    Ok(Args {
+        resume,
+        query,
+        completion,
+    })
 }
 
 fn print_usage() {
     println!(
-        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --help, -h           show this help",
+        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --query, -q <prompt> one-shot mode: answer and exit; piped stdin is appended\n                       to the prompt, e.g. cat file.rs | govinda -q \"review\"\n  --completion <shell> print a completion script (bash, zsh, fish, powershell)\n  --help, -h           show this help",
         paint(
             format!("govinda-cli v{}", env!("CARGO_PKG_VERSION")),
             accent()
@@ -220,6 +281,56 @@ async fn handle_line(line: &str, app: &mut App) -> Result<bool> {
     Ok(false)
 }
 
+/// One-shot `-q` mode: streams the answer to stdout as plain text, runs
+/// tool rounds with confirmation-gated calls auto-declined (no user is
+/// watching), and never autosaves. Errors go to stderr with a non-zero exit.
+async fn run_query(app: &mut App, prompt: &str) -> Result<()> {
+    app.non_interactive = true;
+
+    // Piped stdin becomes context appended after the typed prompt.
+    use std::io::IsTerminal;
+    let mut full = prompt.to_owned();
+    if !std::io::stdin().is_terminal() {
+        match std::io::read_to_string(std::io::stdin()) {
+            Ok(piped) if !piped.trim().is_empty() => {
+                full.push_str("\n\n---\n\n");
+                full.push_str(piped.trim_end());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: could not read piped stdin ({e})"),
+        }
+    }
+
+    for _round in 0..MAX_TOOL_ROUNDS {
+        let history = app.session.window(app.config.context_tokens);
+        let auth = app.config.provider.auth();
+        let opts = chat_options(app, &auth);
+        let mut out = String::new();
+        let mut tool_calls = Vec::new();
+        let result = {
+            let http = &app.http;
+            let provider = app.config.provider.clone();
+            let mut sink = api::StreamSink::new(&mut out, &mut tool_calls);
+            tokio::select! {
+                res = api::stream_chat(http, provider.as_ref(), &opts, &history, &mut sink, |delta| {
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                }) => res,
+                _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("interrupted")),
+            }
+        };
+        result?;
+        println!();
+
+        if tool_calls.is_empty() || !app.tools_enabled {
+            app.record_turn(Duration::ZERO);
+            return Ok(());
+        }
+        run_tool_round(app, &out, &tool_calls).await;
+    }
+    anyhow::bail!("stopped after {MAX_TOOL_ROUNDS} tool rounds without a final answer")
+}
+
 /// Upper bound on model↔tool round trips per user turn, so a confused model
 /// can never loop forever.
 const MAX_TOOL_ROUNDS: usize = 5;
@@ -248,7 +359,7 @@ async fn run_turn(app: &mut App, input: &str) {
         match result {
             Ok(()) if !tool_calls.is_empty() && app.tools_enabled => {
                 show_round_prose(app, raw, &out);
-                run_tool_round(app, &out, &tool_calls);
+                run_tool_round(app, &out, &tool_calls).await;
                 continue; // stream again so the model sees the results
             }
             Ok(()) => {
@@ -278,7 +389,11 @@ fn chat_options<'a>(app: &'a App, auth: &'a govinda_cli::provider::Auth) -> Chat
         max_response_bytes: app.max_response_bytes,
         read_timeout: app.read_timeout,
         tools: if app.tools_enabled {
-            app.tool_specs.clone()
+            app.tool_specs
+                .iter()
+                .filter(|t| !app.disabled_tools.contains(&t.name))
+                .cloned()
+                .collect()
         } else {
             Vec::new()
         },
@@ -359,9 +474,15 @@ fn handle_round_error(app: &mut App, raw: bool, out: String, resume_len: usize, 
 /// Executes each requested call locally and commits the assistant turn
 /// (prose included) plus one `tool` result per call to the session.
 ///
+/// Confirmation-gated tools (workspace writes, shell commands) are approved
+/// sequentially first so prompts never interleave; the approved calls then
+/// execute concurrently via boxed futures, with results printed in call
+/// order once all settle. Declined calls report a sanitized decline line
+/// back to the model.
+///
 /// The model only ever sees a sanitized failure line; the detailed error
 /// chain is printed locally so it never leaks file paths or internals.
-fn run_tool_round(app: &mut App, prose: &str, calls: &[api::ToolCall]) {
+async fn run_tool_round(app: &mut App, prose: &str, calls: &[api::ToolCall]) {
     for call in calls {
         println!(
             "{}",
@@ -371,12 +492,42 @@ fn run_tool_round(app: &mut App, prose: &str, calls: &[api::ToolCall]) {
             )
         );
     }
-    let mut results = Vec::with_capacity(calls.len());
+
+    // Sequential approval pass — user prompts must not interleave. In `-q`
+    // mode nobody can approve, so gated calls are auto-declined.
+    let mut allowed = Vec::with_capacity(calls.len());
     for call in calls {
-        let outcome = match app.tool_executor.as_ref() {
-            Some(executor) => executor.execute(&call.function.name, &call.function.arguments),
-            None => Err(anyhow::anyhow!("no tool executor configured")),
-        };
+        let needs_confirmation = app
+            .tool_executor
+            .as_ref()
+            .is_some_and(|e| e.requires_confirmation(&call.function.name));
+        let approved = needs_confirmation
+            && !app.non_interactive
+            && confirm_tool_call(&call.function.name, &call.function.arguments);
+        if !approved && !app.non_interactive {
+            println!("{}", paint("✗ declined", govinda_cli::render::err_color()));
+        }
+        allowed.push(approved);
+    }
+
+    // Concurrent execution pass; results stay ordered by call index.
+    let executor: Option<&dyn govinda_cli::tools::ToolExecutor> = app.tool_executor.as_deref();
+    let futures = calls.iter().enumerate().map(|(i, call)| {
+        let approved = allowed[i];
+        let name = call.function.name.as_str();
+        let args = call.function.arguments.as_str();
+        async move {
+            match (approved, executor) {
+                (false, _) => Err(anyhow::anyhow!("declined")),
+                (true, Some(executor)) => executor.execute(name, args).await,
+                (true, None) => Err(anyhow::anyhow!("no tool executor configured")),
+            }
+        }
+    });
+    let outcomes = futures_util::future::join_all(futures).await;
+
+    let mut results = Vec::with_capacity(calls.len());
+    for (call, outcome) in calls.iter().zip(outcomes) {
         match outcome {
             Ok(value) => {
                 println!(
@@ -387,6 +538,14 @@ fn run_tool_round(app: &mut App, prose: &str, calls: &[api::ToolCall]) {
                     )
                 );
                 results.push((call.id.clone(), truncate_result(&value)));
+            }
+            Err(e) if e.to_string() == "declined" => {
+                println!("{}", paint("✗ declined", govinda_cli::render::err_color()));
+                results.push((
+                    call.id.clone(),
+                    "error: user declined this operation — ask how to proceed before retrying"
+                        .to_owned(),
+                ));
             }
             Err(e) => {
                 eprintln!(
@@ -404,6 +563,48 @@ fn run_tool_round(app: &mut App, prose: &str, calls: &[api::ToolCall]) {
         }
     }
     app.session.commit_tool_round(prose, calls, &results);
+}
+
+/// Interactive y/N gate for workspace-mutating tools. Shows a truncated
+/// pretty-print of the arguments so the user can see exactly what would run.
+fn confirm_tool_call(name: &str, arguments_json: &str) -> bool {
+    println!();
+    println!(
+        "{}",
+        paint(
+            format!("⚠ tool '{name}' modifies your workspace:"),
+            crossterm::style::Color::Yellow
+        )
+    );
+    match serde_json::from_str::<serde_json::Value>(arguments_json) {
+        Ok(value) => {
+            let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
+            let preview = truncate_chars(&pretty, 2000);
+            for line in preview.lines().take(40) {
+                println!("  {line}");
+            }
+        }
+        Err(_) => println!("  {}", truncate_chars(arguments_json, 2000)),
+    }
+    print!(
+        "{}",
+        paint("proceed? [y/N] ", crossterm::style::Color::Yellow)
+    );
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    match std::io::stdin().read_line(&mut answer) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_owned()
+    } else {
+        let cut: String = s.chars().take(max_chars).collect();
+        format!("{cut}…")
+    }
 }
 
 /// Dimmed footer printed after every completed answer: model, wall time,

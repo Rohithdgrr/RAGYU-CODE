@@ -1,5 +1,6 @@
 use super::{App, dim, err, ok};
 use crate::render::{self, paint, theme_names};
+use crate::tools::save_disabled_tools;
 use crossterm::style::Color;
 use std::time::Duration;
 
@@ -88,9 +89,10 @@ pub(super) fn set_limit(arg: &str, app: &mut App) {
 }
 
 pub(super) fn show_tools(arg: &str, app: &mut App) {
-    match arg.trim() {
+    let arg = arg.trim();
+    match arg {
         "on" | "off" => {
-            let next = arg.trim() == "on";
+            let next = arg == "on";
             if !next && app.tool_executor.is_none() {
                 err("tools are unavailable (no executor configured).");
                 return;
@@ -110,17 +112,60 @@ pub(super) fn show_tools(arg: &str, app: &mut App) {
             match &app.tool_executor {
                 Some(_) => {
                     for tool in &app.tool_specs {
+                        let state = if app.disabled_tools.contains(&tool.name) {
+                            paint("[disabled]", Color::Red)
+                        } else {
+                            paint("[on]", Color::Green)
+                        };
                         println!(
-                            "  {} — {}",
+                            "  {} {} — {}",
+                            state,
                             paint(&tool.name, Color::Green),
                             tool.description
                         );
+                    }
+                    if !app.disabled_tools.is_empty() {
+                        dim("re-enable with '/tools enable <name>'.");
                     }
                 }
                 None => err("no tool executor configured."),
             }
         }
-        _ => println!("usage: /tools [on|off]   (currently shows the registry)"),
+        _ => {
+            // /tools enable|disable <name>
+            let Some((verb, name)) = arg.split_once(char::is_whitespace) else {
+                println!("usage: /tools [on|off] | /tools enable|disable <name>");
+                return;
+            };
+            let name = name.trim();
+            let disable = match verb {
+                "enable" | "en" => false,
+                "disable" | "dis" => true,
+                _ => {
+                    println!("usage: /tools [on|off] | /tools enable|disable <name>");
+                    return;
+                }
+            };
+            if !app.tool_specs.iter().any(|t| t.name == name) {
+                err(&format!(
+                    "unknown tool '{name}' — run /tools to see the registry"
+                ));
+                return;
+            }
+            if disable {
+                app.disabled_tools.insert(name.to_owned());
+                ok(&format!(
+                    "'{name}' disabled — the model can no longer call it."
+                ));
+            } else if app.disabled_tools.remove(name) {
+                ok(&format!("'{name}' re-enabled."));
+            } else {
+                ok(&format!("'{name}' was already enabled."));
+            }
+            if let Err(e) = save_disabled_tools(&app.disabled_tools) {
+                err(&format!("{e:#}"));
+            }
+        }
     }
 }
 

@@ -10,6 +10,22 @@
 ## Function calling
 - OpenAI-style tools advertised to any compatible model; built-ins execute
   locally in the REPL (`current_time`, `count_words`)
+- **Workspace tools** — `read_file`, `write_file`, `list_files`, `grep`
+  (regex) turn Govinda into a coding agent; all paths are sandboxed to the
+  working directory (absolute paths and `..` rejected), reads are capped at
+  2 MB/60 K chars, writes at 1 MB, and every write requires an interactive
+  y/N confirmation with a preview of the arguments
+- **User-defined shell tools** — `[[tools]]` blocks in config.toml
+  (`name`, `description`, `command`, `args_template`, optional
+  `timeout_secs` / `max_output_bytes`) run external commands without a shell:
+  argv templates with `{placeholder}` substitution only, mandatory per-call
+  confirmation, hard timeout (default 30 s, max 600 s), and output caps
+  (default 64 KiB, max 1 MiB); invalid definitions are rejected at startup
+- **Per-tool toggles** — `/tools enable|disable <name>` excludes individual
+  tools from what the model sees, persisted in `.govinda_tools.json`;
+  `/tools` lists the registry with on/disabled markers
+- **Async executor** — tool calls execute as boxed futures concurrently
+  under the REPL (confirmations stay sequential so prompts never interleave)
 - Multi-round agent loop (up to 5 rounds per turn), parallel tool calls supported
 - Streamed argument fragments reassembled byte-safely; prose before calls is
   preserved and shown

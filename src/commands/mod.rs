@@ -3,7 +3,6 @@ mod generation;
 mod persistence;
 mod todo;
 
-use crate::api;
 use crate::config::Config;
 use crate::render::{Renderer, accent, dim_color, err_color, ok_color, paint, theme_names};
 use crate::session::Session;
@@ -14,9 +13,45 @@ use display::{
 };
 use generation::{compact, generate_variants, models, pick_variant, retry, set_model};
 use persistence::{export, fork_session, list_named_sessions, load_session, save_session};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use todo::Todo;
+
+/// Every slash command the REPL accepts. Drives the reedline completer and
+/// shell-completion scripts; keep in sync with `dispatch()` / `help()`.
+pub const SLASH_COMMANDS: [&str; 30] = [
+    "/help",
+    "/exit",
+    "/quit",
+    "/clear",
+    "/reset",
+    "/models",
+    "/model",
+    "/temp",
+    "/system",
+    "/history",
+    "/undo",
+    "/retry",
+    "/variants",
+    "/pick",
+    "/compact",
+    "/search",
+    "/save",
+    "/load",
+    "/sessions",
+    "/fork",
+    "/export",
+    "/stats",
+    "/theme",
+    "/tokens",
+    "/raw",
+    "/config",
+    "/timeout",
+    "/limit",
+    "/tools",
+    "/todo",
+];
 
 /// Shared mutable state for the REPL and command handlers.
 pub struct App {
@@ -39,11 +74,17 @@ pub struct App {
     /// Master switch for function calling (toggled via `/tools`); when off,
     /// no tools are advertised and any calls a rogue server sends are ignored.
     pub tools_enabled: bool,
+    /// Individually disabled tool names (`/tools disable <name>`), persisted
+    /// to `.govinda_tools.json` and excluded from the advertised specs.
+    pub disabled_tools: HashSet<String>,
     /// Tool schemas built once at startup (JSON construction per request
     /// would be pure waste — they never change mid-session).
     pub tool_specs: Vec<crate::api::Tool>,
     /// Session-scoped task list (`/todo`), persisted to `.govinda_todo.json`.
     pub todos: Vec<Todo>,
+    /// True in `-q` one-shot mode: no interactive prompts (confirmation-
+    /// gated tools are auto-declined) and no interactive-only output.
+    pub non_interactive: bool,
 }
 
 #[derive(Default)]
@@ -70,19 +111,22 @@ impl App {
         session: Session,
         renderer: Renderer,
     ) -> Self {
-        let tool_executor: Option<Box<dyn ToolExecutor>> = Some(Box::new(BuiltinTools));
+        let tool_executor: Option<Box<dyn ToolExecutor>> =
+            Some(Box::new(BuiltinTools::new(config.shell_tools.clone())));
         let tool_specs = tool_executor.as_ref().map_or_else(Vec::new, |e| e.specs());
         Self {
-            read_timeout: api::default_read_timeout(),
-            max_response_bytes: api::MAX_RESPONSE_BYTES,
+            read_timeout: Duration::from_secs(config.timeout_secs),
+            max_response_bytes: (config.limit_mb as usize) * 1024 * 1024,
             models_cache: None,
             session_name: None,
             stats: Stats::start(),
             pending_variants: Vec::new(),
             tool_executor,
             tools_enabled: true,
+            disabled_tools: crate::tools::load_disabled_tools(),
             tool_specs,
             todos: todo::load(),
+            non_interactive: false,
             config,
             http,
             session,
@@ -267,7 +311,15 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             Outcome::Handled
         }
         "/config" => {
-            show_config(app);
+            if rest.trim().eq_ignore_ascii_case("save") {
+                match persistence::save_runtime_config(app) {
+                    Ok(path) => ok(&format!("settings saved to {}", path.display())),
+                    Err(e) => err(&format!("config save failed: {e:#}")),
+                }
+            } else {
+                show_config(app);
+                dim("use '/config save' to persist model/theme/timeout/limit settings.");
+            }
             Outcome::Handled
         }
         unknown => {
@@ -316,9 +368,10 @@ fn help(app: &App) {
          \x20 /raw               toggle markdown rendering vs live streaming\n\
          \x20 /timeout <secs>    per-request read-stall timeout (current: {}s)\n\
          \x20 /limit <mb>        response size cap in MB (current: {})\n\
-         \x20 /tools [on|off]    list tools the model may call, or toggle function calling (currently {})\n\
-         \x20 /todo [sub]        task list: list | add <text> | done <n> | undo <n> | rm <n> | clear\n\
-         \x20 /config            show current settings",
+          \x20 /tools [on|off]    toggle function calling, or list the registry (currently {})\n\
+          \x20 /tools en|dis <n>  enable/disable a single tool (persisted across runs)\n\
+          \x20 /todo [sub]        task list: list | add <text> | done <n> | undo <n> | rm <n> | clear\n\
+          \x20 /config [save]     show settings; `save` persists model/theme/timeout/limit",
         app.config.model,
         app.config.temperature,
         theme_names().collect::<Vec<_>>().join(", "),
@@ -364,6 +417,10 @@ mod tests {
             context_tokens: 2048,
             provider,
             source_path: None,
+            shell_tools: Vec::new(),
+            theme: None,
+            timeout_secs: 30,
+            limit_mb: 16,
         };
         App::new(
             config,
