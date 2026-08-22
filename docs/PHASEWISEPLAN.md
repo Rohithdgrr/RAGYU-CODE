@@ -1,6 +1,6 @@
 # Phased Plan
 
-Delivery history and forward plan. Phases 1–5 are **shipped**; 6+ are planned.
+Delivery history and forward plan. Phases 1–7 are **shipped**; 8+ are planned.
 
 ## Phase 1 — Core chat (done)
 - reqwest + rustls streaming client, byte-safe SSE parser
@@ -36,16 +36,41 @@ Delivery history and forward plan. Phases 1–5 are **shipped**; 6+ are planned.
 - Review-driven quality pass: `StreamSink`, per-turn stats, raw-mode
   double-print fix, two-phase wiremock tool-loop test, full CI gate green
 
-## Phase 6 — Extensibility (planned)
-- User-defined shell/file tools via TOML with per-tool confirmation prompts
-- Async executor trait for slow tools (HTTP lookups) with concurrent execution
-- `/tools enable|disable <name>` per-tool granularity
+## Phase 6 — Workspace awareness (done)
+- `scan_project` overview (project types, entry points, dependencies,
+  file stats, git state); `.govindaignore` rule matching
+- Regex-based symbol outlines in `read_file`; pipe mode (`govinda -q`)
+- Async boxed-future executor; concurrent execution under sequential y/N gates
 
-## Phase 7 — Context & content (planned)
+## Phase 7 — Extensibility & staged editing (done)
+- User-defined shell tools via TOML argv templates (no shell), validated at startup
+- Per-tool enable/disable persisted in `.govinda_tools.json`
+- Staged surgical editing: `edit_file` / `insert_after` / `insert_before`,
+  `view_diff` review, atomic `/apply`, `/reject`
+- Execution tools: `run_shell`, `run_test`, `check_project`;
+  `/config save`; session todo list; unified-diff module
+
+## Phase 8 — Code intelligence & RAG (done)
+- In-memory symbol index (kind/name/file/line) built at startup, refreshed
+  by `/scan` or `scan_project`; zero-dep regex extraction
+- `find_symbol` (kind-filtered definition lookup) and passive `explain_code`
+- Context-aware windowing: mentioned files (+ manifest, siblings) injected
+  into every round via `Session::window_with`
+- Agent system-prompt specialization when function calling is enabled
+
+## Phase 9 — Agent loop & planning (done)
+- Self-correction loop: failed rounds grant up to `MAX_FIX_ROUNDS = 3`
+  extra turns beyond the base 5
+- `/plan <task>`: one planning call → ≤10 steps → y/N gate → autonomous
+  step-by-step execution tracked in `/todo` (`Outcome::Plan`)
+- Git tools: `git_diff`, `git_log` (read-only), `git_branch`, `git_commit`
+  (mutations confirmation-gated; direct argv spawns)
+
+## Phase 10 — Context & content (planned)
 - File attachments / RAG over a local folder
+- Incremental symbol-index updates on staged applies
 - Streaming markdown renderer (render-as-it-arrives in markdown mode)
 - Smarter compaction: preserve recent tool rounds verbatim
 
-## Phase 8 — Productization (planned)
-- Full-TUI mode, config writing (`/config save`), release packaging
-  (cargo-dist), install script, badges
+## Phase 11 — Productization (planned)
+- Full-TUI mode, release packaging (cargo-dist), install script, badges

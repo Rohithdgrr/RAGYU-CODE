@@ -1,26 +1,29 @@
 mod display;
+mod edits;
 mod generation;
 mod persistence;
+mod plan;
 mod todo;
 
 use crate::config::Config;
 use crate::render::{Renderer, accent, dim_color, err_color, ok_color, paint, theme_names};
 use crate::session::Session;
-use crate::tools::{BuiltinTools, ToolExecutor};
+use crate::tools::{BuiltinTools, PendingEdits, ToolExecutor};
 use display::{
     print_history, search_history, set_limit, set_or_show_system, set_or_show_theme,
     set_temperature, set_timeout, show_config, show_stats, show_tools,
 };
+use edits::{apply as apply_edits, reject as reject_edits, view as view_diff};
 use generation::{compact, generate_variants, models, pick_variant, retry, set_model};
 use persistence::{export, fork_session, list_named_sessions, load_session, save_session};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use todo::Todo;
 
 /// Every slash command the REPL accepts. Drives the reedline completer and
 /// shell-completion scripts; keep in sync with `dispatch()` / `help()`.
-pub const SLASH_COMMANDS: [&str; 30] = [
+pub const SLASH_COMMANDS: [&str; 35] = [
     "/help",
     "/exit",
     "/quit",
@@ -51,6 +54,11 @@ pub const SLASH_COMMANDS: [&str; 30] = [
     "/limit",
     "/tools",
     "/todo",
+    "/diff",
+    "/apply",
+    "/reject",
+    "/scan",
+    "/plan",
 ];
 
 /// Shared mutable state for the REPL and command handlers.
@@ -85,6 +93,10 @@ pub struct App {
     /// True in `-q` one-shot mode: no interactive prompts (confirmation-
     /// gated tools are auto-declined) and no interactive-only output.
     pub non_interactive: bool,
+    /// Staged (not yet applied) edits from the surgical editing tools,
+    /// shared with the executor; committed via `/apply`, dropped by
+    /// `/reject`.
+    pub pending_edits: Arc<Mutex<PendingEdits>>,
 }
 
 #[derive(Default)]
@@ -111,9 +123,10 @@ impl App {
         session: Session,
         renderer: Renderer,
     ) -> Self {
-        let tool_executor: Option<Box<dyn ToolExecutor>> =
-            Some(Box::new(BuiltinTools::new(config.shell_tools.clone())));
-        let tool_specs = tool_executor.as_ref().map_or_else(Vec::new, |e| e.specs());
+        let builtin = BuiltinTools::new(config.shell_tools.clone());
+        let tool_specs = builtin.specs();
+        let pending_edits = builtin.pending_edits();
+        let tool_executor: Option<Box<dyn ToolExecutor>> = Some(Box::new(builtin));
         Self {
             read_timeout: Duration::from_secs(config.timeout_secs),
             max_response_bytes: (config.limit_mb as usize) * 1024 * 1024,
@@ -127,6 +140,7 @@ impl App {
             tool_specs,
             todos: todo::load(),
             non_interactive: false,
+            pending_edits,
             config,
             http,
             session,
@@ -144,11 +158,18 @@ impl App {
     }
 }
 
+/// Persists the session todo list; used by `/plan` execution in main.
+pub fn persist_todos(app: &mut App) {
+    todo::save(app);
+}
+
 pub enum Outcome {
     Handled,
     Exit,
     /// Send this text as a fresh user turn (powers `/retry`).
     Resend(String),
+    /// A confirmed plan awaiting autonomous execution (powers `/plan`).
+    Plan(Vec<String>),
 }
 
 impl std::fmt::Debug for Outcome {
@@ -157,6 +178,7 @@ impl std::fmt::Debug for Outcome {
             Outcome::Handled => write!(f, "Handled"),
             Outcome::Exit => write!(f, "Exit"),
             Outcome::Resend(t) => write!(f, "Resend({t:?})"),
+            Outcome::Plan(steps) => write!(f, "Plan({} steps)", steps.len()),
         }
     }
 }
@@ -306,10 +328,31 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             todo::handle(rest, app);
             Outcome::Handled
         }
+        "/diff" => {
+            view_diff(app);
+            Outcome::Handled
+        }
+        "/apply" => {
+            apply_edits(app);
+            Outcome::Handled
+        }
+        "/reject" => {
+            reject_edits(app);
+            Outcome::Handled
+        }
         "/limit" => {
             set_limit(rest, app);
             Outcome::Handled
         }
+        "/scan" => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let symbols = crate::symbols::rebuild(&cwd);
+            ok(&format!("workspace scanned · {symbols} symbols indexed"));
+            dim("overview:");
+            println!("{}", crate::scan::scan(&cwd).await);
+            Outcome::Handled
+        }
+        "/plan" => plan::handle(rest, app).await,
         "/config" => {
             if rest.trim().eq_ignore_ascii_case("save") {
                 match persistence::save_runtime_config(app) {
@@ -370,8 +413,13 @@ fn help(app: &App) {
          \x20 /limit <mb>        response size cap in MB (current: {})\n\
           \x20 /tools [on|off]    toggle function calling, or list the registry (currently {})\n\
           \x20 /tools en|dis <n>  enable/disable a single tool (persisted across runs)\n\
-          \x20 /todo [sub]        task list: list | add <text> | done <n> | undo <n> | rm <n> | clear\n\
-          \x20 /config [save]     show settings; `save` persists model/theme/timeout/limit",
+           \x20 /todo [sub]        task list: list | add <text> | done <n> | undo <n> | rm <n> | clear\n\
+           \x20 /diff              show staged edits as a unified diff (nothing applied yet)\n\
+         \x20 /apply             commit all staged edits to disk (atomic batch)\n\
+         \x20 /reject            discard all staged edits\n\
+         \x20 /scan              rebuild the symbol index and print a workspace overview\n\
+         \x20 /plan <task>       decompose a task into steps, confirm, execute autonomously\n\
+         \x20 /config [save]     show settings; `save` persists model/theme/timeout/limit",
         app.config.model,
         app.config.temperature,
         theme_names().collect::<Vec<_>>().join(", "),
@@ -455,6 +503,9 @@ mod tests {
             "/tools off",
             "/tools on",
             "/todo",
+            "/diff",
+            "/apply",
+            "/reject",
             "/todo add write more tests",
             "/todo list",
             "/search hi",

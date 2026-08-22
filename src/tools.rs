@@ -20,7 +20,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 /// Largest file `read_file`/`grep` will open.
 const MAX_INPUT_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -49,7 +49,7 @@ const MAX_SHELL_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Largest single argument value accepted from the model, in characters.
 const MAX_ARG_VALUE_CHARS: usize = 8 * 1024;
 /// Names reserved by built-in implementations; user tools cannot shadow them.
-const BUILTIN_TOOL_NAMES: [&str; 7] = [
+const BUILTIN_TOOL_NAMES: [&str; 20] = [
     "current_time",
     "count_words",
     "read_file",
@@ -57,6 +57,19 @@ const BUILTIN_TOOL_NAMES: [&str; 7] = [
     "list_files",
     "grep",
     "scan_project",
+    "find_symbol",
+    "explain_code",
+    "edit_file",
+    "insert_after",
+    "insert_before",
+    "view_diff",
+    "run_shell",
+    "run_test",
+    "check_project",
+    "git_diff",
+    "git_log",
+    "git_branch",
+    "git_commit",
 ];
 /// `{placeholder}` tokens inside shell-tool `args_template` words.
 #[allow(clippy::expect_used)] // static, hand-checked patterns
@@ -104,11 +117,14 @@ pub trait ToolExecutor: Send + Sync {
     }
 }
 
-/// The default executor: safe local tools plus sandboxed workspace and
-/// user-defined shell tools.
+/// The default executor: safe local tools plus sandboxed workspace, staged
+/// editing, and shell execution tools.
 #[derive(Default)]
 pub struct BuiltinTools {
     shell_tools: Vec<ShellToolDef>,
+    /// Queue of staged edits shared with the REPL (`/diff`, `/apply`,
+    /// `/reject`). The executor stages; only `/apply` touches the disk.
+    pending: Arc<Mutex<PendingEdits>>,
 }
 
 impl BuiltinTools {
@@ -116,7 +132,15 @@ impl BuiltinTools {
     /// Validation errors must already have been surfaced at config load;
     /// this constructor trusts its input.
     pub fn new(shell_tools: Vec<ShellToolDef>) -> Self {
-        Self { shell_tools }
+        Self {
+            shell_tools,
+            pending: Arc::default(),
+        }
+    }
+
+    /// Handle to the shared staged-edit queue for REPL commands.
+    pub fn pending_edits(&self) -> Arc<Mutex<PendingEdits>> {
+        self.pending.clone()
     }
 }
 
@@ -206,10 +230,191 @@ impl ToolExecutor for BuiltinTools {
             Tool::new(
                 "scan_project",
                 "Builds a structured overview of the workspace: project types, entry points, \
-                 dependencies, file statistics, and git branch/status. Read-only.",
+                 dependencies, file statistics, and git branch/status. Also refreshes the \
+                 workspace symbol index used by find_symbol. Read-only.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {},
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "find_symbol",
+                "Locates the definition of a function, struct, enum, trait, impl, module, or \
+                 macro by name across the indexed codebase. Returns kind, name, file, and line \
+                 for each match. Prefer this over grep for symbol lookups.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Symbol name (exact or partial)"},
+                        "kind": {"type": "string", "enum": ["function", "struct", "enum", "union", "trait", "module", "macro", "impl", "class", "any"], "description": "Filter by kind (default any)"}
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "explain_code",
+                "Read-only helper for explaining code: returns the source of one symbol \
+                 (function/struct/trait…) from a workspace file, or an outline plus the head \
+                 of the whole file when no symbol is named. Pair the result with your own \
+                 explanation.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path"},
+                        "symbol": {"type": "string", "description": "Optional symbol name to extract; omit for a file overview"},
+                        "max_lines": {"type": "integer", "description": "Maximum lines to return (default 120)"}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "edit_file",
+                "Replaces an exact string in an existing workspace file. The edit is STAGED, \
+                 not written: the user reviews it via view_diff and commits with /apply. \
+                 Fails unless the search string occurs exactly once — include enough \
+                 surrounding lines (with their indentation) to make it unique.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path"},
+                        "old_string": {"type": "string", "description": "Exact text to replace (including indentation)"},
+                        "new_string": {"type": "string", "description": "Replacement text"}
+                    },
+                    "required": ["path", "old_string", "new_string"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "insert_after",
+                "Stages new text to be inserted after the given 1-based line of a workspace \
+                 file (for adding functions, imports, fields…). Committed only via /apply.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path"},
+                        "line": {"type": "integer", "description": "1-based line number to insert after"},
+                        "text": {"type": "string", "description": "Text block to insert"}
+                    },
+                    "required": ["path", "line", "text"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "insert_before",
+                "Stages new text to be inserted before the given 1-based line of a workspace \
+                 file. Committed only via /apply.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path"},
+                        "line": {"type": "integer", "description": "1-based line number to insert before"},
+                        "text": {"type": "string", "description": "Text block to insert"}
+                    },
+                    "required": ["path", "line", "text"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "view_diff",
+                "Returns the unified diff of all staged (not yet applied) edits for review. \
+                 Read-only.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "run_shell",
+                "Run a shell command in the project directory. Use for: cargo check, cargo \
+                 test, npm test, git diff, etc. Requires user confirmation; output is capped \
+                 and a timeout applies.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "The shell command to run"},
+                        "timeout_secs": {"type": "integer", "description": "Wall-clock cap in seconds (default 60, max 600)"}
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "run_test",
+                "Runs the workspace's test suite with an optional name filter, using the \
+                 detected project type (Rust → cargo test, Python → pytest, JS → npm test). \
+                 Requires user confirmation.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "filter": {"type": "string", "description": "Optional substring filter passed to the test runner"},
+                        "timeout_secs": {"type": "integer", "description": "Wall-clock cap in seconds (default 120, max 600)"}
+                    },
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "check_project",
+                "Runs compile/lint validation for the detected project type (Rust → cargo \
+                 check, TypeScript → tsc --noEmit, Python → mypy) so errors can be fixed \
+                 immediately. Read-only in effect; requires confirmation because it executes \
+                 build tools.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "git_diff",
+                "Shows uncommitted changes (working tree + staged) as a unified diff against \
+                 HEAD, so you can review edits before proposing a commit. Read-only.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "git_log",
+                "Shows recent commit history (one line per commit) for context. Read-only.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "max_commits": {"type": "integer", "description": "How many commits to show (default 20, max 200)"}
+                    },
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "git_branch",
+                "Creates or switches git branches, or lists them. create and switch require \
+                 user confirmation; list is read-only.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "create", "switch"], "description": "Branch operation"},
+                        "name": {"type": "string", "description": "Branch name (required for create/switch)"}
+                    },
+                    "required": ["action"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "git_commit",
+                "Stages all workspace changes (git add -A) and commits with the given message. \
+                 Requires user confirmation — always propose the message in prose first and \
+                 let the user adjust it.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string", "description": "Commit message (concise imperative summary)"},
+                        "stage_all": {"type": "boolean", "description": "Stage every change first (default true); set false to commit only what is already staged"}
+                    },
+                    "required": ["message"],
                     "additionalProperties": false
                 }),
             ),
@@ -225,7 +430,10 @@ impl ToolExecutor for BuiltinTools {
     }
 
     fn requires_confirmation(&self, name: &str) -> bool {
-        name == "write_file" || self.shell_tools.iter().any(|t| t.name == name)
+        matches!(
+            name,
+            "write_file" | "run_shell" | "run_test" | "check_project" | "git_commit" | "git_branch"
+        ) || self.shell_tools.iter().any(|t| t.name == name)
     }
 
     fn execute<'a>(&'a self, name: &'a str, arguments_json: &'a str) -> ToolFuture<'a> {
@@ -267,7 +475,115 @@ impl ToolExecutor for BuiltinTools {
                 "scan_project" => {
                     let cwd =
                         std::env::current_dir().context("cannot resolve working directory")?;
+                    crate::symbols::rebuild(&cwd);
                     Ok(crate::scan::scan(&cwd).await)
+                }
+                "find_symbol" => {
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    let args: FindSymbolArgs = parse_args(arguments_json)?;
+                    let index = crate::symbols::ensure(&cwd);
+                    let hits = index.find(&args.name, args.kind.as_deref());
+                    if hits.is_empty() {
+                        Ok(format!(
+                            "{{\"matches\":0,\"note\":\"no symbols match '{}' — run scan_project to refresh the index\"}}",
+                            args.name
+                        ))
+                    } else {
+                        Ok(crate::symbols::results_json(&hits))
+                    }
+                }
+                "explain_code" => {
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    let args: ExplainCodeArgs = parse_args(arguments_json)?;
+                    explain_code(&cwd, &args)
+                }
+                "edit_file" | "insert_after" | "insert_before" => {
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    let op = parse_edit_op(name, arguments_json)?;
+                    validate_staged_op(&cwd, &op)?;
+                    let summary = op.describe();
+                    let path = op.path().to_owned();
+                    let count = {
+                        let mut pending = self
+                            .pending
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("staged-edit queue poisoned"))?;
+                        pending.push(op);
+                        pending.ops().len()
+                    };
+                    Ok(serde_json::json!({
+                        "staged": true,
+                        "path": path,
+                        "edit": summary,
+                        "pending_edits": count,
+                        "note": "Edit staged. The user reviews with view_diff or /diff and commits with /apply."
+                    })
+                    .to_string())
+                }
+                "view_diff" => {
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    let pending = self
+                        .pending
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("staged-edit queue poisoned"))?;
+                    if pending.ops().is_empty() {
+                        return Ok("no staged edits — nothing to diff".to_owned());
+                    }
+                    let diff = staged_diff(&cwd, pending.ops())?;
+                    if diff.is_empty() {
+                        return Ok("no staged edits — nothing to diff".to_owned());
+                    }
+                    let n = pending.ops().len();
+                    Ok(format!(
+                        "{n} staged edit(s), NOT yet applied:\n{diff}\n(user commits with /apply, discards with /reject)"
+                    ))
+                }
+                "run_shell" => {
+                    let args: RunShellArgs = parse_args(arguments_json)?;
+                    run_shell_command(args).await
+                }
+                "run_test" => {
+                    let args: RunTestArgs = parse_args(arguments_json)?;
+                    run_test_tool(args).await
+                }
+                "check_project" => check_project_tool().await,
+                "git_diff" => {
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    let text = crate::git::run_git(&cwd, &["diff", "HEAD"]).await?;
+                    Ok(format!("uncommitted changes vs HEAD:\n{text}"))
+                }
+                "git_log" => {
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    let args: GitLogArgs = parse_args(arguments_json)?;
+                    let argv = crate::git::log_argv(args.max_commits);
+                    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                    let text = crate::git::run_git(&cwd, &refs).await?;
+                    Ok(format!("recent commits:\n{text}"))
+                }
+                "git_branch" => {
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    let args: GitBranchArgs = parse_args(arguments_json)?;
+                    let action =
+                        crate::git::BranchAction::parse(&args.action).ok_or_else(|| {
+                            anyhow::anyhow!("unknown branch action '{}'", args.action)
+                        })?;
+                    let argv = action.argv(args.name.as_deref().unwrap_or(""))?;
+                    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                    let text = crate::git::run_git(&cwd, &refs).await?;
+                    Ok(format!("git branch {} done:\n{text}", action.label()))
+                }
+                "git_commit" => {
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    let args: GitCommitArgs = parse_args(arguments_json)?;
+                    git_commit_tool(&cwd, &args).await
                 }
                 other => match self.shell_tools.iter().find(|t| t.name == other) {
                     Some(def) => run_shell_tool(def, arguments_json).await,
@@ -310,6 +626,48 @@ struct GrepArgs {
     pattern: String,
     path: Option<String>,
     max_matches: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct RunShellArgs {
+    command: String,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct RunTestArgs {
+    filter: Option<String>,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct FindSymbolArgs {
+    name: String,
+    kind: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExplainCodeArgs {
+    path: String,
+    symbol: Option<String>,
+    max_lines: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct GitLogArgs {
+    max_commits: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct GitBranchArgs {
+    action: String,
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GitCommitArgs {
+    message: String,
+    stage_all: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -528,13 +886,514 @@ pub fn save_disabled_tools(disabled: &HashSet<String>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Staged edits: surgical editing with an explicit apply step
+// ---------------------------------------------------------------------------
+
+/// One staged, not-yet-applied workspace change.
+///
+/// Editing tools never touch the filesystem directly; they validate against
+/// current file contents and queue an `EditOp` here. The user inspects the
+/// unified diff (`/diff` or the `view_diff` tool) and commits everything at
+/// once with `/apply`, or discards with `/reject`.
+#[derive(Debug, Clone)]
+pub enum EditOp {
+    /// Replace the unique occurrence of `old_string` in `path`.
+    Replace {
+        path: String,
+        old_string: String,
+        new_string: String,
+    },
+    /// Insert `text` (a whole block of lines, trailing newline optional)
+    /// before or after 1-based line `line` of `path`.
+    Insert {
+        path: String,
+        line: usize,
+        text: String,
+        after: bool,
+    },
+}
+
+impl EditOp {
+    pub fn path(&self) -> &str {
+        match self {
+            EditOp::Replace { path, .. } | EditOp::Insert { path, .. } => path,
+        }
+    }
+
+    /// One-line human-readable summary for listings and confirmations.
+    pub fn describe(&self) -> String {
+        match self {
+            EditOp::Replace {
+                path,
+                old_string,
+                new_string,
+            } => format!(
+                "replace {} → {} in {path}",
+                first_line(old_string),
+                first_line(new_string)
+            ),
+            EditOp::Insert {
+                path,
+                line,
+                text,
+                after,
+            } => format!(
+                "insert {} line {line} in {path}: {}",
+                if *after { "after" } else { "before" },
+                first_line(text)
+            ),
+        }
+    }
+}
+
+fn first_line(s: &str) -> String {
+    let line = s.lines().next().unwrap_or("");
+    if line.chars().count() > 60 {
+        let mut cut: String = line.chars().take(57).collect();
+        cut.push_str("...");
+        cut
+    } else {
+        line.to_owned()
+    }
+}
+
+/// In-memory queue of staged edits shared between the tool executor and the
+/// REPL commands (`/diff`, `/apply`, `/reject`).
+#[derive(Default)]
+pub struct PendingEdits {
+    ops: Vec<EditOp>,
+}
+
+impl PendingEdits {
+    pub fn push(&mut self, op: EditOp) {
+        self.ops.push(op);
+    }
+    pub fn ops(&self) -> &[EditOp] {
+        &self.ops
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+    pub fn clear(&mut self) {
+        self.ops.clear();
+    }
+}
+
+/// Renders the combined unified diff of all staged edits against the files'
+/// current on-disk contents. Files whose edits cancel out produce no hunk.
+pub fn staged_diff(base: &Path, pending: &[EditOp]) -> Result<String> {
+    let mut per_file: Vec<(String, Vec<&EditOp>)> = Vec::new();
+    for op in pending {
+        match per_file.iter_mut().find(|(p, _)| *p == op.path()) {
+            Some((_, ops)) => ops.push(op),
+            None => per_file.push((op.path().to_owned(), vec![op])),
+        }
+    }
+    let mut out = String::new();
+    for (path, ops) in per_file {
+        let full = resolve_in(base, &path)?;
+        let bytes = fs::read(&full).with_context(|| format!("cannot read '{path}'"))?;
+        anyhow::ensure!(
+            !bytes.contains(&0),
+            "'{path}' looks binary; refusing to diff"
+        );
+        let original = String::from_utf8_lossy(&bytes).to_string();
+        let updated = apply_ops_to_content(&original, &path, &ops)?;
+        out.push_str(&crate::diff::unified_diff(&path, &original, &updated));
+    }
+    Ok(out)
+}
+
+/// Validates and applies a batch of edit ops to one file's content.
+///
+/// All validation happens before any mutation so a bad op aborts the whole
+/// batch atomically. Insertions are grouped by anchor line and applied from
+/// the highest line down so earlier inserts never shift later anchors.
+pub(crate) fn apply_ops_to_content(
+    content: &str,
+    display_path: &str,
+    ops: &[&EditOp],
+) -> Result<String> {
+    // Pass 1 — resolve every op to a concrete change without mutating.
+    enum Change {
+        Spans {
+            start_byte: usize,
+            end_byte: usize,
+            replacement: String,
+        },
+        Lines {
+            line: usize,
+            after: bool,
+            text: String,
+        },
+    }
+    let mut changes = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            EditOp::Replace {
+                old_string,
+                new_string,
+                ..
+            } => {
+                anyhow::ensure!(
+                    !old_string.is_empty(),
+                    "'{display_path}': empty search string is not allowed"
+                );
+                let count = content.matches(old_string.as_str()).count();
+                anyhow::ensure!(
+                    count == 1,
+                    "'{display_path}': search string matched {count} times (must be exactly \
+                     once) — include more surrounding lines to make it unique"
+                );
+                let start = content.find(old_string.as_str()).unwrap_or(0);
+                changes.push(Change::Spans {
+                    start_byte: start,
+                    end_byte: start + old_string.len(),
+                    replacement: new_string.clone(),
+                });
+            }
+            EditOp::Insert {
+                line, text, after, ..
+            } => {
+                anyhow::ensure!(*line >= 1, "'{display_path}': line numbers are 1-based");
+                anyhow::ensure!(
+                    !text.trim().is_empty(),
+                    "'{display_path}': insertion text is empty"
+                );
+                let total = content.lines().count();
+                let max = if *after { total } else { total + 1 };
+                anyhow::ensure!(
+                    *line <= max,
+                    "'{display_path}': cannot insert {} line {line} (file has {total} lines)",
+                    if *after { "after" } else { "before" }
+                );
+                changes.push(Change::Lines {
+                    line: *line,
+                    after: *after,
+                    text: text.clone(),
+                });
+            }
+        }
+    }
+
+    // Conflict check: byte ranges touched by Replace ops must not overlap.
+    let mut spans: Vec<(usize, usize)> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Spans {
+                start_byte,
+                end_byte,
+                ..
+            } => Some((*start_byte, *end_byte)),
+            Change::Lines { .. } => None,
+        })
+        .collect();
+    spans.sort();
+    for pair in spans.windows(2) {
+        anyhow::ensure!(
+            pair[0].1 <= pair[1].0,
+            "'{display_path}': two staged edits overlap — split them into separate applies"
+        );
+    }
+    // Two insertions at the same anchor are ambiguous about ordering.
+    let mut anchors: Vec<(usize, bool)> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Lines { line, after, .. } => Some((*line, *after)),
+            Change::Spans { .. } => None,
+        })
+        .collect();
+    anchors.sort();
+    for pair in anchors.windows(2) {
+        anyhow::ensure!(
+            pair[0] != pair[1] || !pair[0].1,
+            "'{display_path}': multiple insertions anchored at the same point"
+        );
+    }
+
+    // Pass 2 — mutate. Replaces go highest byte offset first; inserts group
+    // by anchor line and apply bottom-up.
+    let mut updated = content.to_owned();
+    let mut span_changes: Vec<_> = changes
+        .iter()
+        .filter(|c| matches!(c, Change::Spans { .. }))
+        .collect();
+    span_changes.sort_by_key(|c| match c {
+        Change::Spans { start_byte, .. } => std::cmp::Reverse(*start_byte),
+        Change::Lines { .. } => std::cmp::Reverse(0),
+    });
+    for c in span_changes {
+        if let Change::Spans {
+            start_byte,
+            end_byte,
+            replacement,
+        } = c
+        {
+            updated.replace_range(*start_byte..*end_byte, replacement);
+        }
+    }
+
+    let mut line_changes: Vec<_> = changes
+        .iter()
+        .filter(|c| matches!(c, Change::Lines { .. }))
+        .collect();
+    line_changes.sort_by_key(|c| match c {
+        Change::Lines { line, after, .. } => (*line, !*after),
+        _ => (0, true),
+    });
+    // Bottom-up: inserting at higher lines first keeps lower anchors valid.
+    for c in line_changes.into_iter().rev() {
+        if let Change::Lines { line, after, text } = c {
+            let had_trailing_nl = updated.ends_with('\n');
+            let mut lines: Vec<String> = updated.lines().map(str::to_owned).collect();
+            let idx = if *after { *line } else { *line - 1 }; // 0-based slot
+            for (k, l) in text.lines().enumerate() {
+                lines.insert(idx + k, l.to_owned());
+            }
+            let mut joined = lines.join("\n");
+            if had_trailing_nl {
+                joined.push('\n');
+            }
+            updated = joined;
+        }
+    }
+    Ok(updated)
+}
+
+/// Builds the `EditOp` requested by one of the staging tools.
+fn parse_edit_op(name: &str, arguments_json: &str) -> Result<EditOp> {
+    #[derive(serde::Deserialize)]
+    struct EditArgs {
+        path: String,
+        old_string: Option<String>,
+        new_string: Option<String>,
+        line: Option<usize>,
+        text: Option<String>,
+    }
+    let args: EditArgs = parse_args(arguments_json)?;
+    anyhow::ensure!(!args.path.trim().is_empty(), "path must not be empty");
+    match name {
+        "edit_file" => Ok(EditOp::Replace {
+            path: args.path,
+            old_string: args
+                .old_string
+                .ok_or_else(|| anyhow::anyhow!("edit_file needs 'old_string'"))?,
+            new_string: args
+                .new_string
+                .ok_or_else(|| anyhow::anyhow!("edit_file needs 'new_string'"))?,
+        }),
+        "insert_after" | "insert_before" => Ok(EditOp::Insert {
+            path: args.path,
+            line: args
+                .line
+                .ok_or_else(|| anyhow::anyhow!("{name} needs 'line'"))?,
+            text: args
+                .text
+                .ok_or_else(|| anyhow::anyhow!("{name} needs 'text'"))?,
+            after: name == "insert_after",
+        }),
+        other => bail!("'{other}' does not stage edits"),
+    }
+}
+
+/// Fail-fast validation against ground truth: the target file must be a
+/// readable text file and the edit must apply cleanly right now. (Re-checked
+/// at apply time in case the file changed meanwhile.)
+fn validate_staged_op(base: &Path, op: &EditOp) -> Result<()> {
+    let full = resolve_in(base, op.path())?;
+    let meta = fs::metadata(&full).with_context(|| format!("cannot stat '{}'", op.path()))?;
+    anyhow::ensure!(meta.is_file(), "'{}' is not a regular file", op.path());
+    anyhow::ensure!(
+        meta.len() <= MAX_INPUT_FILE_BYTES,
+        "'{}' is larger than {} MB",
+        op.path(),
+        MAX_INPUT_FILE_BYTES / (1024 * 1024)
+    );
+    let bytes = fs::read(&full).with_context(|| format!("cannot read '{}'", op.path()))?;
+    anyhow::ensure!(
+        !bytes.contains(&0),
+        "'{}' looks binary; surgical edits are refused",
+        op.path()
+    );
+    let content = String::from_utf8_lossy(&bytes);
+    // Dry-run the single op to surface uniqueness/bounds errors immediately.
+    let refs = [op];
+    apply_ops_to_content(&content, op.path(), &refs)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Execution tools (run_shell / run_test / check_project)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_RUN_SHELL_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_RUN_TEST_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectKind {
+    Rust,
+    Node,
+    Python,
+}
+
+/// Detects the workspace's project type from its manifest files.
+fn detect_project() -> Option<ProjectKind> {
+    if Path::new("Cargo.toml").is_file() {
+        Some(ProjectKind::Rust)
+    } else if Path::new("package.json").is_file() {
+        Some(ProjectKind::Node)
+    } else if [
+        "pyproject.toml",
+        "pytest.ini",
+        "setup.py",
+        "requirements.txt",
+    ]
+    .iter()
+    .any(|f| Path::new(f).is_file())
+    {
+        Some(ProjectKind::Python)
+    } else {
+        None
+    }
+}
+
+/// Runs `program argv…` directly (no shell), enforcing timeout and output
+/// caps. The process inherits the executor's working directory — the project
+/// root — so relative paths inside build tools resolve correctly.
+async fn exec_argv(program: &str, argv: &[String], timeout_secs: u64) -> Result<String> {
+    let timeout_dur = Duration::from_secs(timeout_secs.clamp(1, MAX_SHELL_TIMEOUT_SECS));
+    let max_out = MAX_SHELL_OUTPUT_BYTES;
+    let started = Instant::now();
+    let spawned = tokio::process::Command::new(program).args(argv).output();
+    let output = match tokio::time::timeout(timeout_dur, spawned).await {
+        Err(_) => bail!("timed out after {}s", timeout_dur.as_secs()),
+        Ok(res) => res.with_context(|| format!("cannot spawn '{program}'"))?,
+    };
+    Ok(serde_json::json!({
+        "command": format!("{program} {}", argv.join(" ")).trim_end(),
+        "exit_code": output.status.code(),
+        "duration_ms": started.elapsed().as_millis() as u64,
+        "stdout": capped_lossy(&output.stdout, max_out),
+        "stderr": capped_lossy(&output.stderr, max_out),
+    })
+    .to_string())
+}
+
+/// On Windows several dev tools (npm, npx) are batch files that cannot be
+/// spawned as raw executables; route through cmd there. Unix spawns directly.
+async fn exec_tool(program: &str, argv: &[String], timeout_secs: u64) -> Result<String> {
+    if cfg!(windows) && matches!(program, "npm" | "npx") {
+        let mut wrapped = vec!["/C".to_owned(), program.to_owned()];
+        wrapped.extend(argv.iter().cloned());
+        return exec_argv("cmd", &wrapped, timeout_secs).await;
+    }
+    exec_argv(program, argv, timeout_secs).await
+}
+
+/// `run_shell`: an arbitrary shell command in the project directory.
+async fn run_shell_command(args: RunShellArgs) -> Result<String> {
+    let command = args.command.trim();
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    anyhow::ensure!(
+        command.chars().count() <= MAX_ARG_VALUE_CHARS,
+        "command too long (cap {MAX_ARG_VALUE_CHARS} chars)"
+    );
+    anyhow::ensure!(!command.contains('\0'), "command contains NUL bytes");
+    let timeout = args
+        .timeout_secs
+        .unwrap_or(DEFAULT_RUN_SHELL_TIMEOUT_SECS)
+        .clamp(1, MAX_SHELL_TIMEOUT_SECS);
+    if cfg!(windows) {
+        exec_argv("cmd", &["/C".to_owned(), command.to_owned()], timeout).await
+    } else {
+        exec_argv("sh", &["-c".to_owned(), command.to_owned()], timeout).await
+    }
+}
+
+/// Builds the argv for the workspace's test runner.
+fn test_command(kind: ProjectKind, filter: Option<&str>) -> (String, Vec<String>) {
+    let filter = filter.map(str::trim).filter(|f| !f.is_empty());
+    match kind {
+        ProjectKind::Rust => {
+            let mut argv = vec!["test".to_owned()];
+            if let Some(f) = filter {
+                argv.push(f.to_owned());
+            }
+            ("cargo".to_owned(), argv)
+        }
+        ProjectKind::Node => {
+            let mut argv = vec!["test".to_owned(), "--".to_owned()];
+            if let Some(f) = filter {
+                argv.push(f.to_owned());
+            }
+            ("npm".to_owned(), argv)
+        }
+        ProjectKind::Python => {
+            let mut argv = vec!["-m".to_owned(), "pytest".to_owned()];
+            if let Some(f) = filter {
+                argv.push("-k".to_owned());
+                argv.push(f.to_owned());
+            }
+            ("python".to_owned(), argv)
+        }
+    }
+}
+
+/// `run_test`: semantic wrapper over the detected test runner.
+async fn run_test_tool(args: RunTestArgs) -> Result<String> {
+    let kind = detect_project().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no supported project manifest found (Cargo.toml, package.json, pyproject.toml…)"
+        )
+    })?;
+    let timeout = args
+        .timeout_secs
+        .unwrap_or(DEFAULT_RUN_TEST_TIMEOUT_SECS)
+        .clamp(1, MAX_SHELL_TIMEOUT_SECS);
+    let (program, argv) = test_command(kind, args.filter.as_deref());
+    exec_tool(&program, &argv, timeout).await
+}
+
+/// Builds the compile/lint validation command for the project type.
+fn check_command(kind: ProjectKind) -> Result<(String, Vec<String>)> {
+    Ok(match kind {
+        ProjectKind::Rust => ("cargo".to_owned(), vec!["check".to_owned()]),
+        ProjectKind::Node => {
+            anyhow::ensure!(
+                Path::new("tsconfig.json").is_file(),
+                "no TypeScript config (tsconfig.json) — nothing to type-check"
+            );
+            (
+                "npx".to_owned(),
+                vec!["tsc".to_owned(), "--noEmit".to_owned()],
+            )
+        }
+        ProjectKind::Python => (
+            "python".to_owned(),
+            vec!["-m".to_owned(), "mypy".to_owned(), ".".to_owned()],
+        ),
+    })
+}
+
+/// `check_project`: compile/lint validation with errors fed back verbatim.
+async fn check_project_tool() -> Result<String> {
+    let kind = detect_project().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no supported project manifest found (Cargo.toml, tsconfig.json, pyproject.toml…)"
+        )
+    })?;
+    let (program, argv) = check_command(kind)?;
+    exec_tool(&program, &argv, 300).await
+}
+
+// ---------------------------------------------------------------------------
 // Sandbox
 // ---------------------------------------------------------------------------
 
 /// Anchors a workspace-relative path under `base`, rejecting absolute paths,
 /// rooted paths, and any `..` component. This is the single gate every
 /// workspace tool passes through before touching the filesystem.
-fn resolve_in(base: &Path, raw: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_in(base: &Path, raw: &str) -> Result<PathBuf> {
     anyhow::ensure!(
         !raw.trim().is_empty(),
         "path must not be empty ('.' lists the workspace root)"
@@ -802,9 +1661,422 @@ fn grep(base: &Path, args: &GrepArgs) -> Result<String> {
     Ok(matches.join("\n"))
 }
 
+/// `explain_code`: returns one symbol's source block, or an outline plus
+/// the head of the file when no symbol is named. Read-only; slices are
+/// derived from the same regex extraction as the symbol index.
+fn explain_code(base: &Path, args: &ExplainCodeArgs) -> Result<String> {
+    let path = resolve_in(base, &args.path)?;
+    let meta = fs::metadata(&path).with_context(|| format!("cannot stat '{}'", args.path))?;
+    anyhow::ensure!(meta.is_file(), "'{}' is not a regular file", args.path);
+    anyhow::ensure!(
+        meta.len() <= MAX_INPUT_FILE_BYTES,
+        "'{}' is larger than {} MB",
+        args.path,
+        MAX_INPUT_FILE_BYTES / (1024 * 1024)
+    );
+    let bytes = fs::read(&path).with_context(|| format!("cannot read '{}'", args.path))?;
+    anyhow::ensure!(
+        !bytes.contains(&0),
+        "'{}' looks binary (contains NUL bytes)",
+        args.path
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    let total_lines = text.lines().count();
+    let max_lines = args.max_lines.unwrap_or(120).clamp(1, 2000);
+
+    let slice = |start: usize, end: usize| -> String {
+        let stop = end
+            .min(total_lines + 1)
+            .min(start.saturating_add(max_lines));
+        text.lines()
+            .skip(start - 1)
+            .take(stop - start)
+            .enumerate()
+            .map(|(i, line)| format!("{:>5}| {}", start + i, line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let Some(name) = args
+        .symbol
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        // File overview: outline (when recognized) plus the head of the file.
+        let mut out = String::new();
+        if let Some(lang) = crate::outline::detect_language(&args.path) {
+            let o = crate::outline::outline(lang, &text);
+            if !o.is_empty() {
+                out.push_str(&o);
+            }
+        }
+        out.push_str(&format!(
+            "[file: {} — {total_lines} lines total]\n",
+            args.path
+        ));
+        out.push_str(&slice(1, max_lines + 1));
+        return Ok(out);
+    };
+
+    // Locate the symbol in this file: prefer the global index (fresh from a
+    // scan), falling back to on-the-fly extraction of just this file.
+    let cwd_index = crate::symbols::current();
+    let local = cwd_index.as_ref().and_then(|idx| {
+        idx.find(name, None)
+            .into_iter()
+            .find(|s| s.file == args.path.replace('\\', "/"))
+            .map(|s| (s.kind.to_owned(), s.name.clone(), s.line))
+    });
+    let located = match local {
+        Some(hit) => Some(hit),
+        None => crate::outline::detect_language(&args.path).and_then(|lang| {
+            crate::outline::symbols(lang, &text)
+                .into_iter()
+                .find(|s| s.label == name || s.label.contains(name))
+                .map(|s| (s.kind.to_owned(), s.label, s.line))
+        }),
+    };
+    let Some((kind, label, start)) = located else {
+        bail!(
+            "symbol '{name}' not found in '{}' — try grep first to locate it",
+            args.path
+        );
+    };
+
+    // The block runs until the next indexed symbol at or above its own
+    // definition level; a trailing cap keeps runaway blocks bounded.
+    let next_line = cwd_index
+        .as_ref()
+        .and_then(|idx| {
+            idx.symbols
+                .iter()
+                .filter(|s| s.file == args.path.replace('\\', "/") && s.line > start)
+                .map(|s| s.line)
+                .min()
+        })
+        .unwrap_or(total_lines + 1);
+
+    Ok(format!(
+        "[{kind} {label} — {}:{start}]\n{}\n[end of block]",
+        args.path,
+        slice(start, next_line)
+    ))
+}
+
+/// `git_commit`: optionally stages everything, then commits with the given
+/// message. Confirmation gating happens at the registry layer.
+async fn git_commit_tool(base: &Path, args: &GitCommitArgs) -> Result<String> {
+    let message = args.message.trim();
+    anyhow::ensure!(!message.is_empty(), "commit message must not be empty");
+    anyhow::ensure!(
+        message.chars().count() <= 500,
+        "commit message too long (cap 500 chars)"
+    );
+    if args.stage_all.unwrap_or(true) {
+        crate::git::run_git(base, &["add", "-A"]).await?;
+    }
+    let text = crate::git::run_git(base, &["commit", "-m", message]).await?;
+    Ok(format!("committed:\n{text}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that call `set_current_dir` — the process-wide
+    /// working directory is shared, so parallel tests would race otherwise.
+    fn cwd_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // -- staged edits --------------------------------------------------------
+
+    fn replace_op(old: &str, new: &str) -> EditOp {
+        EditOp::Replace {
+            path: "f.txt".into(),
+            old_string: old.into(),
+            new_string: new.into(),
+        }
+    }
+
+    #[test]
+    fn staged_replace_applies_exactly_once() {
+        let op = replace_op("b", "BETA");
+        let refs = [&op];
+        let out = apply_ops_to_content("a\nb\nc\nb\n", "f.txt", &refs).unwrap_err();
+        assert!(out.to_string().contains("2 times"), "{out}");
+        let op = replace_op("a\nb", "x");
+        let refs = [&op];
+        let out = apply_ops_to_content("a\nb\nc\n", "f.txt", &refs).unwrap();
+        assert_eq!(out, "x\nc\n");
+    }
+
+    #[test]
+    fn staged_replace_rejects_missing_and_empty_search() {
+        let op = replace_op("zzz", "y");
+        let refs = [&op];
+        let err = apply_ops_to_content("abc\n", "f.txt", &refs).unwrap_err();
+        assert!(err.to_string().contains("0 times"), "{err}");
+        let op = EditOp::Replace {
+            path: "f.txt".into(),
+            old_string: String::new(),
+            new_string: "y".into(),
+        };
+        let refs = [&op];
+        assert!(apply_ops_to_content("abc\n", "f.txt", &refs).is_err());
+    }
+
+    #[test]
+    fn staged_inserts_honor_line_anchors_and_bounds() {
+        let mk = |line: usize, after: bool, text: &str| EditOp::Insert {
+            path: "f.txt".into(),
+            line,
+            text: text.into(),
+            after,
+        };
+        let op = mk(1, true, "first!");
+        let out = apply_ops_to_content("a\nb\n", "f.txt", &[&op]).unwrap();
+        assert_eq!(out, "a\nfirst!\nb\n");
+        let op = mk(1, false, "top");
+        let out = apply_ops_to_content("a\nb\n", "f.txt", &[&op]).unwrap();
+        assert_eq!(out, "top\na\nb\n");
+        // after the last line is fine; past it is not
+        assert!(apply_ops_to_content("a\n", "f.txt", &[&mk(1, true, "x")]).is_ok());
+        assert!(apply_ops_to_content("a\n", "f.txt", &[&mk(2, false, "x")]).is_ok());
+        assert!(
+            apply_ops_to_content("a\n", "f.txt", &[&mk(3, true, "x")])
+                .unwrap_err()
+                .to_string()
+                .contains("after line 3")
+        );
+    }
+
+    #[test]
+    fn overlapping_replaces_conflict() {
+        let content = "hello world hello\n";
+        let r1 = replace_op("hello world", "X");
+        let r2 = replace_op("world hello", "Y");
+        let refs = [&r1, &r2];
+        let err = apply_ops_to_content(content, "f.txt", &refs).unwrap_err();
+        assert!(err.to_string().contains("overlap"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_insert_anchor_is_a_conflict() {
+        let i1 = EditOp::Insert {
+            path: "f.txt".into(),
+            line: 2,
+            text: "one".into(),
+            after: true,
+        };
+        let i2 = EditOp::Insert {
+            path: "f.txt".into(),
+            line: 2,
+            text: "two".into(),
+            after: true,
+        };
+        let refs = [&i1, &i2];
+        let err = apply_ops_to_content("a\nb\n", "f.txt", &refs).unwrap_err();
+        assert!(err.to_string().contains("same point"), "{err}");
+    }
+
+    #[test]
+    fn multiple_inserts_apply_bottom_up() {
+        let i1 = EditOp::Insert {
+            path: "f.txt".into(),
+            line: 1,
+            text: "top".into(),
+            after: true,
+        };
+        let i2 = EditOp::Insert {
+            path: "f.txt".into(),
+            line: 3,
+            text: "bottom".into(),
+            after: true,
+        };
+        let refs = [&i1, &i2];
+        let out = apply_ops_to_content("a\nb\nc\n", "f.txt", &refs).unwrap();
+        assert_eq!(out, "a\ntop\nb\nc\nbottom\n");
+    }
+
+    #[test]
+    fn staged_diff_previews_pending_edits() {
+        let ws = TempWs::new("stagediff");
+        fs::write(ws.0.join("f.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let op = EditOp::Replace {
+            path: "f.txt".into(),
+            old_string: "beta".into(),
+            new_string: "BETA".into(),
+        };
+        let diff = staged_diff(&ws.0, &[op]).unwrap();
+        assert!(diff.contains("--- a/f.txt"), "{diff}");
+        assert!(diff.contains("-beta\n+BETA\n"), "{diff}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn edit_tools_stage_through_executor_without_writes() {
+        let _guard = cwd_guard();
+        let orig = std::env::current_dir().unwrap();
+        let ws = TempWs::new("stageexec");
+        std::env::set_current_dir(&ws.0).unwrap();
+        fs::write(ws.0.join("code.rs"), "fn main() {}\n").unwrap();
+        let tools = BuiltinTools::default();
+
+        let out = tools
+            .execute(
+                "edit_file",
+                r#"{"path":"code.rs","old_string":"fn main() {}","new_string":"fn main() {\n    println!(\"hi\");\n}"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("\"staged\":true"), "{out}");
+        // Nothing written yet.
+        assert_eq!(
+            fs::read_to_string(ws.0.join("code.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+
+        let pending = tools.pending_edits();
+        assert_eq!(pending.lock().unwrap().ops().len(), 1);
+        let diff = tools.execute("view_diff", "{}").await.unwrap();
+        assert!(diff.contains("+    println!"), "{diff}");
+
+        pending.lock().unwrap().clear();
+        let _ = std::env::set_current_dir(orig);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn edit_file_rejects_nonunique_match_at_stage_time() {
+        let _guard = cwd_guard();
+        let orig = std::env::current_dir().unwrap();
+        let ws = TempWs::new("stagedup");
+        std::env::set_current_dir(&ws.0).unwrap();
+        fs::write(ws.0.join("dup.txt"), "same\nsame\n").unwrap();
+        let tools = BuiltinTools::default();
+        let err = tools
+            .execute(
+                "edit_file",
+                r#"{"path":"dup.txt","old_string":"same","new_string":"x"}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("2 times"), "{err}");
+        let _ = std::env::set_current_dir(orig);
+    }
+
+    #[test]
+    fn parse_edit_op_builds_expected_variants() {
+        let op = parse_edit_op("insert_after", r#"{"path":"a.rs","line":3,"text":"hi"}"#).unwrap();
+        match op {
+            EditOp::Insert { line, after, .. } => {
+                assert_eq!(line, 3);
+                assert!(after);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse_edit_op("edit_file", r#"{"path":"a"}"#).is_err());
+        assert!(parse_edit_op("view_diff", "{}").is_err());
+    }
+
+    #[tokio::test]
+    async fn run_shell_captures_output() {
+        let args = RunShellArgs {
+            command: "echo hello-run-shell".into(),
+            timeout_secs: Some(10),
+        };
+        let out = run_shell_command(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["exit_code"], 0);
+        assert!(
+            parsed["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("hello-run-shell"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_shell_reports_nonzero_exit_as_data() {
+        let args = RunShellArgs {
+            command: if cfg!(windows) {
+                "cmd /C exit 3".into()
+            } else {
+                "false".into()
+            },
+            timeout_secs: None,
+        };
+        let out = run_shell_command(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["exit_code"], 3);
+    }
+
+    #[tokio::test]
+    async fn run_shell_enforces_timeout_and_rejects_bad_input() {
+        let args = RunShellArgs {
+            command: if cfg!(windows) {
+                "ping -n 30 127.0.0.1".into()
+            } else {
+                "sleep 30".into()
+            },
+            timeout_secs: Some(1),
+        };
+        let err = run_shell_command(args).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        let empty = RunShellArgs {
+            command: "   ".into(),
+            timeout_secs: None,
+        };
+        assert!(run_shell_command(empty).await.is_err());
+    }
+
+    #[test]
+    fn test_command_builds_runner_argv_per_project_kind() {
+        let (prog, argv) = test_command(ProjectKind::Rust, Some("  my_test  "));
+        assert_eq!(prog, "cargo");
+        assert_eq!(argv, vec!["test", "my_test"]);
+        let (_, argv) = test_command(ProjectKind::Rust, None);
+        assert_eq!(argv, vec!["test"]);
+        let (_, argv) = test_command(ProjectKind::Node, Some("api"));
+        assert_eq!(argv, vec!["test", "--", "api"]);
+        let (_, argv) = test_command(ProjectKind::Python, None);
+        assert_eq!(argv, vec!["-m", "pytest"]);
+        let (_, argv) = test_command(ProjectKind::Python, Some("fast"));
+        assert_eq!(argv, vec!["-m", "pytest", "-k", "fast"]);
+    }
+
+    #[test]
+    fn check_command_builds_validation_argv_per_project_kind() {
+        let (prog, argv) = check_command(ProjectKind::Rust).unwrap();
+        assert_eq!(prog, "cargo");
+        assert_eq!(argv, vec!["check"]);
+        let (prog, argv) = check_command(ProjectKind::Python).unwrap();
+        assert_eq!(prog, "python");
+        assert_eq!(argv, vec!["-m", "mypy", "."]);
+        // Node validation requires a tsconfig.json next to package.json.
+        if Path::new("tsconfig.json").is_file() {
+            assert!(check_command(ProjectKind::Node).is_ok());
+        } else {
+            let err = check_command(ProjectKind::Node).unwrap_err();
+            assert!(err.to_string().contains("tsconfig"), "{err}");
+        }
+    }
+
+    #[test]
+    fn execution_tool_names_need_confirmation() {
+        let tools = BuiltinTools::default();
+        for name in ["write_file", "run_shell", "run_test", "check_project"] {
+            assert!(tools.requires_confirmation(name), "{name}");
+        }
+        // Staging edits only queues — no confirmation gate needed.
+        for name in ["edit_file", "insert_after", "insert_before", "view_diff"] {
+            assert!(!tools.requires_confirmation(name), "{name}");
+        }
+    }
 
     #[tokio::test]
     async fn current_time_returns_timestamp() {
@@ -1040,12 +2312,132 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn scan_project_runs_through_executor() {
+        // scan_project refreshes the shared symbol index; hold the global
+        // guard so parallel index tests don't interleave rebuilds.
+        let _index_guard = crate::symbols::tests::global_guard();
         let tools = BuiltinTools::default();
         let out = tools.execute("scan_project", "{}").await.unwrap();
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert!(parsed["files"]["total"].is_u64(), "{out}");
         assert!(!tools.requires_confirmation("scan_project"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn find_symbol_and_explain_code_work_through_executor() {
+        let _guard = cwd_guard();
+        // The executor reads the process-global symbol index; keep other
+        // index-mutating tests from swapping it mid-run. Held across awaits
+        // on purpose — no other test may rebuild while this one runs.
+        let _index_guard = crate::symbols::tests::global_guard();
+        let orig = std::env::current_dir().unwrap();
+        let ws = TempWs::new("symexec");
+        std::env::set_current_dir(&ws.0).unwrap();
+        // Start from a clean slate so ensure() builds THIS workspace's index.
+        crate::symbols::tests::reset_global();
+        fs::write(
+            ws.0.join("lib.rs"),
+            "pub struct Widget;\n\npub fn build() -> Widget {\n    Widget\n}\n",
+        )
+        .unwrap();
+        let tools = BuiltinTools::default();
+
+        // find_symbol locates definitions with kind/file/line
+        let out = tools
+            .execute("find_symbol", r#"{"name":"Widget"}"#)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["matches"], 1, "{out}");
+        assert_eq!(parsed["symbols"][0]["kind"], "struct");
+        assert_eq!(parsed["symbols"][0]["file"], "lib.rs");
+
+        // kind filter excludes non-matching kinds
+        let out = tools
+            .execute("find_symbol", r#"{"name":"Widget","kind":"trait"}"#)
+            .await
+            .unwrap();
+        assert!(out.contains("\"matches\":0"), "{out}");
+
+        // explain_code extracts one symbol's block with line numbers
+        let out = tools
+            .execute("explain_code", r#"{"path":"lib.rs","symbol":"build"}"#)
+            .await
+            .unwrap();
+        assert!(out.contains("[function build — lib.rs:3]"), "{out}");
+        assert!(out.contains("pub fn build() -> Widget {"), "{out}");
+        assert!(out.contains("[end of block]"), "{out}");
+
+        // explain_code without a symbol gives a file overview
+        let out = tools
+            .execute("explain_code", r#"{"path":"lib.rs"}"#)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("[outline]") || out.contains("[file: lib.rs"),
+            "{out}"
+        );
+        assert!(
+            tools
+                .execute("find_symbol", r#"{"name":42}"#)
+                .await
+                .is_err(),
+            "malformed args must error"
+        );
+        crate::symbols::tests::reset_global();
+        let _ = std::env::set_current_dir(orig);
+    }
+
+    #[tokio::test]
+    async fn git_tools_validate_input_and_gate_confirmation() {
+        let tools = BuiltinTools::default();
+        assert!(tools.requires_confirmation("git_commit"));
+        assert!(tools.requires_confirmation("git_branch"));
+        for name in ["git_diff", "git_log"] {
+            assert!(!tools.requires_confirmation(name), "{name}");
+        }
+        // Unknown branch action fails before spawning git.
+        let err = tools
+            .execute("git_branch", r#"{"action":"rebase"}"#)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown branch action"), "{err}");
+        // Empty commit message is rejected without touching git.
+        let err = tools
+            .execute("git_commit", r#"{"message":"   "}"#)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn explain_code_rejects_escaping_paths_and_missing_symbols() {
+        let ws = TempWs::new("explainsandbox");
+        fs::write(ws.0.join("a.rs"), "fn ok_fn() {}\n").unwrap();
+        let err = explain_code(
+            &ws.0,
+            &ExplainCodeArgs {
+                path: "../secrets.txt".into(),
+                symbol: None,
+                max_lines: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        fs::write(ws.0.join("b.rs"), "fn present_fn() {}\n").unwrap();
+        let err = explain_code(
+            &ws.0,
+            &ExplainCodeArgs {
+                path: "b.rs".into(),
+                symbol: Some("absent_fn".into()),
+                max_lines: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found in"), "{err}");
     }
 
     #[test]
@@ -1334,6 +2726,9 @@ mod tests {
 
     #[test]
     fn disabled_tool_toggles_roundtrip() {
+        // The toggle file resolves against the process cwd; serialize with
+        // tests that change directories.
+        let _guard = cwd_guard();
         let mut set = HashSet::new();
         set.insert("grep".to_owned());
         set.insert("write_file".to_owned());

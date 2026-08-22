@@ -39,14 +39,20 @@ can read the entire source of.
 | FR-2 | Multi-provider presets + `base_url` override | ✅ |
 | FR-3 | Tokenizer-trimmed context window aligned to user turns | ✅ |
 | FR-4 | Named sessions: save/load/resume/list/fork/autosave/export | ✅ |
-| FR-5 | Slash-command surface (~26 commands incl. runtime tuning) | ✅ |
-| FR-6 | Function calling: advertise tools, reassemble streamed calls, execute locally, loop ≤5 rounds, commit results atomically | ✅ |
-| FR-7 | `/tools` registry view + master on/off switch | ✅ |
+| FR-5 | Slash-command surface (35 commands incl. runtime tuning) | ✅ |
+| FR-6 | Function calling: advertise tools, reassemble streamed calls, execute locally, loop ≤5 rounds (+3 self-correction), commit results atomically | ✅ |
+| FR-7 | `/tools` registry view + master on/off switch + per-tool toggles | ✅ |
 | FR-8 | Retry with backoff honoring `Retry-After`; no duplicated output after partial emission | ✅ |
 | FR-9 | Caps: response size (`/limit`), SSE line, parallel calls (64), arguments (256 KB), stored results (8 K chars) | ✅ |
 | FR-10 | Undo/retry semantics that never split tool rounds | ✅ |
 | FR-11 | Concurrent answer variants with pick-to-commit | ✅ |
 | FR-12 | History compaction via summary turn | ✅ |
+| FR-13 | Workspace tools: sandboxed read/write/list/grep, staged surgical edits with diff review and atomic apply | ✅ |
+| FR-14 | Symbol index (`/scan`) with `find_symbol` / `explain_code` lookups | ✅ |
+| FR-15 | Context-aware windowing: prompt-mentioned files injected into the window | ✅ |
+| FR-16 | Execution tools: `run_shell`, `run_test`, `check_project` with confirmation gates | ✅ |
+| FR-17 | Git tools: `git_diff`, `git_log`, `git_branch`, `git_commit` (mutations gated) | ✅ |
+| FR-18 | `/plan <task>`: decompose → confirm → autonomous step execution tracked in `/todo` | ✅ |
 
 ## 6. Non-functional requirements
 - NFR-1 Performance: first token rendered as soon as it arrives; tool specs

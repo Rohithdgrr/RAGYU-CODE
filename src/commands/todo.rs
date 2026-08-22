@@ -26,7 +26,8 @@ pub fn load() -> Vec<Todo> {
         .unwrap_or_default()
 }
 
-fn save(app: &App) {
+/// Persists the current list (also used by `/plan` to track execution).
+pub(super) fn save(app: &App) {
     if let Ok(json) = serde_json::to_string_pretty(&app.todos)
         && let Err(e) = std::fs::write(todo_path(), json)
     {

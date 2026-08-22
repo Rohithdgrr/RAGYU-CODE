@@ -5,12 +5,17 @@ A minimal, pure-Rust CLI chatbot with streaming responses, conversation memory, 
 ## Features
 
 - **Multi-provider** — one binary for any OpenAI-compatible backend (`provider = "ollama"` in the config and you're talking to localhost)
-- **Function calling** — the model can invoke locally executed tools (`current_time`, `count_words`); multi-round tool loops with parallel calls, streamed fragment reassembly, and hard caps on call count, argument size, and result size
+- **Coding agent** — the model can read, grep, scan, stage surgical edits (`edit_file`/`insert_after`/`insert_before` reviewed via `/diff`, applied atomically with `/apply`), run shell commands/tests/compile checks, and use git tools — all sandboxed to the working directory with confirmation gates on anything destructive
+- **Symbol index** — an in-memory `file:line` index of functions, structs, enums, traits, impls, and macros built at startup; `find_symbol` locates definitions without grep-guessing
+- **Context-aware window** — files your prompt mentions ride along in the context window (plus manifest + same-dir siblings) even if they only appeared in old messages
+- **Self-correction loop** — failed verifications (non-zero exit codes, compile errors) grant up to 3 extra agent rounds so the model can fix its own mistakes
+- **Plan mode** — `/plan <task>` decomposes a task into steps, confirms with y/N, then executes them autonomously
+- **Function calling** — multi-round tool loops with parallel calls, streamed fragment reassembly, and hard caps on call count, argument size, and result size
 - **Token-aware context** — history is trimmed with a real BPE tokenizer against a configurable token budget
 - **Streaming + rendered output** — spinner while generating, then the answer is rendered as terminal markdown (or `/raw` for live token-by-token plain text)
 - **Concurrent variants** — `/variants 3` fires three parallel requests and races them
 - **Conversation history** — multi-turn memory with automatic context-window trimming
-- **Resilient** — byte-safe SSE parsing (survives chunks split mid-UTF-8-character), retries with backoff on 429/5xx, connect/read timeouts, 4 MB response cap
+- **Resilient** — byte-safe SSE parsing (survives chunks split mid-UTF-8-character), retries with backoff on 429/5xx, connect/read timeouts, response size cap
 - **Ctrl+C safe** — cancels the current reply and keeps whatever was generated so far
 - **Pure-Rust TLS** — rustls engine; OS certificate store via `rustls-native-certs` (no OpenSSL)
 
@@ -101,27 +106,38 @@ cargo run --release -- --resume work   # continue a saved session
 | `/timeout <secs>` | Per-request read-stall timeout (1–600 s) |
 | `/limit <mb>` | Response size cap in MB (1–64) |
 | `/tools [on\|off]` | List tools the model may call, or toggle function calling |
+| `/tools en\|dis <name>` | Enable/disable a single tool (persisted in `.govinda_tools.json`) |
 | `/todo [sub]` | Persistent task list: `list` · `add <text>` · `done <n>` · `undo <n>` · `rm <n>` · `clear` |
-| `/config` | Show current settings |
+| `/diff` | Show staged edits as a unified diff (nothing applied yet) |
+| `/apply` | Commit all staged edits to disk (atomic batch) |
+| `/reject` | Discard all staged edits |
+| `/scan` | Rebuild the symbol index and print a workspace overview |
+| `/plan <task>` | Decompose a task into steps, confirm, execute autonomously |
+| `/config [save]` | Show current settings; `save` persists them to the config file |
 
-Input line supports up/down history recall (persisted to `.govinda_history`) and standard editing keys.
+Input line supports up/down history recall (persisted to `.govinda_history`), slash-command completion as you type, and standard editing keys.
 
 Sessions are saved with real ISO-8601 `created_at` / `updated_at` timestamps, and the current conversation is auto-saved on exit (named sessions keep their name; unnamed ones become `auto-<epoch>`).
 
 ## Function calling
 
-Models that support OpenAI-style tools can call built-ins, which execute locally in the REPL:
+Models that support OpenAI-style tools can invoke built-ins, which execute locally in the REPL:
 
-- `current_time` — the user's local date/time (ISO-8601)
-- `count_words` — word/character counts for a given text
+- `current_time`, `count_words` — simple utilities
+- **Workspace**: `read_file` (with symbol outlines), `write_file`, `list_files`, `grep` — all paths sandboxed to the working directory; reads capped at 2 MB, writes confirmation-gated
+- **Staged editing**: `edit_file` (unique-match replace), `insert_after`, `insert_before` queue edits that are reviewed via `view_diff`/`/diff` and committed atomically by `/apply`
+- **Code intelligence**: `find_symbol` (kind-filtered definition lookup in the startup-built index), `explain_code` (one symbol's source block), `scan_project` (workspace overview + index refresh)
+- **Execution**: `run_shell` (confirmation, timeout, output caps), `run_test` (detected runner: cargo test / pytest / npm test), `check_project` (cargo check / tsc / mypy)
+- **Git**: `git_diff`, `git_log` (read-only), `git_branch`, `git_commit` (mutations confirmation-gated)
+- **User-defined** `[[tools]]` blocks in config.toml spawn external commands via argv templates with `{placeholder}` substitution — never a shell
 
-The agent loop runs up to 5 model↔tool rounds per turn: each requested call executes immediately (its invocation and truncated result print dimmed), results go back to the model as `role: "tool"` messages, and tool rounds move atomically in history (`/undo` never splits one). Safety rails:
+The agent loop runs up to 5 model↔tool rounds per turn; failed rounds (non-zero exit codes, compile errors) grant up to 3 self-correction rounds. Each requested call executes concurrently after sequential y/N confirmations (its invocation and truncated result print dimmed); results go back to the model as `role: "tool"` messages and tool rounds move atomically in history (`/undo` never splits one). Safety rails:
 
 - `/tools off` stops advertising tools entirely — nothing can be invoked
 - at most 64 parallel calls per turn, 256 KB of arguments per call, 8 K chars per stored result
 - executor failures send only a sanitized error line back to the model
 
-New Rust tools plug in by implementing the `ToolExecutor` trait (`src/tools.rs`) and registering it on `App`.
+New tools plug in by implementing the `ToolExecutor` trait (`src/tools.rs`) and registering it on `App`.
 
 ## Development
 
@@ -139,4 +155,4 @@ cargo fmt --check
 
 ## Roadmap
 
-User-defined shell tools · file attachments/RAG · full-TUI mode · config-file writing (`/config save`)
+File attachments/RAG · full-TUI mode · incremental symbol-index updates on edit

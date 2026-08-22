@@ -163,7 +163,20 @@ impl Session {
     /// fit in `budget_tokens` (real tokenizer counts, framing included),
     /// always aligned so the window begins on a user turn.
     pub fn window(&self, budget_tokens: usize) -> Vec<Message> {
-        let mut ctx = vec![Message::system(self.system.clone())];
+        self.window_with(budget_tokens, None)
+    }
+
+    /// [`Session::window`] with an extra workspace-context block (relevant
+    /// file contents) folded into the system message. The injected text
+    /// counts against the budget like any other content; when it alone
+    /// would exceed the budget the window still opens (the newest user
+    /// turn is never dropped), matching the existing over-budget policy.
+    pub fn window_with(&self, budget_tokens: usize, injected: Option<&str>) -> Vec<Message> {
+        let system_text = match injected.filter(|s| !s.trim().is_empty()) {
+            Some(extra) => format!("{}\n\n{extra}", self.system),
+            None => self.system.clone(),
+        };
+        let mut ctx = vec![Message::system(system_text)];
         if self.messages.is_empty() {
             return ctx;
         }
@@ -324,6 +337,23 @@ mod tests {
         let w = s.window(0);
         assert_eq!(w.len(), 2, "system + the single newest message");
         assert_eq!(w[1], Message::user("x".repeat(500)));
+    }
+
+    #[test]
+    fn window_with_folds_injection_into_the_system_message() {
+        let s = Session::new("sys");
+        let w = s.window_with(usize::MAX, Some("--- src/api.rs ---\nfn a() {}"));
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].content.starts_with("sys\n\n--- src/api.rs ---"),
+            "{:?}",
+            w[0].content
+        );
+        // Empty injections leave the system prompt untouched.
+        let w = s.window_with(usize::MAX, Some("   "));
+        assert_eq!(w[0].content, "sys");
+        let w = s.window_with(usize::MAX, None);
+        assert_eq!(w[0].content, "sys");
     }
 
     #[test]

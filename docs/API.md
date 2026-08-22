@@ -99,14 +99,42 @@ Also: `list_models(http, url, bearer) -> Result<Vec<String>>` (sorted ids).
 ```rust
 pub trait ToolExecutor: Send + Sync {
     fn specs(&self) -> Vec<Tool>;
-    fn execute(&self, name: &str, arguments_json: &str) -> Result<String>;
+    fn execute<'a>(&'a self, name: &'a str, arguments_json: &'a str)
+        -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+    fn requires_confirmation(&self, name: &str) -> bool;  // default: false
 }
 ```
 
-- `BuiltinTools`: `current_time` (local ISO-8601), `count_words`
-  (`{"text": ...}` → `{"words":n,"characters":n}`).
+`BuiltinTools` implements the trait and registers these built-ins:
+
+| Group | Tools |
+|---|---|
+| Utilities | `current_time`, `count_words` |
+| Workspace | `read_file` (symbol outlines), `write_file`, `list_files`, `grep` — sandboxed to the working directory |
+| Staged editing | `edit_file`, `insert_after`, `insert_before`, `view_diff` — queue into `PendingEdits`; `/apply` commits, `/reject` discards |
+| Code intelligence | `scan_project` (overview + symbol-index refresh), `find_symbol`, `explain_code` |
+| Execution | `run_shell`, `run_test`, `check_project` |
+| Git | `git_diff`, `git_log` (read-only); `git_branch`, `git_commit` (confirmation-gated) |
+
+User-defined `[[tools]]` from config.toml are appended as argv-template tools.
+
 - `parse_args<T: DeserializeOwned>(json) -> Result<T>` standardizes argument
   decoding for every executor.
+- `requires_confirmation` gates workspace writes, execution, and git
+  mutations behind the REPL's y/N prompt.
+
+## Symbols & context — `govinda_cli::{symbols, context}`
+
+- `symbols::rebuild(base) -> usize` walks the workspace (`.govindaignore`
+  respected) and installs a global `Arc<SymbolIndex>` snapshot;
+  `symbols::current()` reads it and `symbols::ensure(base)` builds lazily.
+- `SymbolIndex::find(name, kind)` ranks exact → case-insensitive → substring
+  matches, optionally filtered by one of `function | struct | enum | union |
+  trait | module | macro | impl | class`.
+- `context::relevant_files(input, base)` resolves mentioned paths to real
+  files and adds the manifest plus same-dir siblings (≤6 files);
+  `context::build_injection(&files, base)` renders the capped text block fed
+  to `Session::window_with`.
 
 ## Session — `govinda_cli::session`
 
@@ -117,6 +145,8 @@ Key operations on `Session`:
 - `commit_tool_round(prose, calls, &[(id, output)])` — atomic round commit
 - `window(budget_tokens)` — tokenizer-trimmed context; always opens on a user
   turn, never splits an assistant-tool-call group from its results
+- `window_with(budget_tokens, injected: Option<&str>)` — same trimming with a
+  workspace-context block folded into the system message
 - `undo()` — removes the last exchange; tool rounds move atomically
 - `approx_tokens()`, `search()`, `compact_with_summary()`,
   `save_to(path)` / `load_from(path)` (JSON, format version 2; version 1 files load unchanged)

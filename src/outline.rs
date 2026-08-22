@@ -109,7 +109,7 @@ impl RustRes {
                 .expect("valid regex"),
             macro_rules: Regex::new(&format!(r"(?m)^\s*macro_rules!\s*(?P<label>{ident})"))
                 .expect("valid regex"),
-            impl_block: Regex::new(r"(?m)^\s*impl\b(?P<rest>[^\n{]*)").expect("valid regex"),
+            impl_block: Regex::new(r"(?m)^[ \t]*impl\b(?P<rest>[^\n{]*)").expect("valid regex"),
             use_stmt: Regex::new(r"(?m)^[ \t]*use\s+(?P<rest>[^;\n]+);?").expect("valid regex"),
         }
     }
@@ -278,6 +278,61 @@ fn js_outline(text: &str) -> (Vec<Entry>, Vec<Entry>) {
     (symbols, imports)
 }
 
+/// A structured symbol extracted from source: machine-readable `kind`,
+/// display `label`, and 1-based `line`. Feeds the workspace symbol index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sym {
+    /// One of: function | struct | enum | union | trait | module | macro |
+    /// impl | class.
+    pub kind: &'static str,
+    pub label: String,
+    pub line: usize,
+}
+
+/// Structured symbol extraction (same heuristics as [`outline`], but
+/// machine-readable). Sorted by line; empty for unrecognized sources.
+pub fn symbols(lang: Language, text: &str) -> Vec<Sym> {
+    let (entries, _) = match lang {
+        Language::Rust => rust_outline(text),
+        Language::Python => python_outline(text),
+        Language::JavaScript => js_outline(text),
+    };
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            // Entry labels look like "fn name", "struct Name", "impl X for Y",
+            // "macro_rules! name", "def name", "class Name", or a bare impl
+            // header. Split off the leading keyword where present.
+            let (kind, label) = split_kind(&e.label)?;
+            Some(Sym {
+                kind,
+                label,
+                line: e.line,
+            })
+        })
+        .collect()
+}
+
+/// Maps an outline label like `"fn main"` or `"impl Runner for Config"` to
+/// `(kind, remaining label)`.
+fn split_kind(label: &str) -> Option<(&'static str, String)> {
+    let (kw, rest) = label.split_once(' ')?;
+    let kind = match kw {
+        "fn" | "def" | "function" => "function",
+        "struct" => "struct",
+        "enum" => "enum",
+        "union" => "union",
+        "trait" => "trait",
+        "mod" => "module",
+        "class" => "class",
+        "macro_rules!" => "macro",
+        "impl" => "impl",
+        _ => return None,
+    };
+    let rest = rest.trim();
+    (!rest.is_empty()).then(|| (kind, rest.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +423,49 @@ let plain = 5;
     fn empty_text_yields_empty_outline() {
         assert_eq!(outline(Language::Rust, ""), "");
         assert_eq!(outline(Language::Python, "# nothing here\n"), "");
+    }
+
+    #[test]
+    fn symbols_extracts_kinds_names_and_lines() {
+        let syms = symbols(Language::Rust, RUST_SRC);
+        let find = |kind: &str, name: &str| {
+            syms.iter()
+                .find(|s| s.kind == kind && s.label == name)
+                .unwrap_or_else(|| panic!("missing {kind} {name} in {syms:?}"))
+        };
+        assert_eq!(find("struct", "Config").line, 3);
+        assert_eq!(find("enum", "Mode").line, 7);
+        assert_eq!(find("trait", "Runner").line, 9);
+        assert_eq!(find("function", "start").line, 13);
+        assert_eq!(find("impl", "Runner for Config").line, 15);
+        assert_eq!(find("macro", "shout").line, 18);
+    }
+
+    #[test]
+    fn symbols_cover_python_and_javascript() {
+        let py = symbols(
+            Language::Python,
+            "class Dog:\n    def bark(self):\n        pass\n",
+        );
+        assert!(py.contains(&Sym {
+            kind: "class",
+            label: "Dog".into(),
+            line: 1
+        }));
+        assert!(py.contains(&Sym {
+            kind: "function",
+            label: "bark".into(),
+            line: 2
+        }));
+        let js = symbols(Language::JavaScript, "export function hi() {}\n");
+        assert_eq!(
+            js,
+            vec![Sym {
+                kind: "function",
+                label: "hi".into(),
+                line: 1
+            }]
+        );
     }
 
     #[test]
