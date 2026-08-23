@@ -25,6 +25,101 @@ pub fn completion(input: &str) -> Option<&'static str> {
         .find(|c| c.starts_with(input) && *c != input)
 }
 
+/// Filtered slash commands for palette. Returns up to 12 matches that start
+/// with the typed prefix (case-insensitive). Single "/" returns all.
+pub fn filtered(input: &str) -> Vec<&'static str> {
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+    // only the first token matters, before any whitespace
+    let token = input.split_whitespace().next().unwrap_or(input).to_ascii_lowercase();
+    if token.is_empty() || token == "/" {
+        return commands::SLASH_COMMANDS.to_vec();
+    }
+    commands::SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|c| c.starts_with(token.as_str()))
+        .collect()
+}
+
+/// Builds rich palette lines for dropdown — up to 10 rows, selected highlighted.
+pub fn palette_lines(input: &str, selected: usize) -> Vec<Line<'static>> {
+    let t = theme::active();
+    let hits = filtered(input);
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let max_show = 10usize;
+    // keep selected centered
+    let total = hits.len().min(max_show);
+    let sel = selected.min(total.saturating_sub(1));
+    let mut out = Vec::new();
+    // header
+    out.push(Line::styled(
+        format!(" {} commands ", hits.len()),
+        Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
+    ));
+    for (i, cmd) in hits.into_iter().take(max_show).enumerate() {
+        let is_sel = i == sel;
+        let bg = if is_sel { t.bg_hover } else { t.bg_tertiary };
+        let fg = if is_sel { t.accent_primary } else { t.text_secondary };
+        let mut style = Style::default().fg(fg).bg(bg);
+        if is_sel {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        let desc = describe(cmd);
+        let marker = if is_sel { "▸" } else { " " };
+        out.push(Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(t.accent_primary).bg(bg)),
+            Span::styled(cmd, style),
+            Span::styled(format!("  {desc}"), Style::default().fg(t.text_muted).bg(bg)),
+        ]));
+    }
+    out
+}
+
+fn describe(cmd: &str) -> &'static str {
+    match cmd {
+        "/help" => "show help",
+        "/exit" | "/quit" => "quit",
+        "/clear" | "/reset" => "clear chat",
+        "/models" => "list models",
+        "/model" => "switch model",
+        "/temp" => "temperature",
+        "/system" => "system prompt",
+        "/history" => "show history",
+        "/undo" => "undo last",
+        "/retry" => "retry last",
+        "/variants" => "alternates",
+        "/pick" => "pick variant",
+        "/compact" => "compact history",
+        "/search" => "search",
+        "/save" => "save session",
+        "/load" => "load session",
+        "/sessions" => "list sessions",
+        "/fork" => "fork session",
+        "/export" => "export md/txt",
+        "/stats" => "session stats",
+        "/theme" => "theme",
+        "/tokens" => "token usage",
+        "/raw" => "toggle markdown",
+        "/config" => "show/save config",
+        "/timeout" => "request timeout",
+        "/limit" => "response cap",
+        "/tools" => "tools registry",
+        "/todo" => "task list",
+        "/diff" => "staged diff",
+        "/apply" => "apply edits",
+        "/reject" => "discard edits",
+        "/review" => "review edits",
+        "/scan" => "scan workspace",
+        "/plan" => "plan task",
+        "/project" => "project memory",
+        _ => "",
+    }
+}
+
 /// Header chip content — returns styled line for block top title.
 pub fn header_line(mode: AppMode, focus_input: bool) -> Line<'static> {
     let t = theme::active();

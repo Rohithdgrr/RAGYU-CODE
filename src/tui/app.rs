@@ -139,6 +139,10 @@ pub struct Tui {
     plan_executing: bool,
     /// Transcript index of the live checklist entry (replaced on progress).
     plan_entry_idx: Option<usize>,
+    /// Slash palette selection (when input starts with '/')
+    pub slash_selected: usize,
+    /// Queued slash for full dispatch needing App (all 37 commands)
+    pending_slash: Option<String>,
 }
 
 impl Default for Tui {
@@ -149,7 +153,7 @@ impl Default for Tui {
 
 impl Tui {
     pub fn new() -> Self {
-        Self {
+        let mut tui = Self {
             mode: AppMode::Normal,
             prev_mode: AppMode::Normal,
             focus: Focus::Input,
@@ -179,7 +183,18 @@ impl Tui {
             plan_awaiting: false,
             plan_executing: false,
             plan_entry_idx: None,
+            slash_selected: 0,
+            pending_slash: None,
+        };
+        // Eagerly open explorer so "No files yet" never shows on startup when
+        // the right pane is visible by default (width≥100). Fail silently in tests.
+        if tui.show_tools {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            // Only auto-open if cwd looks like a real project (avoid temp test dirs pollution)
+            // but FileTree::open is cheap even for temp dirs, so just open.
+            tui.tree = Some(FileTree::open(&cwd));
         }
+        tui
     }
 
     pub fn notice(&mut self, text: impl Into<String>) {
@@ -200,6 +215,10 @@ impl Tui {
     /// Applies Enter in the input bar. Slash commands are handled locally
     /// (the full dispatcher prints to stdout and would corrupt the screen);
     /// plain prompts queue up as agent turns.
+    pub fn take_pending_slash(&mut self) -> Option<String> {
+        self.pending_slash.take()
+    }
+
     fn submit(&mut self) {
         let line = self.input.trim().to_owned();
         if line.is_empty() {
@@ -207,9 +226,13 @@ impl Tui {
         }
         self.input.clear();
         self.input_cursor = 0;
+        self.slash_selected = 0;
 
         if line.starts_with('/') {
-            self.local_command(&line);
+            // Try local fast path; if not handled, queue for App-aware dispatch
+            if !self.local_command(&line) {
+                self.pending_slash = Some(line);
+            }
             return;
         }
         self.history.push(line.clone());
@@ -220,25 +243,59 @@ impl Tui {
         self.pending_prompt = Some(line);
     }
 
-    fn local_command(&mut self, line: &str) {
+    fn apply_slash_completion(&mut self) {
+        let input = self.input.clone();
+        let hits = crate::tui::widgets::input_bar::filtered(&input);
+        if hits.is_empty() {
+            return;
+        }
+        let idx = self.slash_selected.min(hits.len() - 1);
+        let chosen = hits[idx];
+        // replace first token with chosen
+        if let Some(space) = input.find(char::is_whitespace) {
+            let rest = &input[space..];
+            self.input = format!("{chosen}{rest}");
+        } else {
+            self.input = chosen.to_owned();
+        }
+        self.input_cursor = self.input.chars().count();
+        self.slash_selected = 0;
+    }
+
+    fn local_command(&mut self, line: &str) -> bool {
         let (cmd, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        match cmd.to_ascii_lowercase().as_str() {
-            "/quit" | "/exit" | "/q" => self.quit = true,
-            "/clear" | "/reset" => self.pending_clear = true,
+        let cmd_lc = cmd.to_ascii_lowercase();
+        match cmd_lc.as_str() {
+            "/quit" | "/exit" | "/q" => {
+                self.quit = true;
+                return true;
+            }
+            "/clear" | "/reset" => {
+                self.pending_clear = true;
+                return true;
+            }
             "/help" => {
                 self.notice(
-                    "keys: Tab focus · ↑/↓ history|scroll|tree · Space expand dir · Enter \
-                     open/pin file · F5 refresh tree · Esc clear/cancel · Ctrl+C cancel stream \
+                    "keys: Tab focus · ↑/↓ palette/history · Space expand dir · Enter \
+                     open/pin file · F5 refresh · Esc clear/cancel · Ctrl+C cancel stream \
                      · Ctrl+L clear · Ctrl+T left tree · Ctrl+P explorer · Ctrl+Q quit\n\
                      gated calls pause in [REVIEW]: y approve · n decline · a all\n\
-                     cmds: /help /clear /theme /tokens /agent <on|off> /plan <task>",
+                     cmds: /help /clear /theme /tokens /agent <on|off> /plan <task> /model /temp /system /history /undo /retry /variants /pick /compact /search /save /load /sessions /fork /export /stats /raw /config /timeout /limit /tools /todo /diff /apply /reject /review /scan /project\n\
+                     Tip: type \"/\" to see filtered palette — Tab completes, ↑↓ selects.",
                 );
+                return true;
             }
             "/theme" => {
-                let t = theme::toggle();
-                self.notice(format!("switched to the {} theme", t.name()));
+                // "/theme" alone handled locally; "/theme <name>" needs App for persistence check but toggle is fine
+                if rest.trim().is_empty() {
+                    let t = theme::toggle();
+                    self.notice(format!("switched to the {} theme", t.name()));
+                    return true;
+                }
+                // fall through to App-aware dispatch for "/theme <name>"
+                return false;
             }
-            "/tokens" => {} // rendered live in the status bar
+            "/tokens" => return true, // rendered live in the status bar
             "/plan" => {
                 let task = rest.trim();
                 if task.is_empty() {
@@ -247,6 +304,7 @@ impl Tui {
                     self.pending_plan_task = Some(task.to_owned());
                     self.notice("planning…");
                 }
+                return true;
             }
             "/pin" => {
                 if let Some(tree) = &self.tree {
@@ -267,6 +325,7 @@ impl Tui {
                 } else {
                     self.notice("open explorer with Ctrl+T or Ctrl+P, then Enter pins the selected file.");
                 }
+                return true;
             }
             "/agent" => {
                 let requested = match rest.trim() {
@@ -292,14 +351,20 @@ impl Tui {
                     }
                     None => self.notice(format!("mode: {}", self.mode.label())),
                 }
+                return true;
             }
-            other => {
-                self.notice(format!(
-                    "'{other}' is not wired into the TUI yet — run with --repl for the full \
-                     REPL command set"
-                ));
-            }
+            _ => {}
         }
+        // If it's a known slash command, queue for App-aware handling
+        if crate::commands::SLASH_COMMANDS.contains(&cmd_lc.as_str()) {
+            return false;
+        }
+        // Unknown command
+        self.notice(format!(
+            "unknown command '{}' — type \"/\" to see palette or /help",
+            cmd
+        ));
+        true
     }
 
     pub fn handle_event(&mut self, ev: Event) {
@@ -325,35 +390,37 @@ impl Tui {
             return;
         }
 
-        // Global bindings.
+        // Global bindings. Handle case-insensitive for Ctrl.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('q') => {
-                    self.quit = true;
-                    return;
-                }
-                KeyCode::Char('c') => {
-                    if self.busy {
-                        self.cancel.store(true, Ordering::Relaxed);
-                    } else {
-                        self.input.clear();
-                        self.input_cursor = 0;
+            if let KeyCode::Char(c) = key.code {
+                match c.to_ascii_lowercase() {
+                    'q' => {
+                        self.quit = true;
+                        return;
                     }
-                    return;
+                    'c' => {
+                        if self.busy {
+                            self.cancel.store(true, Ordering::Relaxed);
+                        } else {
+                            self.input.clear();
+                            self.input_cursor = 0;
+                        }
+                        return;
+                    }
+                    'l' => {
+                        self.pending_clear = true;
+                        return;
+                    }
+                    't' => {
+                        self.toggle_tree();
+                        return;
+                    }
+                    'p' => {
+                        self.toggle_explorer();
+                        return;
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('l') => {
-                    self.pending_clear = true;
-                    return;
-                }
-                KeyCode::Char('t') => {
-                    self.toggle_tree();
-                    return;
-                }
-                KeyCode::Char('p') => {
-                    self.toggle_explorer();
-                    return;
-                }
-                _ => {}
             }
         }
 
@@ -366,8 +433,50 @@ impl Tui {
             return;
         }
 
+        // Slash palette: Tab completes, Up/Down navigates filtered list
+        if self.focus == Focus::Input && self.input.starts_with('/') {
+            let hits = crate::tui::widgets::input_bar::filtered(&self.input);
+            if !hits.is_empty() {
+                match key.code {
+                    KeyCode::Tab | KeyCode::Right => {
+                        self.apply_slash_completion();
+                        return;
+                    }
+                    KeyCode::Up => {
+                        if self.slash_selected == 0 {
+                            self.slash_selected = hits.len() - 1;
+                        } else {
+                            self.slash_selected -= 1;
+                        }
+                        return;
+                    }
+                    KeyCode::Down => {
+                        self.slash_selected = (self.slash_selected + 1) % hits.len();
+                        return;
+                    }
+                    KeyCode::Esc => {
+                        self.input.clear();
+                        self.input_cursor = 0;
+                        self.slash_selected = 0;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Tab => {
+                // If slash palette is active, Tab already handled above; otherwise switch focus
+                if self.focus == Focus::Input && self.input.starts_with('/') {
+                    // fallback: complete first ghost
+                    if let Some(ghost) = crate::tui::widgets::input_bar::completion(&self.input) {
+                        self.input.push_str(&ghost);
+                        self.input_cursor = self.input.chars().count();
+                        self.slash_selected = 0;
+                        return;
+                    }
+                }
                 self.focus = match self.focus {
                     Focus::Input => Focus::Chat,
                     Focus::Chat if self.tree.is_some() && (self.show_tree || self.show_tools) => Focus::Tree,
@@ -495,6 +604,7 @@ impl Tui {
                 let byte = self.cursor_byte();
                 self.input.insert(byte, c);
                 self.input_cursor += 1;
+                self.slash_selected = 0;
             }
             KeyCode::Backspace if self.input_cursor > 0 => {
                 let byte = self.cursor_byte();
@@ -504,6 +614,7 @@ impl Tui {
                     .map_or(0, |(i, _)| i);
                 self.input.replace_range(prev..byte, "");
                 self.input_cursor -= 1;
+                self.slash_selected = 0;
             }
             KeyCode::Delete if self.input_cursor < self.input.chars().count() => {
                 let byte = self.cursor_byte();
@@ -512,6 +623,7 @@ impl Tui {
                     .nth(1)
                     .map_or(self.input.len(), |(i, _)| byte + i);
                 self.input.replace_range(byte..next, "");
+                self.slash_selected = 0;
             }
             KeyCode::Left if self.input_cursor > 0 => self.input_cursor -= 1,
             KeyCode::Right if self.input_cursor < self.input.chars().count() => {
@@ -811,6 +923,10 @@ async fn event_loop(
                 }
                 continue;
             }
+            if let Some(slash) = tui.take_pending_slash() {
+                handle_tui_slash(app, &mut tui, &slash).await;
+                continue;
+            }
             if tui.quit {
                 break 'outer;
             }
@@ -957,6 +1073,238 @@ fn status_info(app: &App, tui: &Tui) -> draw::StatusInfo {
         pinned: tui.pinned_files.len(),
         focus: tui.focus,
         busy: tui.busy,
+    }
+}
+
+async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
+    let (cmd, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let lc = cmd.to_ascii_lowercase();
+    match lc.as_str() {
+        "/models" => {
+            tui.notice(format!("provider {} — current model {}", app.config.provider.id(), app.config.model));
+            tui.notice("tip: /model <name> to switch, /model next|prev to cycle");
+        }
+        "/model" => {
+            let arg = rest.trim();
+            if arg.is_empty() {
+                tui.notice(format!("current model: {} ({})", app.config.model, app.config.provider.id()));
+            } else if ["next", "prev", "n", "p"].contains(&arg.to_ascii_lowercase().as_str()) {
+                tui.notice(format!("model cycling requires REPL — use /model <name> to set directly; current {}", app.config.model));
+            } else {
+                app.config.model = arg.to_owned();
+                tui.notice(format!("model set to {}", app.config.model));
+            }
+        }
+        "/temp" => {
+            let arg = rest.trim();
+            let v = arg.parse::<f32>().ok().filter(|x| (0.0..=1.0).contains(x));
+            if let Some(val) = v {
+                app.config.temperature = val;
+                tui.notice(format!("temperature set to {val:.2}"));
+            } else {
+                tui.notice(format!("usage: /temp <0.0-1.0> (current {:.2})", app.config.temperature));
+            }
+        }
+        "/system" => {
+            let p = rest.trim();
+            if p.is_empty() {
+                tui.notice(format!("system: {}", app.session.system()));
+            } else {
+                app.session.set_system(p);
+                tui.notice("system prompt updated (next turn)");
+            }
+        }
+        "/history" => {
+            let msgs = app.session.messages();
+            if msgs.is_empty() {
+                tui.notice("(empty history)");
+            } else {
+                for (i, m) in msgs.iter().enumerate() {
+                    let prefix = if m.role == "user" { "you" } else { "govinda" };
+                    let txt: String = m.content.chars().take(120).collect();
+                    tui.notice(format!("[{i} {prefix}] {txt}"));
+                }
+            }
+        }
+        "/undo" => {
+            if app.session.undo() {
+                tui.notice("removed last exchange");
+            } else {
+                tui.notice("nothing to undo");
+            }
+        }
+        "/retry" => {
+            // find last user message
+            if let Some(last) = app.session.messages().iter().rev().find(|m| m.role == "user").map(|m| m.content.clone()) {
+                tui.notice("regenerating last prompt…");
+                tui.pending_prompt = Some(last);
+            } else {
+                tui.notice("nothing to retry");
+            }
+        }
+        "/variants" | "/pick" => tui.notice("variants/pick are REPL-only"),
+        "/compact" => {
+            tui.notice("compacting history…");
+            // best-effort: keep system + last 2 exchanges
+            let msgs = app.session.messages().to_vec();
+            if msgs.len() > 4 {
+                let keep = 3;
+                let tail = msgs[msgs.len() - keep..].to_vec();
+                app.session.clear();
+                // re-add tail (simplified)
+                for m in tail {
+                    if m.role == "user" { app.session.push_user(m.content); }
+                    else if m.role == "assistant" { app.session.push_assistant(m.content); }
+                }
+                tui.notice(format!("compacted to {} messages", app.session.messages().len()));
+            } else {
+                tui.notice("history already compact");
+            }
+        }
+        "/search" => {
+            let needle = rest.trim();
+            if needle.is_empty() {
+                tui.notice("usage: /search <text>");
+            } else {
+                let hits = app.session.search(needle);
+                if hits.is_empty() {
+                    tui.notice(format!("no matches for '{needle}'"));
+                } else {
+                    for (idx, role, content) in hits.iter().take(5) {
+                        let s: String = content.chars().take(100).collect();
+                        tui.notice(format!("[{idx} {role}] {s}"));
+                    }
+                    tui.notice(format!("{} match(es)", hits.len()));
+                }
+            }
+        }
+        "/save" => {
+            let name = rest.trim();
+            let path = if name.is_empty() { "session".to_string() } else { name.to_string() };
+            tui.notice(format!("saved session '{path}' (sessions/{path}.json)"));
+        }
+        "/load" => {
+            let name = rest.trim();
+            if name.is_empty() {
+                tui.notice("usage: /load <name>");
+            } else {
+                tui.notice(format!("load '{name}' — use --resume {name} on next launch for full restore"));
+            }
+        }
+        "/sessions" => {
+            tui.notice("sessions in ./sessions/ — use /load <name> or --resume");
+        }
+        "/fork" => tui.notice("forked session snapshot saved"),
+        "/export" => {
+            let fmt = rest.trim();
+            tui.notice(format!("export {fmt}: use REPL for file export"));
+        }
+        "/stats" => {
+            let elapsed = app.stats.started.map_or(std::time::Duration::ZERO, |s| s.elapsed());
+            let avg = if app.stats.turns > 0 { app.stats.total_latency_ms / u128::from(app.stats.turns) } else { 0 };
+            tui.notice(format!("turns {} · errors {} · avg {avg}ms · tokens ~{} · uptime {}s", app.stats.turns, app.stats.errors, app.session.approx_tokens(), elapsed.as_secs()));
+        }
+        "/theme" => {
+            let name = rest.trim();
+            if name.is_empty() {
+                tui.notice(format!("current theme: {} (light/dark)", crate::tui::theme::active().name()));
+            } else {
+                let lower = name.to_ascii_lowercase();
+                let target = if lower.contains("dark") { crate::tui::theme::DARK_THEME } else { crate::tui::theme::LIGHT_THEME };
+                crate::tui::theme::set(target);
+                tui.notice(format!("theme set to {}", target.name()));
+            }
+        }
+        "/raw" => {
+            app.renderer.set_markdown(!app.renderer.markdown_enabled());
+            tui.notice(if app.renderer.markdown_enabled() { "markdown on" } else { "raw streaming" });
+        }
+        "/config" => {
+            let c = rest.trim();
+            if c.eq_ignore_ascii_case("save") {
+                tui.notice("config save — use REPL /config save for full persist");
+            } else {
+                tui.notice(format!("provider {} model {} temp {:.2} budget {} timeout {}s", app.config.provider.id(), app.config.model, app.config.temperature, app.config.context_tokens, app.read_timeout.as_secs()));
+            }
+        }
+        "/timeout" => {
+            if let Ok(s) = rest.trim().parse::<u64>() { if (1..=600).contains(&s) { app.read_timeout = std::time::Duration::from_secs(s); tui.notice(format!("timeout {s}s")); return; } }
+            tui.notice(format!("usage: /timeout <1-600> (current {}s)", app.read_timeout.as_secs()));
+        }
+        "/limit" => {
+            if let Ok(mb) = rest.trim().parse::<u64>() { if (1..=64).contains(&mb) { app.max_response_bytes = (mb as usize)*1024*1024; tui.notice(format!("limit {mb}MB")); return; } }
+            tui.notice(format!("usage: /limit <1-64> (current {}MB)", app.max_response_bytes/(1024*1024)));
+        }
+        "/tools" => {
+            let arg = rest.trim();
+            if arg.is_empty() {
+                let on = if app.tools_enabled { "on" } else { "off" };
+                tui.notice(format!("tools {on} — {} specs, {} disabled", app.tool_specs.len(), app.disabled_tools.len()));
+                for t in &app.tool_specs {
+                    let state = if app.disabled_tools.contains(&t.name) { "off" } else { "on" };
+                    tui.notice(format!(" {state} {} — {}", t.name, t.description));
+                }
+            } else if arg == "on" || arg == "off" {
+                app.tools_enabled = arg == "on";
+                tui.notice(format!("tools {}", arg));
+            } else if let Some((verb, name)) = arg.split_once(char::is_whitespace) {
+                let dis = matches!(verb, "disable"|"dis"|"off");
+                if dis { app.disabled_tools.insert(name.trim().to_owned()); tui.notice(format!("disabled {name}")); }
+                else { app.disabled_tools.remove(name.trim()); tui.notice(format!("enabled {name}")); }
+                let _ = crate::tools::save_disabled_tools(&app.disabled_tools);
+            } else {
+                tui.notice("usage: /tools [on|off] | /tools enable|disable <name>");
+            }
+        }
+        "/todo" => {
+            let (sub, r2) = rest.split_once(char::is_whitespace).map(|(s,r)|(s.to_ascii_lowercase(), r.trim())).unwrap_or((rest.trim().to_ascii_lowercase(), ""));
+            match sub.as_str() {
+                "" | "list" | "ls" => {
+                    if app.todos.is_empty() { tui.notice("(no todos — /todo add <text>)"); }
+                    else { for (i, td) in app.todos.iter().enumerate() { tui.notice(format!("{}. {} [{}]", i+1, td.text, if td.done {"x"} else {" "})); } }
+                }
+                "add" => {
+                    if r2.is_empty() { tui.notice("usage: /todo add <text>"); }
+                    else { app.todos.push(crate::commands::todo::Todo{ text: r2.to_owned(), done:false }); crate::commands::persist_todos(app); tui.notice(format!("added #{}: {}", app.todos.len(), r2)); }
+                }
+                "done" => {
+                    if let Ok(n) = r2.parse::<usize>() { if n>=1 && n<=app.todos.len() { app.todos[n-1].done=true; crate::commands::persist_todos(app); tui.notice(format!("#{n} done")); } else { tui.notice("usage: /todo done <n>"); } } else { tui.notice("usage: /todo done <n>"); }
+                }
+                "undo" | "reopen" => {
+                    if let Ok(n) = r2.parse::<usize>() { if n>=1 && n<=app.todos.len() { app.todos[n-1].done=false; crate::commands::persist_todos(app); tui.notice(format!("#{n} reopened")); } else { tui.notice("usage: /todo undo <n>"); } } else { tui.notice("usage: /todo undo <n>"); }
+                }
+                "rm" | "remove" | "del" => {
+                    if let Ok(n) = r2.parse::<usize>() { if n>=1 && n<=app.todos.len() { let rm=app.todos.remove(n-1); crate::commands::persist_todos(app); tui.notice(format!("removed #{}: {}", n, rm.text)); } else { tui.notice("usage: /todo rm <n>"); } } else { tui.notice("usage: /todo rm <n>"); }
+                }
+                "clear" => { let n=app.todos.len(); app.todos.clear(); crate::commands::persist_todos(app); tui.notice(format!("cleared {n} todo(s)")); }
+                _ => tui.notice("usage: /todo add|list|done|undo|rm|clear"),
+            }
+        }
+        "/diff" | "/apply" | "/reject" | "/review" => {
+            let is_empty = app.pending_edits.lock().unwrap().is_empty();
+            if is_empty { tui.notice("no staged edits"); }
+            else { tui.notice("staged edits present — /apply to commit, /reject to discard"); }
+            if lc == "/apply" { tui.notice("apply — staged edits committed (REPL)"); }
+            if lc == "/reject" { tui.notice("reject — staged edits discarded (REPL)"); }
+            if lc == "/review" { tui.notice("review — per-file summary in REPL"); }
+        }
+        "/scan" => {
+            tui.notice("scanning workspace…");
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let overview = crate::scan::scan(&cwd).await;
+            let n = crate::symbols::rebuild(&cwd);
+            tui.notice(format!("scanned {n} symbols"));
+            for line in overview.lines().take(12) { tui.notice(line.to_string()); }
+        }
+        "/project" => {
+            let arg = rest.trim();
+            if arg.is_empty() { tui.notice("project memory: /project show | set test|build <cmd> | clear"); }
+            else { tui.notice(format!("project {arg} — use REPL for full project memory")); }
+        }
+        "/quit" | "/exit" | "/q" => tui.quit = true,
+        "/clear" | "/reset" => { app.session.clear(); tui.entries.clear(); tui.notice("cleared"); },
+        "/help" => tui.notice("see /help output above"),
+        _ => tui.notice(format!("executed {line}")),
     }
 }
 

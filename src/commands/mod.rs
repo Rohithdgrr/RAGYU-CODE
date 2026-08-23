@@ -4,7 +4,7 @@ mod generation;
 mod persistence;
 mod plan;
 mod project;
-mod todo;
+pub mod todo;
 
 use crate::config::Config;
 use crate::render::{Renderer, accent, dim_color, err_color, ok_color, paint, theme_names};

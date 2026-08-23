@@ -221,6 +221,44 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
             place_cursor(f, inner.x, inner.y, &tui.input, tui.input_cursor);
         }
     }
+
+    // — Slash palette dropdown: filtered "/" commands above input —
+    if focus_input && tui.input.starts_with('/') && !tui.input.contains(' ') {
+        let hits = input_bar::filtered(&tui.input);
+        if !hits.is_empty() {
+            let lines = input_bar::palette_lines(&tui.input, tui.slash_selected);
+            if !lines.is_empty() {
+                let pal_h = (lines.len() as u16 + 2).min(12);
+                let pal_w = area.width.saturating_sub(2).min(56);
+                let pal_x = area.x;
+                // place just above input block
+                let pal_y = area.y.saturating_sub(pal_h);
+                let pal_rect = Rect {
+                    x: pal_x,
+                    y: pal_y.max(1),
+                    width: pal_w,
+                    height: pal_h,
+                };
+                let pal_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(t.accent_primary).bg(t.bg_tertiary))
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .title(" ⌘ COMMANDS ")
+                    .title_style(
+                        Style::default()
+                            .fg(t.accent_primary)
+                            .bg(t.bg_tertiary)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .style(Style::default().bg(t.bg_tertiary));
+                let pal_inner = pal_block.inner(pal_rect);
+                f.render_widget(pal_block, pal_rect);
+                // height may be less than lines if clamped, slice
+                let slice: Vec<Line<'static>> = lines.into_iter().take(pal_inner.height as usize).collect();
+                f.render_widget(Paragraph::new(slice).style(Style::default().bg(t.bg_tertiary)), pal_inner);
+            }
+        }
+    }
 }
 
 /// Positions the terminal cursor after the `❯ ` prompt at `x`.
