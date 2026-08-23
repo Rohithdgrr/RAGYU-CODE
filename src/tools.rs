@@ -52,7 +52,7 @@ const MAX_ARG_VALUE_CHARS: usize = 8 * 1024;
 /// (the model sees this string too, so it must stay bounded).
 const MAX_DIFF_PREVIEW_CHARS: usize = 4_000;
 /// Names reserved by built-in implementations; user tools cannot shadow them.
-const BUILTIN_TOOL_NAMES: [&str; 20] = [
+const BUILTIN_TOOL_NAMES: [&str; 24] = [
     "current_time",
     "count_words",
     "read_file",
@@ -73,6 +73,10 @@ const BUILTIN_TOOL_NAMES: [&str; 20] = [
     "git_log",
     "git_branch",
     "git_commit",
+    "open_preview",
+    "web_search",
+    "web_fetch",
+    "ask_user",
 ];
 /// `{placeholder}` tokens inside shell-tool `args_template` words.
 #[allow(clippy::expect_used)] // static, hand-checked patterns
@@ -332,9 +336,12 @@ impl ToolExecutor for BuiltinTools {
             ),
             Tool::new(
                 "run_shell",
-                "Run a shell command in the project directory. Use for: cargo check, cargo \
-                 test, npm test, git diff, etc. Requires user confirmation; output is capped \
-                 and a timeout applies.",
+                "Run ANY shell command in the project directory — build, test, lint, git, \
+                 package managers, start dev servers (npm run dev, python -m http.server), \
+                 open files or URLs in the browser (start on Windows, xdg-open on Linux), \
+                 launch apps. Never claim you cannot open a browser or run a program — you \
+                 can, via this tool. Requires user confirmation; output is capped and a \
+                 timeout applies.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -342,6 +349,20 @@ impl ToolExecutor for BuiltinTools {
                         "timeout_secs": {"type": "integer", "description": "Wall-clock cap in seconds (default 60, max 600)"}
                     },
                     "required": ["command"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "open_preview",
+                "Serve the workspace over a local HTTP server and open a file in the user's \
+                 browser — the right way to show an HTML/CSS/JS preview after creating or \
+                 editing web files. Relative assets resolve against the workspace root. \
+                 Requires user confirmation (it starts a server).",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file to open, e.g. index.html (default index.html)"}
+                    },
                     "additionalProperties": false
                 }),
             ),
@@ -421,6 +442,52 @@ impl ToolExecutor for BuiltinTools {
                     "additionalProperties": false
                 }),
             ),
+            Tool::new(
+                "web_search",
+                "Search the web using a search engine API. Returns search results with titles, \
+                 URLs, and snippets. Use this to find current information, documentation, \
+                 or verify facts.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query string"},
+                        "max_results": {"type": "integer", "description": "Maximum results to return (default 5, max 20)"}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "web_fetch",
+                "Fetch the content of a web page by URL. Returns the readable text content \
+                 of the page (stripped of HTML, scripts, and navigation). Use for reading \
+                 documentation, articles, or API responses.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "URL to fetch (http:// or https://)"},
+                        "max_chars": {"type": "integer", "description": "Maximum characters to return (default 20000)"}
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "ask_user",
+                "Ask the user a clarifying question before proceeding. The question is \
+                 displayed as an input gate that pauses the agent turn. Use this when \
+                 you need user input, clarification, or a decision that only the user \
+                 can make. The user's response is returned as the tool result.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "The question to ask the user"},
+                        "options": {"type": "array", "items": {"type": "string"}, "description": "Optional list of suggested answer options"}
+                    },
+                    "required": ["question"],
+                    "additionalProperties": false
+                }),
+            ),
         ];
         for def in &self.shell_tools {
             specs.push(Tool::new(
@@ -435,7 +502,8 @@ impl ToolExecutor for BuiltinTools {
     fn requires_confirmation(&self, name: &str) -> bool {
         matches!(
             name,
-            "write_file" | "run_shell" | "run_test" | "check_project" | "git_commit" | "git_branch"
+            "write_file" | "run_shell" | "run_test" | "check_project" | "git_commit"
+            | "git_branch" | "open_preview"
         ) || self.shell_tools.iter().any(|t| t.name == name)
     }
 
@@ -555,6 +623,10 @@ impl ToolExecutor for BuiltinTools {
                     let args: RunShellArgs = parse_args(arguments_json)?;
                     run_shell_command(args).await
                 }
+                "open_preview" => {
+                    let args: OpenPreviewArgs = parse_args(arguments_json)?;
+                    crate::preview::open(args.path.as_deref()).await
+                }
                 "run_test" => {
                     let args: RunTestArgs = parse_args(arguments_json)?;
                     run_test_tool(args).await
@@ -593,6 +665,19 @@ impl ToolExecutor for BuiltinTools {
                         std::env::current_dir().context("cannot resolve working directory")?;
                     let args: GitCommitArgs = parse_args(arguments_json)?;
                     git_commit_tool(&cwd, &args).await
+                }
+                "web_search" => {
+                    let args: WebSearchArgs = parse_args(arguments_json)?;
+                    web_search_tool(args).await
+                }
+                "web_fetch" => {
+                    let args: WebFetchArgs = parse_args(arguments_json)?;
+                    web_fetch_tool(args).await
+                }
+                "ask_user" => {
+                    let args: AskUserArgs = parse_args(arguments_json)?;
+                    // In non-interactive mode, return a default answer
+                    bail!("ask_user requires interactive mode — user input is needed: {}", args.question);
                 }
                 other => match self.shell_tools.iter().find(|t| t.name == other) {
                     Some(def) => run_shell_tool(def, arguments_json).await,
@@ -650,6 +735,11 @@ struct RunTestArgs {
 }
 
 #[derive(serde::Deserialize)]
+struct OpenPreviewArgs {
+    path: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct FindSymbolArgs {
     name: String,
     kind: Option<String>,
@@ -677,6 +767,187 @@ struct GitBranchArgs {
 struct GitCommitArgs {
     message: String,
     stage_all: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    max_results: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct WebFetchArgs {
+    url: String,
+    max_chars: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct AskUserArgs {
+    question: String,
+    options: Option<Vec<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// Web tools (web_search / web_fetch)
+// ---------------------------------------------------------------------------
+
+/// `web_search`: performs a web search using a lightweight approach.
+/// Uses DuckDuckGo's lite HTML endpoint to extract search results.
+async fn web_search_tool(args: WebSearchArgs) -> Result<String> {
+    let query = args.query.trim();
+    anyhow::ensure!(!query.is_empty(), "query must not be empty");
+    let max_results = args.max_results.unwrap_or(5).clamp(1, 20);
+
+    let url = format!(
+        "https://html.duckduckgo.com/html/?q={}",
+        urlencoding::encode(query)
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("failed to build HTTP client for web search")?;
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; govinda-cli/1.0)")
+        .send()
+        .await
+        .context("web search request failed")?
+        .text()
+        .await
+        .context("failed to read web search response")?;
+
+    // Parse results from DuckDuckGo lite HTML
+    let mut results = Vec::new();
+    for block in resp.split("<a rel=\"nofollow\"") {
+        if results.len() >= max_results {
+            break;
+        }
+        // Extract URL
+        let Some(href_start) = block.find("href=") else {
+            continue
+        };
+        let href_rest = &block[href_start + 6..];
+        let Some(url_end) = href_rest.find(['"', '\'', ' ']) else {
+            continue
+        };
+        let result_url = &href_rest[..url_end];
+        // Extract title (inside <a> tag)
+        let title = block
+            .find('>')
+            .map(|i| &block[i + 1..])
+            .and_then(|title_rest| title_rest.find("</a>"))
+            .map(|end| {
+                let title_rest = &block[block.find('>').unwrap() + 1..];
+                &title_rest[..end]
+            })
+            .unwrap_or("")
+            .trim();
+        // Extract snippet
+        let snippet = block
+            .find("class=\"result-snippet\"")
+            .map(|i| &block[i + 22..])
+            .and_then(|snip_rest| snip_rest.find("</td>"))
+            .map(|end| {
+                let snip_rest = &block[block.find("class=\"result-snippet\"").unwrap() + 22..];
+                &snip_rest[..end]
+            })
+            .unwrap_or("")
+            .trim();
+        // Strip HTML tags from snippet
+        let clean_snippet = strip_html_tags(snippet);
+        if !result_url.is_empty() && !result_url.starts_with("//") {
+            results.push(format!(
+                "{}. {}\n   {}\n   {}",
+                results.len() + 1,
+                strip_html_tags(title),
+                result_url,
+                clean_snippet
+            ));
+        }
+    }
+
+    if results.is_empty() {
+        Ok(format!(
+            "{{\"query\":\"{}\",\"results\":0,\"note\":\"no results found — try different keywords\"}}",
+            query
+        ))
+    } else {
+        Ok(format!(
+            "{{\"query\":\"{}\",\"results\":{}}}",
+            query,
+            results.len()
+        ) + "\n\n" + &results.join("\n\n"))
+    }
+}
+
+/// Strips HTML tags from a string.
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut in_entity = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            '&' => in_entity = true,
+            ';' if in_entity => in_entity = false,
+            _ if !in_tag && !in_entity => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_owned()
+}
+
+/// `web_fetch`: fetches a URL and returns the readable text content.
+async fn web_fetch_tool(args: WebFetchArgs) -> Result<String> {
+    let url = args.url.trim();
+    anyhow::ensure!(!url.is_empty(), "url must not be empty");
+    anyhow::ensure!(
+        url.starts_with("http://") || url.starts_with("https://"),
+        "url must start with http:// or https://"
+    );
+    let max_chars = args.max_chars.unwrap_or(20_000).min(100_000);
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build HTTP client for web fetch")?;
+    let resp = client
+        .get(url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (compatible; govinda-cli/1.0)",
+        )
+        .send()
+        .await
+        .context(format!("failed to fetch {url}"))?
+        .text()
+        .await
+        .context(format!("failed to read response from {url}"))?;
+
+    let text = if resp.len() > max_chars * 4 {
+        // Likely HTML — strip tags and scripts
+        let stripped = strip_html_tags(&resp);
+        let lines: Vec<&str> = stripped
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        lines.join("\n")
+    } else {
+        resp
+    };
+
+    let truncated: String = text.chars().take(max_chars).collect();
+    Ok(format!(
+        "{{\"url\":\"{}\",\"chars\":{}}}
+\n{}",
+        url,
+        text.len(),
+        truncated
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2101,7 +2372,7 @@ mod tests {
     #[test]
     fn execution_tool_names_need_confirmation() {
         let tools = BuiltinTools::default();
-        for name in ["write_file", "run_shell", "run_test", "check_project"] {
+        for name in ["write_file", "run_shell", "run_test", "check_project", "open_preview"] {
             assert!(tools.requires_confirmation(name), "{name}");
         }
         // Staging edits only queues — no confirmation gate needed.

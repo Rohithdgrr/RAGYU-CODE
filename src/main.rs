@@ -100,7 +100,10 @@ impl Prompt for CliPrompt {
 const AGENT_SYSTEM_ADDENDUM: &str = "\n\nYou are a coding agent working inside the user's project \
 workspace. You use edit_file/insert_after/insert_before for changes (staged for review via \
 view_diff), run_shell or check_project to verify compilation, find_symbol to locate definitions, \
-and never guess line numbers — read files or query the symbol index before editing.";
+and never guess line numbers — read files or query the symbol index before editing. \
+You CAN run arbitrary shell commands: start dev servers, open files and URLs in the browser, \
+launch programs. When the user asks to run, preview, or open something, do it with run_shell \
+or open_preview instead of saying you cannot.";
 
 /// Extra rounds granted after a failed tool round (self-correction loop):
 /// a failing `cargo check` goes back to the model as-is so it can fix it.
@@ -110,7 +113,19 @@ const MAX_FIX_ROUNDS: usize = 3;
 /// user's configured system prompt untouched.
 fn specialize_system(app: &mut App) {
     if app.tools_enabled {
-        let specialized = format!("{}{AGENT_SYSTEM_ADDENDUM}", app.session.system());
+        let mut specialized = format!("{}{AGENT_SYSTEM_ADDENDUM}", app.session.system());
+        // Inject project memory (AGENTS.md / CLAUDE.md / .govinda/memory.md)
+        if let Some(suffix) = app.project_memory.to_system_suffix() {
+            specialized.push_str(&format!("\n\n{suffix}"));
+        }
+        // Inject custom skills as available commands
+        if !app.skills.is_empty() {
+            specialized.push_str("\n\n## Custom Skills\n\nAvailable custom slash commands:\n");
+            for s in &app.skills {
+                let args_hint = if s.requires_args { " (requires args)" } else { "" };
+                specialized.push_str(&format!("- `{}` — {}{}\n", s.name, s.description, args_hint));
+            }
+        }
         app.session.set_system(specialized);
     }
 }
@@ -447,6 +462,10 @@ async fn run_query(app: &mut App, prompt: &str) -> Result<()> {
         let files = govinda_cli::context::relevant_files(&full, &cwd);
         govinda_cli::context::build_injection(&files, &cwd)
     };
+
+    // The prompt itself must reach the model — one-shot mode previously sent
+    // only the system prompt, so the model answered a question it never saw.
+    app.session.push_user(full);
 
     for _round in 0..MAX_TOOL_ROUNDS {
         let history = app

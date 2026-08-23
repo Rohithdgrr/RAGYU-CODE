@@ -29,12 +29,14 @@ pub use plan::parse_steps;
 
 /// Every slash command the REPL accepts. Drives the reedline completer and
 /// shell-completion scripts; keep in sync with `dispatch()` / `help()`.
-pub const SLASH_COMMANDS: [&str; 37] = [
+pub const SLASH_COMMANDS: [&str; 47] = [
     "/help",
     "/exit",
     "/quit",
     "/clear",
     "/reset",
+    "/agent",
+    "/pin",
     "/models",
     "/model",
     "/temp",
@@ -67,6 +69,14 @@ pub const SLASH_COMMANDS: [&str; 37] = [
     "/scan",
     "/plan",
     "/project",
+    "/checkpoint",
+    "/rewind",
+    "/memory",
+    "/skills",
+    "/commit",
+    "/pr",
+    "/pty",
+    "/auto-compact",
 ];
 
 /// Shared mutable state for the REPL and command handlers.
@@ -110,6 +120,16 @@ pub struct App {
     /// Current "focus" file shown in the prompt breadcrumb: the last
     /// workspace file the user mentioned or the agent edited.
     pub focus_file: Option<String>,
+    /// Session checkpoints for rewind functionality.
+    pub checkpoints: crate::checkpoint::CheckpointStore,
+    /// Project memory loaded from AGENTS.md / CLAUDE.md / .govinda/memory.md.
+    pub project_memory: crate::memory::ProjectMemory,
+    /// Loaded skills from ~/.config/govinda/skills/*.md.
+    pub skills: Vec<crate::skills::Skill>,
+    /// Whether auto-compact is enabled (context-aware session management).
+    pub auto_compact_enabled: bool,
+    /// Track when the last auto-compact happened (message count).
+    pub last_auto_compact_count: usize,
 }
 
 #[derive(Default)]
@@ -140,6 +160,9 @@ impl App {
         let tool_specs = builtin.specs();
         let pending_edits = builtin.pending_edits();
         let tool_executor: Option<Arc<dyn ToolExecutor>> = Some(Arc::new(builtin));
+        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let project_memory = crate::memory::ProjectMemory::load(&workspace);
+        let skills = crate::skills::load_skills();
         Self {
             read_timeout: Duration::from_secs(config.timeout_secs),
             max_response_bytes: (config.limit_mb as usize) * 1024 * 1024,
@@ -155,6 +178,11 @@ impl App {
             non_interactive: false,
             pending_edits,
             focus_file: None,
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
+            project_memory,
+            skills,
+            auto_compact_enabled: true,
+            last_auto_compact_count: 0,
             config,
             http,
             session,
@@ -398,6 +426,127 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
         "/plan" => plan::handle(rest, app).await,
         "/project" => {
             project::handle(rest);
+            Outcome::Handled
+        }
+        "/checkpoint" => {
+            let label = rest.trim();
+            let label = if label.is_empty() {
+                format!("turn {}", app.stats.turns + 1)
+            } else {
+                label.to_owned()
+            };
+            let cp = app.checkpoints.checkpoint(&label, app.session.messages()).to_owned();
+            let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match crate::checkpoint::save_checkpoint(&workspace, &cp) {
+                Ok(path) => ok(&format!("checkpoint #{} saved ({} msgs) → {}", cp.id, cp.message_count, path.display())),
+                Err(e) => ok(&format!("checkpoint #{} created ({} msgs) — disk save failed: {e:#}", cp.id, cp.message_count)),
+            }
+            Outcome::Handled
+        }
+        "/rewind" => {
+            let arg = rest.trim();
+            let id = if arg.is_empty() { None } else { arg.parse::<usize>().ok() };
+            match app.checkpoints.rewind_to(id.unwrap_or(0)) {
+                Some(messages) => {
+                    app.session.clear();
+                    for m in messages {
+                        match m.role.as_str() {
+                            "user" => app.session.push_user(m.content),
+                            "assistant" => app.session.push_assistant(m.content),
+                            "system" => app.session.set_system(m.content),
+                            _ => {}
+                        }
+                    }
+                    ok(&format!("rewound to checkpoint — {} messages restored", app.session.messages().len()));
+                }
+                None => err("no checkpoint found with that id"),
+            }
+            Outcome::Handled
+        }
+        "/memory" => {
+            let arg = rest.trim();
+            if arg.starts_with("add ") || arg.starts_with("note ") {
+                let note = arg.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+                let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                match crate::memory::ProjectMemory::append_note(&workspace, note) {
+                    Ok(()) => ok("note added to .govinda/memory.md"),
+                    Err(e) => err(&format!("failed to add note: {e:#}")),
+                }
+            } else if app.project_memory.has_content() {
+                ok(&format!("project memory loaded: {}", app.project_memory.to_system_suffix().unwrap_or_default().len()));
+            } else {
+                dim("no project memory found — create AGENTS.md, CLAUDE.md, or .govinda/memory.md in the workspace root");
+            }
+            Outcome::Handled
+        }
+        "/skills" => {
+            if app.skills.is_empty() {
+                dim("no skills found — create .md files in ~/.config/govinda/skills/");
+            } else {
+                ok(&format!("{} skill(s) loaded:", app.skills.len()));
+                for s in &app.skills {
+                    println!("  {} — {}{}", s.name, s.description, if s.requires_args { " (args required)" } else { "" });
+                }
+            }
+            Outcome::Handled
+        }
+        "/commit" => {
+            let msg = rest.trim();
+            if msg.is_empty() {
+                err("usage: /commit <message>");
+                return Outcome::Handled;
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match crate::git::run_git(&cwd, &["add", "-A"]).await {
+                Ok(_) => match crate::git::run_git(&cwd, &["commit", "-m", msg]).await {
+                    Ok(out) => ok(&format!("committed:\n{out}")),
+                    Err(e) => err(&format!("commit failed: {e:#}")),
+                },
+                Err(e) => err(&format!("git add failed: {e:#}")),
+            }
+            Outcome::Handled
+        }
+        "/pr" => {
+            let arg = rest.trim();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if arg == "create" || arg.is_empty() {
+                // Create a new branch and show instructions
+                let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                let branch = format!("govinda/{timestamp}");
+                match crate::git::run_git(&cwd, &["checkout", "-b", &branch]).await {
+                    Ok(_) => ok(&format!("created branch {branch}\n  → Make changes, then: /commit <message>\n  → Push: run_shell(\"git push -u origin {branch}\")")),
+                    Err(e) => err(&format!("branch creation failed: {e:#}")),
+                }
+            } else if arg == "list" {
+                match crate::git::run_git(&cwd, &["branch", "--list"]).await {
+                    Ok(branches) => ok(&format!("branches:\n{branches}")),
+                    Err(e) => err(&format!("git branch failed: {e:#}")),
+                }
+            } else {
+                // Switch to branch
+                match crate::git::run_git(&cwd, &["checkout", arg]).await {
+                    Ok(out) => ok(&format!("switched to {arg}:\n{out}")),
+                    Err(e) => err(&format!("branch switch failed: {e:#}")),
+                }
+            }
+            Outcome::Handled
+        }
+        "/pty" => {
+            dim("PTY panel: use run_shell tool for long-running commands (the TUI streams output live)");
+            Outcome::Handled
+        }
+        "/auto-compact" => {
+            let arg = rest.trim();
+            if arg == "on" {
+                app.auto_compact_enabled = true;
+                ok("auto-compact enabled — context will be refreshed when nearing the token limit");
+            } else if arg == "off" {
+                app.auto_compact_enabled = false;
+                ok("auto-compact disabled");
+            } else {
+                let state = if app.auto_compact_enabled { "on" } else { "off" };
+                ok(&format!("auto-compact is {state} (use: /auto-compact on|off)"));
+            }
             Outcome::Handled
         }
         "/config" => {

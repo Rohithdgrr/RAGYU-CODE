@@ -38,10 +38,10 @@ const MAX_TOOL_RESULT_CHARS: usize = 8 * 1024;
 
 /// Slash commands that never take an argument — Enter on the palette runs
 /// them directly instead of opening the args dialog.
-const ZERO_ARG_SLASH: [&str; 22] = [
+const ZERO_ARG_SLASH: [&str; 25] = [
     "/help", "/exit", "/quit", "/q", "/clear", "/reset", "/sessions", "/stats", "/history",
     "/models", "/tools", "/config", "/tokens", "/undo", "/retry", "/compact", "/raw", "/scan",
-    "/pin", "/variants", "/pick", "/agent",
+    "/pin", "/variants", "/pick", "/agent", "/skills", "/pty", "/auto-compact",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,17 +569,13 @@ impl Tui {
                 return true;
             }
             _ => {}
-        }
-        // If it's a known slash command, queue for App-aware handling
+        }        // Known slash commands and custom skills need App-aware handling
         if crate::commands::SLASH_COMMANDS.contains(&cmd_lc.as_str()) {
             return false;
         }
-        // Unknown command
-        self.notice(format!(
-            "unknown command '{}' — type \"/\" to see palette or /help",
-            cmd
-        ));
-        true
+
+        // Unknown command — queue for handle_tui_slash which checks skills
+        false
     }
 
     pub     fn handle_event(&mut self, ev: Event) {
@@ -2068,6 +2064,12 @@ async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
                 if let Some(tree) = tui.tree.as_mut() {
                     tree.mark_dirty();
                 }
+                // Incremental symbol index: rebuild after applying edits
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let syms = crate::symbols::rebuild(&cwd);
+                if syms > 0 {
+                    tui.notice(format!("symbol index refreshed ({syms} symbols)"));
+                }
             }
         }
         "/reject" => {
@@ -2236,7 +2238,128 @@ async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
                 tui.notice(l.to_string());
             }
         }
-        _ => tui.notice(format!("'{lc}' is not available in the TUI")),
+        "/checkpoint" => {
+            let label = rest.trim();
+            let label = if label.is_empty() { format!("turn {}", tui.entries.len()) } else { label.to_owned() };
+            let cp = app.checkpoints.checkpoint(&label, app.session.messages()).to_owned();
+            tui.notice(format!("checkpoint #{} saved ({} msgs)", cp.id, cp.message_count));
+        }
+        "/rewind" => {
+            let arg = rest.trim();
+            let id = if arg.is_empty() { None } else { arg.parse::<usize>().ok() };
+            match app.checkpoints.rewind_to(id.unwrap_or(0)) {
+                Some(messages) => {
+                    app.session.clear();
+                    tui.entries.clear();
+                    for m in messages {
+                        match m.role.as_str() {
+                            "user" => { app.session.push_user(m.content.clone()); tui.entries.push(ChatEntry::User(m.content)); }
+                            "assistant" => { app.session.push_assistant(m.content.clone()); tui.entries.push(ChatEntry::Assistant(m.content)); }
+                            "system" => app.session.set_system(m.content),
+                            _ => {}
+                        }
+                    }
+                    tui.scroll_from_bottom = 0;
+                    tui.notice(format!("rewound — {} messages restored", app.session.messages().len()));
+                }
+                None => tui.notice("no checkpoint found with that id"),
+            }
+        }
+        "/memory" => {
+            let arg = rest.trim();
+            if arg.starts_with("add ") || arg.starts_with("note ") {
+                let note = arg.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+                let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                match crate::memory::ProjectMemory::append_note(&workspace, note) {
+                    Ok(()) => tui.notice("note added to .govinda/memory.md"),
+                    Err(e) => tui.notice(format!("failed to add note: {e:#}")),
+                }
+            } else if app.project_memory.has_content() {
+                tui.notice(format!("project memory loaded ({} chars)", app.project_memory.to_system_suffix().unwrap_or_default().len()));
+            } else {
+                tui.notice("no project memory found — create AGENTS.md, CLAUDE.md, or .govinda/memory.md");
+            }
+        }
+        "/skills" => {
+            if app.skills.is_empty() {
+                tui.notice("no skills found — create .md files in ~/.config/govinda/skills/");
+            } else {
+                tui.notice(format!("{} skill(s):", app.skills.len()));
+                for s in &app.skills {
+                    tui.notice(format!("  {} — {}{}", s.name, s.description, if s.requires_args { " (args required)" } else { "" }));
+                }
+            }
+        }
+        "/commit" => {
+            let msg = rest.trim();
+            if msg.is_empty() {
+                tui.notice("usage: /commit <message>");
+            } else {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                match crate::git::run_git(&cwd, &["add", "-A"]).await {
+                    Ok(_) => match crate::git::run_git(&cwd, &["commit", "-m", msg]).await {
+                        Ok(out) => {
+                            for l in out.lines().take(5) { tui.notice(l.to_string()); }
+                        }
+                        Err(e) => tui.notice(format!("commit failed: {e:#}")),
+                    },
+                    Err(e) => tui.notice(format!("git add failed: {e:#}")),
+                }
+            }
+        }
+        "/pr" => {
+            let arg = rest.trim();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if arg == "create" || arg.is_empty() {
+                let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                let branch = format!("govinda/{timestamp}");
+                match crate::git::run_git(&cwd, &["checkout", "-b", &branch]).await {
+                    Ok(_) => {
+                        tui.notice(format!("created branch {branch}"));
+                        tui.notice("make changes, then /commit <message> to commit");
+                    }
+                    Err(e) => tui.notice(format!("branch creation failed: {e:#}")),
+                }
+            } else if arg == "list" {
+                match crate::git::run_git(&cwd, &["branch", "--list"]).await {
+                    Ok(branches) => { for l in branches.lines().take(10) { tui.notice(l.to_string()); } }
+                    Err(e) => tui.notice(format!("git branch failed: {e:#}")),
+                }
+            } else {
+                match crate::git::run_git(&cwd, &["checkout", arg]).await {
+                    Ok(_) => tui.notice(format!("switched to {arg}")),
+                    Err(e) => tui.notice(format!("branch switch failed: {e:#}")),
+                }
+            }
+        }
+        "/pty" => {
+            tui.notice("PTY: use run_shell tool for long-running commands — the TUI streams output live");
+        }
+        "/auto-compact" => {
+            let arg = rest.trim();
+            if arg == "on" { app.auto_compact_enabled = true; tui.notice("auto-compact enabled"); }
+            else if arg == "off" { app.auto_compact_enabled = false; tui.notice("auto-compact disabled"); }
+            else { let s = if app.auto_compact_enabled { "on" } else { "off" }; tui.notice(format!("auto-compact is {s}")); }
+        }
+        _ => {
+            // Check if it matches a loaded skill
+            if let Some(skill) = app.skills.iter().find(|s| s.name.eq_ignore_ascii_case(&lc)) {
+                let body = if rest.trim().is_empty() && skill.requires_args {
+                    format!("{}\n\n{}", skill.body, "(This skill requires arguments)")
+                } else if rest.trim().is_empty() {
+                    skill.body.clone()
+                } else {
+                    format!("{}\n\nUser input: {}", skill.body, rest.trim())
+                };
+                tui.notice(format!("executing skill: {}", skill.name));
+                // Queue as a prompt so the model processes the skill body
+                tui.pending_prompt = Some(body);
+            } else {
+                tui.notice(format!(
+                    "unknown command '{lc}' — type \"/\" to see palette or /help"
+                ));
+            }
+        },
     }
 }
 
@@ -2313,7 +2436,7 @@ async fn run_turn(
     prompt: String,
     pinned: Vec<PathBuf>,
     tx: tokio::sync::mpsc::UnboundedSender<TurnUpdate>,
-    mut confirm_rx: tokio::sync::mpsc::UnboundedReceiver<ConfirmDecision>,
+    _confirm_rx: tokio::sync::mpsc::UnboundedReceiver<ConfirmDecision>,
 ) -> bool {
     let started = Instant::now();
     streaming.borrow_mut().clear();
@@ -2331,7 +2454,37 @@ async fn run_turn(
         crate::context::build_injection(&files, &cwd)
     };
 
-    app.session.push_user(prompt);
+    // Auto-checkpoint before each turn for rewind capability
+    app.checkpoints.checkpoint(
+        &format!("before turn {}", app.stats.turns + 1),
+        app.session.messages(),
+    );
+
+    // Auto-compact: if the session is nearing the context limit, compact it
+    if app.auto_compact_enabled && !app.pending_variants.is_empty() {
+        // skip if variants pending — user is mid-selection
+    } else if app.auto_compact_enabled {
+        let approx_tokens = app.session.approx_tokens();
+        let budget = app.config.context_tokens;
+        // Compact when we hit 80% of the context budget
+        if approx_tokens > (budget * 80) / 100 && app.session.messages().len() > 6 {
+            let msgs = app.session.messages().to_vec();
+            let tail_len = msgs.len().min(4);
+            let tail = msgs[msgs.len() - tail_len..].to_vec();
+            app.session.clear();
+            for m in tail {
+                match m.role.as_str() {
+                    "user" => app.session.push_user(m.content),
+                    "assistant" => app.session.push_assistant(m.content),
+                    _ => {}
+                }
+            }
+            let _ = tx.send(TurnUpdate::Notice(format!(
+                "auto-compact: session refreshed ({} messages)",
+                app.session.messages().len()
+            )));
+        }
+    }
 
     for round in 1..=MAX_TOOL_ROUNDS {
         if cancel.load(Ordering::Relaxed) {
@@ -2694,13 +2847,12 @@ mod tests {
         tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(tui.take_clear_request());
 
+        // Unknown commands are queued for handle_tui_slash (which checks skills)
         tui.set_input("/bogus".into());
         tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(tui.take_submission().is_none());
-        assert!(tui
-            .entries
-            .iter()
-            .any(|e| matches!(e, ChatEntry::Notice(t) if t.contains("bogus"))));
+        // The command is queued as pending_slash, not handled locally
+        assert_eq!(tui.take_pending_slash().as_deref(), Some("/bogus"));
     }
 
     #[test]

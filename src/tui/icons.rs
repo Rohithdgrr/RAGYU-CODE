@@ -117,6 +117,14 @@ pub fn command(cmd: &str) -> &'static str {
         "/scan" => "\u{f00e}",     // search-plus
         "/plan" => "\u{f0cb}",     // list-ol
         "/project" => "\u{f187}",  // archive
+        "/checkpoint" => "\u{f0c7}", // save
+        "/rewind" => "\u{f04a}",    // backward
+        "/memory" => "\u{f040}",     // at
+        "/skills" => "\u{f0e6}",    // comments
+        "/commit" => "\u{f0c1}",    // link
+        "/pr" => "\u{f126}",        // code-fork
+        "/pty" => "\u{f120}",       // terminal
+        "/auto-compact" => "\u{f0e7}", // bolt
         "/pin" => PINNED,
         "/agent" => MODE_AGENT,
         _ => INFO,

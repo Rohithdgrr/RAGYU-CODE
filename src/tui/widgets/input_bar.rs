@@ -148,6 +148,14 @@ pub fn describe(cmd: &str) -> &'static str {
         "/scan" => "scan workspace",
         "/plan" => "plan task",
         "/project" => "project memory",
+        "/checkpoint" => "save checkpoint",
+        "/rewind" => "rewind to checkpoint",
+        "/memory" => "project memory notes",
+        "/skills" => "custom skills",
+        "/commit" => "git commit",
+        "/pr" => "branch/PR workflow",
+        "/pty" => "PTY panel",
+        "/auto-compact" => "auto-compact session",
         _ => "",
     }
 }

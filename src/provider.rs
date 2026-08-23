@@ -70,9 +70,44 @@ const PRESETS: &[Preset] = &[
         api_key_env: Some("OPENAI_API_KEY"),
     },
     Preset {
+        id: "openrouter",
+        base_url: "https://openrouter.ai/api/v1",
+        api_key_env: Some("OPENROUTER_API_KEY"),
+    },
+    Preset {
+        id: "nvidia",
+        base_url: "https://integrate.api.nvidia.com/v1",
+        api_key_env: Some("NVIDIA_API_KEY"),
+    },
+    Preset {
+        id: "deepseek",
+        base_url: "https://api.deepseek.com/v1",
+        api_key_env: Some("DEEPSEEK_API_KEY"),
+    },
+    Preset {
+        id: "kimi",
+        base_url: "https://api.moonshot.cn/v1",
+        api_key_env: Some("KIMI_API_KEY"),
+    },
+    Preset {
+        id: "glm",
+        base_url: "https://open.bigmodel.cn/api/paas/v4",
+        api_key_env: Some("GLM_API_KEY"),
+    },
+    Preset {
+        id: "minimax",
+        base_url: "https://api.minimax.chat/v1",
+        api_key_env: Some("MINIMAX_API_KEY"),
+    },
+    Preset {
         id: "groq",
         base_url: "https://api.groq.com/openai/v1",
         api_key_env: Some("GROQ_API_KEY"),
+    },
+    Preset {
+        id: "bytez",
+        base_url: "https://api.bytez.com/v1",
+        api_key_env: Some("BYTEZ_API_KEY"),
     },
     Preset {
         id: "ollama",
