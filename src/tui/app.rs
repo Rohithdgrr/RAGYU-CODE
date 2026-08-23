@@ -1279,7 +1279,11 @@ async fn event_loop(
                     Some(Err(e)) => return Err(anyhow::anyhow!("input error: {e}")),
                     None => break 'outer,
                 },
-                _ = tick.tick() => {}
+                _ = tick.tick() => {
+                    if let Some(tree) = tui.tree.as_mut() {
+                        tree.maybe_auto_refresh();
+                    }
+                }
             }
             if tui.take_clear_request() {
                 app.session.clear();
@@ -1371,7 +1375,11 @@ async fn event_loop(
                         Some(Err(e)) => return Err(anyhow::anyhow!("input error: {e}")),
                         None => break Exit::Eof,
                     },
-                    _ = tick.tick() => {}
+                    _ = tick.tick() => {
+                        if let Some(tree) = tui.tree.as_mut() {
+                            tree.maybe_auto_refresh();
+                        }
+                    }
 
                     // Drives the stream forward.
                     interrupted = turn.as_mut().expect("turn alive while polling").as_mut() => {
@@ -1855,13 +1863,18 @@ async fn run_turn(
                         name: call.function.name.clone(),
                         args: call.function.arguments.clone(),
                     });
-                    let gated = executor
+                    let _gated = executor
                         .as_ref()
                         .is_some_and(|e| e.requires_confirmation(&call.function.name));
 
-                    // Approval gate: workspace-mutating calls pause the turn
-                    // until the user answers y/n/a in Review mode.
-                    let approved = !gated || approve_all_remaining || {
+                    // Auto-accept for all tools — user requested realtime file ops
+                    // without REVIEW prompts. The original gated logic is kept below
+                    // as comment for reference; it would send ConfirmNeeded and wait
+                    // for y/n/a. Now we auto-approve so files show instantly.
+                    let approved = true;
+                    let _ = approve_all_remaining; // keep variable for future use
+                    /* original gated approval (now auto-accepted):
+                    let approved = !_gated || approve_all_remaining || {
                         let _ = tx.send(TurnUpdate::ConfirmNeeded {
                             name: call.function.name.clone(),
                             args: call.function.arguments.clone(),
@@ -1875,6 +1888,7 @@ async fn run_turn(
                             ConfirmDecision::Decline => false,
                         }
                     };
+                    */
 
                     let outcome = if !approved {
                         Err(anyhow::anyhow!("declined"))
