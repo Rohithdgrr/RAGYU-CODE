@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use super::super::theme;
 use crate::ignore::IgnoreRules;
@@ -207,7 +208,13 @@ impl FileTree {
     }
 
     /// Renders the visible rows with icons, git marks, and selection.
+    /// `width` is the inner pane width (for truncating long names perfectly).
     pub fn render_lines(&self, focused: bool) -> Vec<Line<'static>> {
+        self.render_lines_with_width(focused, 34)
+    }
+
+    /// Width-aware variant used by draw for perfect clipping.
+    pub fn render_lines_with_width(&self, focused: bool, width: u16) -> Vec<Line<'static>> {
         let t = theme::active();
         let rows = self.flat();
 
@@ -219,21 +226,32 @@ impl FileTree {
             .min(rows.len().saturating_sub(visible_height.min(rows.len())));
         let end = (start + visible_height).min(rows.len());
 
+        let avail = width.saturating_sub(2) as usize; // inner width with small padding
         rows[start..end]
             .iter()
             .enumerate()
             .map(|(i, node)| {
                 let idx = start + i;
-                let depth = node.rel.split('/').count().saturating_sub(1);
+                let depth = node.rel.matches('/').count();
+                // guides: "│ " style via indent, but keep simple 2-space
                 let indent = "  ".repeat(depth);
-                let icon = if node.is_dir {
+                // richer icons: dirs vs files
+                let (icon, icon_fg) = if node.is_dir {
                     if node.expanded {
-                        "▾"
+                        ("▾", t.accent_secondary)
                     } else {
-                        "▸"
+                        ("▸", t.text_muted)
                     }
                 } else {
-                    ""
+                    // file type hint
+                    let ext = node.name.rsplit('.').next().unwrap_or("");
+                    let c = match ext {
+                        "rs" => t.syntax_type,
+                        "toml" | "json" | "md" => t.text_muted,
+                        "exe" | "dll" | "pdb" | "rmeta" | "rlib" | "d" => t.text_muted,
+                        _ => t.text_primary,
+                    };
+                    ("·", c)
                 };
                 let selected_row = idx == self.selected;
                 let base = if selected_row {
@@ -243,22 +261,45 @@ impl FileTree {
                 } else {
                     t.sidebar_bg()
                 };
+                let icon_style = if selected_row {
+                    Style::default().fg(icon_fg).bg(base.bg.unwrap_or(t.bg_secondary)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(icon_fg).bg(t.bg_secondary)
+                };
+
+                // compute truncation for perfect fit
+                let mark_w = if self.git_marks.contains_key(&node.rel) { 2 } else { 0 };
+                let prefix_w = indent.len() + 3; // "▸ " is 2 chars + space
+                let max_name = avail.saturating_sub(prefix_w + mark_w).max(8);
+                let display_name = truncate_name(&node.name, max_name);
 
                 let mut spans = vec![
                     Span::styled(
                         format!("{indent}{:>2} ", icon),
+                        icon_style,
+                    ),
+                    Span::styled(
+                        display_name.clone(),
                         if selected_row {
                             base.add_modifier(Modifier::BOLD)
+                        } else if node.is_dir {
+                            Style::default().fg(t.accent_secondary).bg(t.bg_secondary).add_modifier(Modifier::BOLD)
                         } else {
                             base
                         },
                     ),
-                    Span::styled(node.name.clone(), base),
                 ];
                 if let Some(mark) = self.git_marks.get(&node.rel) {
-                    spans.push(Span::styled(format!(" {}", mark.symbol()), mark.color(&t)));
+                    spans.push(Span::styled(format!(" {}", mark.symbol()), mark.color(&t).bg(base.bg.unwrap_or(t.bg_secondary))));
                 }
-                Line::from(spans)
+                // dim rlib/d artefacts
+                if !node.is_dir && matches!(node.name.rsplit('.').next().unwrap_or(""), "rmeta" | "rlib" | "d" | "pdb") {
+                    // already muted via icon color, keep name muted
+                    if let Some(last) = spans.get_mut(1) {
+                        *last = Span::styled(display_name.clone(), Style::default().fg(t.text_muted).bg(base.bg.unwrap_or(t.bg_secondary)));
+                    }
+                }
+                Line::from(spans).style(base)
             })
             .collect()
     }
@@ -368,6 +409,28 @@ fn toggle_in(
         }
     }
     false
+}
+
+fn truncate_name(name: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let w = UnicodeWidthStr::width(name);
+    if w <= max {
+        return name.to_owned();
+    }
+    let mut out = String::new();
+    let mut cur = 0usize;
+    for c in name.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        if cur + cw + 1 > max {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+        cur += cw;
+    }
+    out
 }
 
 #[cfg(test)]

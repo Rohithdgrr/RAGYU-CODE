@@ -25,7 +25,7 @@ impl PaneLayout {
     /// Splits `area` per the current visibility flags.
     ///
     /// Responsive breakpoints:
-    /// - width < 80 → file explorer (right) collapses
+    /// - width < 70 → file explorer (right) collapses
     /// - width < 60  → project tree (left) collapses too (chat goes full-width)
     /// - height < 20 → 1-row compact (tiny)
     /// - height < 28 → 3-row cozy
@@ -47,7 +47,7 @@ impl PaneLayout {
         .areas(area);
 
         let want_tree = show_tree && area.width >= 60;
-        let want_tools = show_tools && area.width >= 80;
+        let want_tools = show_tools && area.width >= 70;
 
         let mut chat = body;
         let mut tree = None;
@@ -55,11 +55,20 @@ impl PaneLayout {
 
         // Carve side panes off the body left-to-right so the chat keeps a
         // predictable center position regardless of what is visible.
+        // When only one explorer is visible we give it extra width (34) for
+        // perfect file-name visibility; when both are visible we keep 26+26
+        // to preserve chat width. Chat never drops below 20 cols.
         if want_tree || want_tools {
+            let (left_w, right_w) = match (want_tree, want_tools) {
+                (true, true) => (26, 28),
+                (true, false) => (34, 0),
+                (false, true) => (0, 36),
+                (false, false) => (0, 0),
+            };
             let cols = Layout::horizontal([
-                Constraint::Length(if want_tree { 26 } else { 0 }),
-                Constraint::Min(20), // chat floor — never squeezed below this
-                Constraint::Length(if want_tools { 26 } else { 0 }),
+                Constraint::Length(left_w),
+                Constraint::Min(20),
+                Constraint::Length(right_w),
             ])
             .split(body);
             chat = cols[1];
@@ -102,7 +111,7 @@ mod tests {
 
     #[test]
     fn narrow_terminal_hides_tools() {
-        let l = PaneLayout::compute(rect(70, 30), true, true);
+        let l = PaneLayout::compute(rect(65, 30), true, true);
         assert!(l.tree.is_some());
         assert!(l.tools.is_none());
     }
@@ -112,6 +121,15 @@ mod tests {
         let l = PaneLayout::compute(rect(90, 30), true, true);
         assert!(l.tree.is_some());
         assert!(l.tools.is_some());
+    }
+
+    #[test]
+    fn single_explorer_gets_wider_pane() {
+        let l = PaneLayout::compute(rect(100, 30), false, true);
+        assert!(l.tools.is_some());
+        assert_eq!(l.tools.unwrap().width, 36);
+        let l2 = PaneLayout::compute(rect(100, 30), true, false);
+        assert_eq!(l2.tree.unwrap().width, 34);
     }
 
     #[test]

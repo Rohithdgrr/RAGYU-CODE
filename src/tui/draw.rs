@@ -115,7 +115,10 @@ fn render_tree(
 
     // Tell the tree how tall it can draw so scrolling stays exact.
     tree.set_view_height(inner.height);
-    f.render_widget(Paragraph::new(tree.render_lines(focused)), inner);
+    f.render_widget(
+        Paragraph::new(tree.render_lines_with_width(focused, inner.width)),
+        inner,
+    );
 }
 
 fn render_explorer_placeholder(f: &mut Frame<'_>, area: Rect) {
