@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use govinda_cli::api::{self, ChatOptions};
 use govinda_cli::clock;
 use govinda_cli::commands::{self, App, Outcome};
@@ -36,11 +37,39 @@ impl reedline::Completer for SlashCompleter {
     }
 }
 
-struct CliPrompt;
+/// Prompt with an optional file breadcrumb (Phase 6.2):
+/// `govinda-cli v0.5.0  📄 src/api.rs  🦀 Rust\n❯ `
+struct CliPrompt {
+    left: String,
+}
+
+impl CliPrompt {
+    fn new(focus: Option<&str>) -> Self {
+        let dim = govinda_cli::render::dim_color();
+        let mut left = paint(
+            format!("govinda-cli v{}", env!("CARGO_PKG_VERSION")),
+            accent(),
+        );
+        if let Some(file) = focus.map(str::trim).filter(|f| !f.is_empty()) {
+            left.push_str(&paint(format!("  📄 {file}"), accent()));
+            if let Some(badge) = govinda_cli::render::language_badge(file) {
+                left.push_str(&paint(format!("  {badge}"), dim));
+            }
+        }
+        left.push_str(&paint("\n❯ ".to_owned(), accent()));
+        Self { left }
+    }
+}
+
+impl Default for CliPrompt {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
 
 impl Prompt for CliPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Owned(paint("❯ ".to_owned(), accent()))
+        Cow::Borrowed(&self.left)
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -172,7 +201,7 @@ async fn main() -> Result<()> {
         .with_completer(Box::new(SlashCompleter));
 
     loop {
-        match rl.read_line(&CliPrompt) {
+        match rl.read_line(&CliPrompt::new(app.focus_file.as_deref())) {
             Ok(Signal::Success(line)) => {
                 let line = line.trim();
                 if line.is_empty() {
@@ -445,7 +474,20 @@ async fn run_turn(app: &mut App, input: &str) {
 
     // Context-aware windowing: files the prompt mentions (plus their
     // manifest and same-dir siblings) ride along even if they only appeared
-    // in old messages — computed once from this turn's input.
+    // in old messages — computed once from this turn's input. The first
+    // mentioned file becomes the prompt's breadcrumb focus.
+    {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        if let Some(first) = govinda_cli::context::mentioned_files(input, &cwd).first() {
+            app.focus_file = Some(
+                first
+                    .strip_prefix(&cwd)
+                    .unwrap_or(first)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+    }
     let injection = {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let files = govinda_cli::context::relevant_files(input, &cwd);
@@ -616,10 +658,16 @@ fn handle_round_error(app: &mut App, raw: bool, out: String, resume_len: usize, 
 /// (prose included) plus one `tool` result per call to the session.
 ///
 /// Confirmation-gated tools (workspace writes, shell commands) are approved
-/// sequentially first so prompts never interleave; the approved calls then
-/// execute concurrently via boxed futures, with results printed in call
-/// order once all settle. Declined calls report a sanitized decline line
-/// back to the model.
+/// sequentially first so prompts never interleave. When more than one call is
+/// gated, a batch offer ("approve all?") precedes the per-call gates, and any
+/// `a` answer approves all remaining gated calls — a 10-prompt refactor must
+/// not take 10 keystrokes. In `-q` mode nobody can approve, so gated calls
+/// are auto-declined.
+///
+/// Approved calls execute concurrently via `FuturesUnordered`; results are
+/// printed the moment each settles (completion order) but stored in call
+/// order for the session commit. Declined calls report a sanitized decline
+/// line back to the model.
 ///
 /// The model only ever sees a sanitized failure line; the detailed error
 /// chain is printed locally so it never leaks file paths or internals.
@@ -638,74 +686,135 @@ async fn run_tool_round(app: &mut App, prose: &str, calls: &[api::ToolCall]) -> 
         );
     }
 
-    // Sequential approval pass — user prompts must not interleave. In `-q`
-    // mode nobody can approve, so gated calls are auto-declined.
+    // Approval pass — user prompts must not interleave.
+    let gated: Vec<bool> = calls
+        .iter()
+        .map(|call| {
+            app.tool_executor
+                .as_ref()
+                .is_some_and(|e| e.requires_confirmation(&call.function.name))
+        })
+        .collect();
+    let gated_count = gated.iter().filter(|g| **g).count();
+
+    let mut approve_rest = false;
+    if gated_count > 1 && !app.non_interactive {
+        approve_rest = confirm_batch(calls, &gated);
+    }
+
     let mut allowed = Vec::with_capacity(calls.len());
-    for call in calls {
-        let needs_confirmation = app
-            .tool_executor
-            .as_ref()
-            .is_some_and(|e| e.requires_confirmation(&call.function.name));
-        let approved = needs_confirmation
-            && !app.non_interactive
-            && confirm_tool_call(&call.function.name, &call.function.arguments);
-        if !approved && !app.non_interactive {
-            println!("{}", paint("✗ declined", govinda_cli::render::err_color()));
-        }
+    for (i, call) in calls.iter().enumerate() {
+        let approved = if !gated[i] {
+            true
+        } else if app.non_interactive || approve_rest {
+            !app.non_interactive
+        } else {
+            // "approve all" is offered while later gated calls remain.
+            let more_gated_after = gated[i + 1..].iter().filter(|g| **g).count() > 0;
+            match confirm_tool_call(
+                &call.function.name,
+                &call.function.arguments,
+                more_gated_after,
+            ) {
+                Confirmation::ApprovedAll => {
+                    approve_rest = true;
+                    true
+                }
+                Confirmation::Approved => true,
+                Confirmation::Declined => false,
+            }
+        };
         allowed.push(approved);
     }
 
-    // Concurrent execution pass; results stay ordered by call index.
-    let executor: Option<&dyn govinda_cli::tools::ToolExecutor> = app.tool_executor.as_deref();
-    let futures = calls.iter().enumerate().map(|(i, call)| {
-        let approved = allowed[i];
-        let name = call.function.name.as_str();
-        let args = call.function.arguments.as_str();
-        async move {
-            match (approved, executor) {
-                (false, _) => Err(anyhow::anyhow!("declined")),
-                (true, Some(executor)) => executor.execute(name, args).await,
-                (true, None) => Err(anyhow::anyhow!("no tool executor configured")),
+    // Concurrent execution pass. The executor Arc is cloned out up front so
+    // `app` stays free to mutate while futures are being polled and results
+    // stream to the terminal as they complete (not batched behind join_all).
+    let executor: Option<std::sync::Arc<dyn govinda_cli::tools::ToolExecutor>> =
+        app.tool_executor.clone();
+    let mut futures: futures_util::stream::FuturesUnordered<_> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, call)| {
+            let approved = allowed[i];
+            let name = call.function.name.clone();
+            let args = call.function.arguments.clone();
+            let executor = executor.clone();
+            async move {
+                let outcome = match (approved, executor) {
+                    (false, _) => Err(anyhow::anyhow!("declined")),
+                    (true, Some(executor)) => executor.execute(&name, &args).await,
+                    (true, None) => Err(anyhow::anyhow!("no tool executor configured")),
+                };
+                (i, outcome)
             }
-        }
-    });
-    let outcomes = futures_util::future::join_all(futures).await;
+        })
+        .collect();
 
-    let mut results = Vec::with_capacity(calls.len());
+    let mut outcomes: Vec<Option<anyhow::Result<String>>> =
+        (0..calls.len()).map(|_| None).collect();
     let mut had_failure = false;
+    while let Some((i, outcome)) = futures.next().await {
+        match &outcome {
+            Ok(value) => println!(
+                "{}",
+                paint(
+                    format!("← {}", truncate_line(value, TOOL_RESULT_DISPLAY_CHARS)),
+                    govinda_cli::render::dim_color()
+                )
+            ),
+            Err(e) if e.to_string() == "declined" => {
+                println!("{}", paint("✗ declined", govinda_cli::render::err_color()))
+            }
+            Err(e) => eprintln!(
+                "{}",
+                paint(
+                    format!("tool '{}' failed: {e:#}", calls[i].function.name),
+                    govinda_cli::render::err_color()
+                )
+            ),
+        }
+        if outcome.is_err() || outcome.as_deref().is_ok_and(result_signals_failure) {
+            had_failure = true;
+        }
+        outcomes[i] = Some(outcome);
+    }
+
+    // Session commit stays in call order regardless of completion order.
+    let mut results = Vec::with_capacity(calls.len());
     for (call, outcome) in calls.iter().zip(outcomes) {
+        let Some(outcome) = outcome else {
+            results.push((
+                call.id.clone(),
+                format!("error: tool '{}' produced no result", call.function.name),
+            ));
+            had_failure = true;
+            continue;
+        };
         match outcome {
             Ok(value) => {
-                println!(
-                    "{}",
-                    paint(
-                        format!("← {}", truncate_line(&value, TOOL_RESULT_DISPLAY_CHARS)),
-                        govinda_cli::render::dim_color()
-                    )
-                );
-                if result_signals_failure(&value) {
-                    had_failure = true;
+                // Phase 6.1: staged edits stream their unified diff to the
+                // terminal immediately, in color; also track the focus file.
+                if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&value) {
+                    if let Some(path) = payload.get("path").and_then(|p| p.as_str()) {
+                        app.focus_file = Some(path.to_owned());
+                    }
+                    if let Some(diff) = payload.get("diff").and_then(|d| d.as_str())
+                        && !diff.trim().is_empty()
+                    {
+                        govinda_cli::render::render_diff(diff);
+                    }
                 }
                 results.push((call.id.clone(), truncate_result(&value)));
             }
             Err(e) if e.to_string() == "declined" => {
-                println!("{}", paint("✗ declined", govinda_cli::render::err_color()));
-                had_failure = true;
                 results.push((
                     call.id.clone(),
                     "error: user declined this operation — ask how to proceed before retrying"
                         .to_owned(),
                 ));
             }
-            Err(e) => {
-                eprintln!(
-                    "{}",
-                    paint(
-                        format!("tool '{}' failed: {e:#}", call.function.name),
-                        govinda_cli::render::err_color()
-                    )
-                );
-                had_failure = true;
+            Err(_) => {
                 results.push((
                     call.id.clone(),
                     format!("error: tool '{}' failed", call.function.name),
@@ -717,22 +826,41 @@ async fn run_tool_round(app: &mut App, prose: &str, calls: &[api::ToolCall]) -> 
     had_failure
 }
 
-/// Heuristic over a committed tool-result string: `error:` prefixes from
-/// the executor, or a structured JSON payload with a non-zero exit code
-/// (`run_shell`, `check_project`…) count as failures.
-fn result_signals_failure(value: &str) -> bool {
-    if value.starts_with("error:") {
-        return true;
+/// One-shot offer covering every gated call in the round: list them compactly,
+/// then ask once instead of prompting per call.
+fn confirm_batch(calls: &[api::ToolCall], gated: &[bool]) -> bool {
+    println!();
+    println!(
+        "{}",
+        paint(
+            format!(
+                "⚠ {} tools modify your workspace:",
+                gated.iter().filter(|g| **g).count()
+            ),
+            crossterm::style::Color::Yellow
+        )
+    );
+    for (call, _) in calls.iter().zip(gated).filter(|(_, g)| **g) {
+        let args = truncate_chars(&call.function.arguments.replace('\n', " "), 120);
+        println!("  • {}({args})", call.function.name);
     }
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()
-        .and_then(|v| v.get("exit_code").and_then(serde_json::Value::as_i64))
-        .is_some_and(|code| code != 0)
+    print!(
+        "{}",
+        paint("approve all? [y/N] ", crossterm::style::Color::Yellow)
+    );
+    read_confirmation_answer()
+}
+
+enum Confirmation {
+    Approved,
+    ApprovedAll,
+    Declined,
 }
 
 /// Interactive y/N gate for workspace-mutating tools. Shows a truncated
 /// pretty-print of the arguments so the user can see exactly what would run.
-fn confirm_tool_call(name: &str, arguments_json: &str) -> bool {
+/// When more gated calls follow this one, `a` approves all of them too.
+fn confirm_tool_call(name: &str, arguments_json: &str, allow_all: bool) -> Confirmation {
     println!();
     println!(
         "{}",
@@ -751,16 +879,45 @@ fn confirm_tool_call(name: &str, arguments_json: &str) -> bool {
         }
         Err(_) => println!("  {}", truncate_chars(arguments_json, 2000)),
     }
+    let hint = if allow_all { "[y/N/a(ll)]" } else { "[y/N]" };
     print!(
         "{}",
-        paint("proceed? [y/N] ", crossterm::style::Color::Yellow)
+        paint(format!("proceed? {hint} "), crossterm::style::Color::Yellow)
     );
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    match std::io::stdin().read_line(&mut answer) {
+        Ok(0) | Err(_) => return Confirmation::Declined,
+        Ok(_) => {}
+    }
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Confirmation::Approved,
+        "a" | "all" if allow_all => Confirmation::ApprovedAll,
+        _ => Confirmation::Declined,
+    }
+}
+
+/// Reads one stdin line for the confirmation prompts (`Ok(0)`/EOF declines).
+fn read_confirmation_answer() -> bool {
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
     match std::io::stdin().read_line(&mut answer) {
         Ok(0) | Err(_) => false,
         Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
     }
+}
+
+/// Heuristic over a committed tool-result string: `error:` prefixes from
+/// the executor, or a structured JSON payload with a non-zero exit code
+/// (`run_shell`, `check_project`…) count as failures.
+fn result_signals_failure(value: &str) -> bool {
+    if value.starts_with("error:") {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .and_then(|v| v.get("exit_code").and_then(serde_json::Value::as_i64))
+        .is_some_and(|code| code != 0)
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {

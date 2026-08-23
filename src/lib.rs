@@ -11,6 +11,7 @@ pub mod diff;
 pub mod git;
 pub mod ignore;
 pub mod outline;
+pub mod project;
 pub mod provider;
 pub mod render;
 pub mod scan;

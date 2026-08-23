@@ -3,7 +3,23 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Monotonic per-process counter backing `next_request_id`.
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Correlation ID attached to every outgoing request (`x-request-id`) and
+/// echoed in error messages, so a failed call can be traced on the provider
+/// side. No external uuid dependency needed: wall-clock millis + a process-
+/// local counter is unique enough for one REPL session.
+fn next_request_id() -> String {
+    let n = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    format!("gvnd-{ts:x}-{n:x}")
+}
 
 /// Hard cap on a single streamed answer (protects memory from runaway output).
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -192,18 +208,20 @@ struct PartialToolCall {
 impl SseParser {
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buf.extend_from_slice(chunk);
-        if self.buf.len() > MAX_SSE_LINE_BYTES {
-            // No newline in sight: refuse to buffer a runaway line.
-            self.buf.clear();
-            return vec![SseEvent::ApiError(format!(
-                "SSE line exceeded {} KB without a newline",
-                MAX_SSE_LINE_BYTES / 1024
-            ))];
-        }
+        // Parse every complete line *first*: an oversized tail must not
+        // discard valid data that happens to share the buffer with it.
         let mut events = Vec::new();
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = self.buf.drain(..=pos).collect();
             events.extend(self.parse_line(&String::from_utf8_lossy(&line_bytes)));
+        }
+        if self.buf.len() > MAX_SSE_LINE_BYTES {
+            // No newline in sight: refuse to buffer a runaway line.
+            self.buf.clear();
+            events.push(SseEvent::ApiError(format!(
+                "SSE line exceeded {} KB without a newline",
+                MAX_SSE_LINE_BYTES / 1024
+            )));
         }
         events
     }
@@ -438,7 +456,8 @@ async fn attempt_once(
     sink: &mut StreamSink<'_>,
     on_delta: &mut impl FnMut(&str),
 ) -> Result<Attempt> {
-    let mut req = http.post(url).json(body);
+    let req_id = next_request_id();
+    let mut req = http.post(url).json(body).header("x-request-id", &req_id);
     if let Some(token) = bearer {
         req = req.bearer_auth(token);
     }
@@ -450,9 +469,9 @@ async fn attempt_once(
     {
         Ok(resp) => resp,
         Err(e) => {
-            return Ok(transport_outcome(
-                anyhow::Error::new(e).context("request failed (check your connection)"),
-            ));
+            return Ok(transport_outcome(anyhow::Error::new(e).context(format!(
+                "request failed [{req_id}] (check your connection)"
+            ))));
         }
     };
 
@@ -468,7 +487,7 @@ async fn attempt_once(
             None
         };
         let snippet = truncate(&resp.text().await.unwrap_or_default(), 300);
-        let error = anyhow::anyhow!("API error {status}: {snippet}");
+        let error = anyhow::anyhow!("API error {status} [{req_id}]: {snippet}");
         return Ok(if retryable {
             Attempt::Retryable { error, retry_after }
         } else {
@@ -484,7 +503,8 @@ async fn attempt_once(
             Some(Ok(chunk)) => chunk,
             Some(Err(e)) => {
                 return Ok(Attempt::Retryable {
-                    error: anyhow::Error::new(e).context("connection dropped mid-stream"),
+                    error: anyhow::Error::new(e)
+                        .context(format!("connection dropped mid-stream [{req_id}]")),
                     retry_after: None,
                 });
             }
@@ -563,6 +583,7 @@ pub async fn list_models(
         req = req.bearer_auth(token);
     }
     let resp: Resp = req
+        .header("x-request-id", next_request_id())
         .send()
         .await
         .context("failed to list models")?
@@ -660,6 +681,20 @@ mod tests {
             &[b"data: {\"error\":{\"message\":\"rate limited\",\"type\":\"too_many\"}}\n"],
         );
         assert_eq!(events[0], SseEvent::ApiError("rate limited".to_owned()));
+    }
+
+    #[test]
+    fn oversized_tail_keeps_valid_lines_parsed_in_same_feed() {
+        let mut p = SseParser::default();
+        let mut chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"keep\"}}]}\n".to_vec();
+        // >1 MB of garbage with no trailing newline, in the same feed.
+        chunk.extend(std::iter::repeat_n(b'x', MAX_SSE_LINE_BYTES + 1));
+        let events = p.feed(&chunk);
+        assert_eq!(deltas(&events), vec!["keep"]);
+        assert!(
+            matches!(events.last(), Some(SseEvent::ApiError(msg)) if msg.contains("newline")),
+            "expected overflow error after the delta, got {events:?}"
+        );
     }
 
     #[test]

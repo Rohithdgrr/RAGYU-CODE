@@ -77,6 +77,24 @@ fn range(start_1based: usize, len: usize) -> String {
     }
 }
 
+/// Counts added/removed lines in a unified diff, ignoring the `+++`/`---`
+/// file headers. Used by `/review` for per-file summaries.
+pub fn count_changes(diff: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
 /// Renders a unified diff between two texts for display to the user or the
 /// model. Identical inputs yield an empty string.
 pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
@@ -195,6 +213,13 @@ pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_changes_ignores_headers_and_hunk_lines() {
+        let d = "--- a/f.rs\n+++ b/f.rs\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+        assert_eq!(count_changes(d), (1, 1));
+        assert_eq!(count_changes(""), (0, 0));
+    }
 
     #[test]
     fn identical_inputs_produce_empty_diff() {

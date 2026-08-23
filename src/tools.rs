@@ -48,6 +48,9 @@ const DEFAULT_SHELL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_SHELL_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Largest single argument value accepted from the model, in characters.
 const MAX_ARG_VALUE_CHARS: usize = 8 * 1024;
+/// Cap on the unified-diff preview embedded in each staged-edit result
+/// (the model sees this string too, so it must stay bounded).
+const MAX_DIFF_PREVIEW_CHARS: usize = 4_000;
 /// Names reserved by built-in implementations; user tools cannot shadow them.
 const BUILTIN_TOOL_NAMES: [&str; 20] = [
     "current_time",
@@ -506,6 +509,11 @@ impl ToolExecutor for BuiltinTools {
                     validate_staged_op(&cwd, &op)?;
                     let summary = op.describe();
                     let path = op.path().to_owned();
+                    // Per-op unified diff for the terminal: the REPL renders
+                    // it in color as soon as the edit is staged (Phase 6.1).
+                    let diff_preview = staged_diff(&cwd, std::slice::from_ref(&op))
+                        .map(|d| truncate_chars(&d, MAX_DIFF_PREVIEW_CHARS))
+                        .unwrap_or_default();
                     let count = {
                         let mut pending = self
                             .pending
@@ -519,6 +527,7 @@ impl ToolExecutor for BuiltinTools {
                         "path": path,
                         "edit": summary,
                         "pending_edits": count,
+                        "diff": diff_preview,
                         "note": "Edit staged. The user reviews with view_diff or /diff and commits with /apply."
                     })
                     .to_string())
@@ -957,6 +966,14 @@ fn first_line(s: &str) -> String {
     }
 }
 
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_owned();
+    }
+    let cut: String = s.chars().take(max_chars).collect();
+    format!("{cut}\n…(diff preview truncated)")
+}
+
 /// In-memory queue of staged edits shared between the tool executor and the
 /// REPL commands (`/diff`, `/apply`, `/reject`).
 #[derive(Default)]
@@ -1339,17 +1356,24 @@ fn test_command(kind: ProjectKind, filter: Option<&str>) -> (String, Vec<String>
     }
 }
 
-/// `run_test`: semantic wrapper over the detected test runner.
+/// `run_test`: semantic wrapper over the detected test runner. A user-
+/// configured test command (`.govinda_project.json`) takes precedence.
 async fn run_test_tool(args: RunTestArgs) -> Result<String> {
+    let timeout = args
+        .timeout_secs
+        .unwrap_or(DEFAULT_RUN_TEST_TIMEOUT_SECS)
+        .clamp(1, MAX_SHELL_TIMEOUT_SECS);
+    if let Some((program, argv)) = crate::project::load()
+        .test_command
+        .and_then(|cmd| crate::project::ProjectMemory::argv(cmd.trim()))
+    {
+        return exec_tool(&program, &argv, timeout).await;
+    }
     let kind = detect_project().ok_or_else(|| {
         anyhow::anyhow!(
             "no supported project manifest found (Cargo.toml, package.json, pyproject.toml…)"
         )
     })?;
-    let timeout = args
-        .timeout_secs
-        .unwrap_or(DEFAULT_RUN_TEST_TIMEOUT_SECS)
-        .clamp(1, MAX_SHELL_TIMEOUT_SECS);
     let (program, argv) = test_command(kind, args.filter.as_deref());
     exec_tool(&program, &argv, timeout).await
 }
@@ -1376,7 +1400,15 @@ fn check_command(kind: ProjectKind) -> Result<(String, Vec<String>)> {
 }
 
 /// `check_project`: compile/lint validation with errors fed back verbatim.
+/// A user-configured build command (`.govinda_project.json`) takes precedence
+/// over the auto-detected one.
 async fn check_project_tool() -> Result<String> {
+    if let Some((program, argv)) = crate::project::load()
+        .build_command
+        .and_then(|cmd| crate::project::ProjectMemory::argv(cmd.trim()))
+    {
+        return exec_tool(&program, &argv, 300).await;
+    }
     let kind = detect_project().ok_or_else(|| {
         anyhow::anyhow!(
             "no supported project manifest found (Cargo.toml, tsconfig.json, pyproject.toml…)"

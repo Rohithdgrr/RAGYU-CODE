@@ -3,6 +3,7 @@ mod edits;
 mod generation;
 mod persistence;
 mod plan;
+mod project;
 mod todo;
 
 use crate::config::Config;
@@ -13,7 +14,9 @@ use display::{
     print_history, search_history, set_limit, set_or_show_system, set_or_show_theme,
     set_temperature, set_timeout, show_config, show_stats, show_tools,
 };
-use edits::{apply as apply_edits, reject as reject_edits, view as view_diff};
+use edits::{
+    apply as apply_edits, reject as reject_edits, review as review_edits, view as view_diff,
+};
 use generation::{compact, generate_variants, models, pick_variant, retry, set_model};
 use persistence::{export, fork_session, list_named_sessions, load_session, save_session};
 use std::collections::HashSet;
@@ -23,7 +26,7 @@ use todo::Todo;
 
 /// Every slash command the REPL accepts. Drives the reedline completer and
 /// shell-completion scripts; keep in sync with `dispatch()` / `help()`.
-pub const SLASH_COMMANDS: [&str; 35] = [
+pub const SLASH_COMMANDS: [&str; 37] = [
     "/help",
     "/exit",
     "/quit",
@@ -57,8 +60,10 @@ pub const SLASH_COMMANDS: [&str; 35] = [
     "/diff",
     "/apply",
     "/reject",
+    "/review",
     "/scan",
     "/plan",
+    "/project",
 ];
 
 /// Shared mutable state for the REPL and command handlers.
@@ -78,7 +83,9 @@ pub struct App {
     /// Alternates produced by `/variants`, awaiting a `/pick`.
     pub pending_variants: Vec<String>,
     /// Executes model-requested tool calls (`None` disables function calling).
-    pub tool_executor: Option<Box<dyn ToolExecutor>>,
+    /// Shared so the tool round can clone it out and stream results while
+    /// still mutating `App` between completions.
+    pub tool_executor: Option<Arc<dyn ToolExecutor>>,
     /// Master switch for function calling (toggled via `/tools`); when off,
     /// no tools are advertised and any calls a rogue server sends are ignored.
     pub tools_enabled: bool,
@@ -97,6 +104,9 @@ pub struct App {
     /// shared with the executor; committed via `/apply`, dropped by
     /// `/reject`.
     pub pending_edits: Arc<Mutex<PendingEdits>>,
+    /// Current "focus" file shown in the prompt breadcrumb: the last
+    /// workspace file the user mentioned or the agent edited.
+    pub focus_file: Option<String>,
 }
 
 #[derive(Default)]
@@ -126,7 +136,7 @@ impl App {
         let builtin = BuiltinTools::new(config.shell_tools.clone());
         let tool_specs = builtin.specs();
         let pending_edits = builtin.pending_edits();
-        let tool_executor: Option<Box<dyn ToolExecutor>> = Some(Box::new(builtin));
+        let tool_executor: Option<Arc<dyn ToolExecutor>> = Some(Arc::new(builtin));
         Self {
             read_timeout: Duration::from_secs(config.timeout_secs),
             max_response_bytes: (config.limit_mb as usize) * 1024 * 1024,
@@ -141,6 +151,7 @@ impl App {
             todos: todo::load(),
             non_interactive: false,
             pending_edits,
+            focus_file: None,
             config,
             http,
             session,
@@ -340,6 +351,10 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             reject_edits(app);
             Outcome::Handled
         }
+        "/review" => {
+            review_edits(app);
+            Outcome::Handled
+        }
         "/limit" => {
             set_limit(rest, app);
             Outcome::Handled
@@ -350,9 +365,26 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             ok(&format!("workspace scanned · {symbols} symbols indexed"));
             dim("overview:");
             println!("{}", crate::scan::scan(&cwd).await);
+            // Remember the scanned HEAD so future runs can detect a stale index.
+            match crate::git::run_git(&cwd, &["rev-parse", "HEAD"]).await {
+                Ok(head) => {
+                    let hash = head.trim();
+                    match crate::project::record_scan_commit(&cwd, hash) {
+                        Ok(()) => dim(&format!(
+                            "recorded scan at commit {hash} in .govinda_project.json"
+                        )),
+                        Err(e) => err(&format!("could not update project memory: {e:#}")),
+                    }
+                }
+                Err(_) => dim("not a git repository — scan commit not recorded."),
+            }
             Outcome::Handled
         }
         "/plan" => plan::handle(rest, app).await,
+        "/project" => {
+            project::handle(rest);
+            Outcome::Handled
+        }
         "/config" => {
             if rest.trim().eq_ignore_ascii_case("save") {
                 match persistence::save_runtime_config(app) {
@@ -417,8 +449,10 @@ fn help(app: &App) {
            \x20 /diff              show staged edits as a unified diff (nothing applied yet)\n\
          \x20 /apply             commit all staged edits to disk (atomic batch)\n\
          \x20 /reject            discard all staged edits\n\
+         \x20 /review            per-file +N/-M summary of staged edits\n\
          \x20 /scan              rebuild the symbol index and print a workspace overview\n\
          \x20 /plan <task>       decompose a task into steps, confirm, execute autonomously\n\
+         \x20 /project [sub]     project memory: show | set test|build <cmd> | clear test|build\n\
          \x20 /config [save]     show settings; `save` persists model/theme/timeout/limit",
         app.config.model,
         app.config.temperature,
@@ -452,12 +486,13 @@ mod tests {
     use crate::render::Renderer;
     use crate::session::Session;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use zeroize::Zeroizing;
 
-    fn smoke_app() -> App {
+    pub(crate) fn smoke_app() -> App {
         let provider = provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
         let config = Config {
-            api_key: Zeroizing::new(String::new()),
+            api_key: Arc::new(Zeroizing::new(String::new())),
             model: "test-model".to_owned(),
             temperature: 0.5,
             render_markdown: false,
@@ -506,6 +541,10 @@ mod tests {
             "/diff",
             "/apply",
             "/reject",
+            "/review",
+            "/project",
+            "/project set test cargo test",
+            "/project clear test",
             "/todo add write more tests",
             "/todo list",
             "/search hi",
@@ -523,6 +562,7 @@ mod tests {
             assert!(matches!(outcome, Outcome::Handled), "{cmd} -> {outcome:?}");
         }
         let _ = std::fs::remove_file("sessions/dispatch-smoke.json");
+        let _ = std::fs::remove_file(".govinda_project.json");
     }
 
     #[tokio::test]

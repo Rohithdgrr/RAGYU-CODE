@@ -3,7 +3,7 @@
 //! have queued. Nothing touches the disk until `/apply`.
 
 use super::{App, dim, err, ok, paint};
-use crate::render::{dim_color, err_color};
+use crate::render::{accent, dim_color, err_color, ok_color};
 use crate::tools::{EditOp, PendingEdits, apply_ops_to_content, resolve_in, staged_diff};
 use anyhow::Context as _;
 use crossterm::style::Color;
@@ -128,6 +128,77 @@ pub(super) fn reject(app: &mut App) {
     }
 }
 
+/// `/review` — batch summary after a run of edits: per-file `+N/-M` counts
+/// computed from each file's staged unified diff.
+pub(super) fn review(app: &App) {
+    let ops = snapshot(app);
+    if ops.is_empty() {
+        dim("no staged edits — nothing to review.");
+        return;
+    }
+    // Group by target path, preserving first-seen order (same as /apply).
+    let mut grouped: Vec<(String, Vec<&EditOp>)> = Vec::new();
+    for op in &ops {
+        match grouped.iter_mut().find(|(p, _)| *p == op.path()) {
+            Some((_, group)) => group.push(op),
+            None => grouped.push((op.path().to_owned(), vec![op])),
+        }
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        err("cannot resolve working directory.");
+        return;
+    };
+
+    println!(
+        "{}",
+        paint(
+            format!("{} file(s) modified:", grouped.len()),
+            Color::Yellow
+        )
+    );
+    let width = grouped
+        .iter()
+        .map(|(p, _)| p.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut totals = (0usize, 0usize);
+    for (path, group) in &grouped {
+        let (added, removed) = {
+            let owned: Vec<EditOp> = group.iter().map(|op| (*op).clone()).collect();
+            match staged_diff(&cwd, &owned) {
+                Ok(diff) => crate::diff::count_changes(&diff),
+                Err(e) => {
+                    err(&format!("cannot diff '{path}': {e:#}"));
+                    continue;
+                }
+            }
+        };
+        totals.0 += added;
+        totals.1 += removed;
+        let pad = " ".repeat(width - path.chars().count());
+        println!(
+            "  {}{}  {} {}",
+            paint(path.clone(), accent()),
+            pad,
+            paint(format!("+{added}"), ok_color()),
+            paint(format!("-{removed}"), err_color())
+        );
+    }
+    println!(
+        "{}",
+        paint(
+            format!(
+                "total: +{}/-{} across {} staged edit(s)",
+                totals.0,
+                totals.1,
+                ops.len()
+            ),
+            dim_color()
+        )
+    );
+    dim("run /apply to confirm, /reject to discard, or /diff for full diffs.");
+}
+
 fn snapshot(app: &App) -> Vec<EditOp> {
     app.pending_edits
         .lock()
@@ -141,4 +212,57 @@ fn transform_file(cwd: &std::path::Path, path: &str, group: &[&EditOp]) -> anyho
     anyhow::ensure!(!bytes.contains(&0), "'{path}' looks binary");
     let original = String::from_utf8_lossy(&bytes).to_string();
     apply_ops_to_content(&original, path, group)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::PendingEdits;
+
+    fn smoke_app() -> App {
+        super::super::tests::smoke_app()
+    }
+
+    #[test]
+    fn review_reports_per_file_change_counts() {
+        let ws = TempDir::new("review");
+        std::fs::write(ws.0.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(ws.0.join("b.txt"), "x\n").unwrap();
+        let mut app = smoke_app();
+        app.pending_edits = std::sync::Arc::new(std::sync::Mutex::new({
+            let mut q = PendingEdits::default();
+            q.push(EditOp::Replace {
+                path: "a.txt".into(),
+                old_string: "two".into(),
+                new_string: "TWO\nextra".into(),
+            });
+            q.push(EditOp::Replace {
+                path: "b.txt".into(),
+                old_string: "x".into(),
+                new_string: "".into(),
+            });
+            q
+        }));
+        // Must not panic and must not touch the disk.
+        review(&app);
+        assert_eq!(
+            std::fs::read_to_string(ws.0.join("a.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+    }
+
+    // Local temp-workspace helper (mirrors tools::tests::TempWs).
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "govinda-edits-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
 }

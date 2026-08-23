@@ -225,6 +225,40 @@ impl Renderer {
     }
 }
 
+/// Renders a unified diff with ANSI colors: `+` lines in the OK color,
+/// `-` lines in the error color, hunk headers accented, everything else
+/// dimmed. Piped output stays uncolored (see [`paint`]).
+pub fn render_diff(diff: &str) {
+    for line in diff.lines() {
+        let color = if line.starts_with("+++") || line.starts_with("---") {
+            dim_color()
+        } else if line.starts_with('+') {
+            ok_color()
+        } else if line.starts_with('-') {
+            err_color()
+        } else if line.starts_with("@@") {
+            accent()
+        } else {
+            dim_color()
+        };
+        println!("{}", paint(line.to_owned(), color));
+    }
+}
+
+/// Emoji + display name badge for a source file, or `None` for files with no
+/// recognized language (plain `📄` still shows in the breadcrumb).
+pub fn language_badge(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next()?;
+    match ext.to_ascii_lowercase().as_str() {
+        "rs" => Some("🦀 Rust"),
+        "py" => Some("🐍 Python"),
+        "js" | "jsx" | "mjs" | "cjs" => Some("🟨 JavaScript"),
+        "ts" | "tsx" => Some("🔷 TypeScript"),
+        "go" => Some("🐹 Go"),
+        _ => None,
+    }
+}
+
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Animated single-line spinner for rendered mode. Inert when disabled or

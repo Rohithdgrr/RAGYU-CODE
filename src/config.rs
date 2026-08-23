@@ -50,7 +50,7 @@ struct FileConfig {
 
 #[derive(Clone)]
 pub struct Config {
-    pub api_key: Zeroizing<String>,
+    pub api_key: Arc<Zeroizing<String>>,
     pub model: String,
     pub temperature: f32,
     pub render_markdown: bool,
@@ -91,7 +91,9 @@ impl Config {
             env_override,
         )
         .context("provider setup failed")?;
-        let api_key = Zeroizing::new(provider.auth().token().unwrap_or_default().to_owned());
+        let api_key = Arc::new(Zeroizing::new(
+            provider.auth().token().unwrap_or_default().to_owned(),
+        ));
 
         let model = env_override("MISTRAL_MODEL")
             .or(file.model)
