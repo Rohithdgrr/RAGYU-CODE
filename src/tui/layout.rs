@@ -25,7 +25,7 @@ impl PaneLayout {
     /// Splits `area` per the current visibility flags.
     ///
     /// Responsive breakpoints:
-    /// - width < 100 → file explorer (right) collapses
+    /// - width < 80 → file explorer (right) collapses
     /// - width < 60  → project tree (left) collapses too (chat goes full-width)
     /// - height < 20 → 1-row compact (tiny)
     /// - height < 28 → 3-row cozy
@@ -47,7 +47,7 @@ impl PaneLayout {
         .areas(area);
 
         let want_tree = show_tree && area.width >= 60;
-        let want_tools = show_tools && area.width >= 100;
+        let want_tools = show_tools && area.width >= 80;
 
         let mut chat = body;
         let mut tree = None;
@@ -102,9 +102,16 @@ mod tests {
 
     #[test]
     fn narrow_terminal_hides_tools() {
-        let l = PaneLayout::compute(rect(80, 30), true, true);
+        let l = PaneLayout::compute(rect(70, 30), true, true);
         assert!(l.tree.is_some());
         assert!(l.tools.is_none());
+    }
+
+    #[test]
+    fn mid_width_shows_explorer() {
+        let l = PaneLayout::compute(rect(90, 30), true, true);
+        assert!(l.tree.is_some());
+        assert!(l.tools.is_some());
     }
 
     #[test]

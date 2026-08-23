@@ -43,25 +43,40 @@ pub fn filtered(input: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// Builds rich palette lines for dropdown — up to 10 rows, selected highlighted.
+/// Builds rich palette lines for dropdown — scrollable, shows all matches.
+/// `selected` is clamped and kept centered in a 12-row window.
 pub fn palette_lines(input: &str, selected: usize) -> Vec<Line<'static>> {
     let t = theme::active();
     let hits = filtered(input);
     if hits.is_empty() {
         return Vec::new();
     }
-    let max_show = 10usize;
-    // keep selected centered
-    let total = hits.len().min(max_show);
+    let total = hits.len();
+    let max_show = 12usize.min(total);
     let sel = selected.min(total.saturating_sub(1));
+    // window so selected is visible
+    let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
+    let end = (start + max_show).min(total);
     let mut out = Vec::new();
-    // header
+    // header with window info
+    let header = if total > max_show {
+        format!(" {}–{} / {} commands ", start + 1, end, total)
+    } else {
+        format!(" {} commands ", total)
+    };
     out.push(Line::styled(
-        format!(" {} commands ", hits.len()),
+        header,
         Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
     ));
-    for (i, cmd) in hits.into_iter().take(max_show).enumerate() {
-        let is_sel = i == sel;
+    if start > 0 {
+        out.push(Line::styled(
+            format!("  ↑ {} more", start),
+            Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    for (idx, cmd) in hits[start..end].iter().enumerate() {
+        let global_idx = start + idx;
+        let is_sel = global_idx == sel;
         let bg = if is_sel { t.bg_hover } else { t.bg_tertiary };
         let fg = if is_sel { t.accent_primary } else { t.text_secondary };
         let mut style = Style::default().fg(fg).bg(bg);
@@ -72,9 +87,15 @@ pub fn palette_lines(input: &str, selected: usize) -> Vec<Line<'static>> {
         let marker = if is_sel { "▸" } else { " " };
         out.push(Line::from(vec![
             Span::styled(format!("{marker} "), Style::default().fg(t.accent_primary).bg(bg)),
-            Span::styled(cmd, style),
+            Span::styled(*cmd, style),
             Span::styled(format!("  {desc}"), Style::default().fg(t.text_muted).bg(bg)),
         ]));
+    }
+    if end < total {
+        out.push(Line::styled(
+            format!("  ↓ {} more", total - end),
+            Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+        ));
     }
     out
 }

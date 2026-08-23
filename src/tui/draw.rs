@@ -222,13 +222,13 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
         }
     }
 
-    // — Slash palette dropdown: filtered "/" commands above input —
+    // — Slash palette dropdown: filtered "/" commands above input — scrollable, shows all
     if focus_input && tui.input.starts_with('/') && !tui.input.contains(' ') {
         let hits = input_bar::filtered(&tui.input);
         if !hits.is_empty() {
             let lines = input_bar::palette_lines(&tui.input, tui.slash_selected);
             if !lines.is_empty() {
-                let pal_h = (lines.len() as u16 + 2).min(12);
+                let pal_h = (lines.len() as u16 + 2).min(18);
                 let pal_w = area.width.saturating_sub(2).min(56);
                 let pal_x = area.x;
                 // place just above input block
