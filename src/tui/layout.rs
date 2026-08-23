@@ -1,9 +1,11 @@
 //! Responsive pane layout.
 //!
 //! Terminal real estate is split top-to-bottom into a 1-row status bar,
-//! the main content band (chat center, optional tree/tools flanks), and a
-//! 3-row input bar. Narrow terminals drop side panes instead of squeezing
-//! the chat; short terminals compact the input bar to one row.
+//! the main content band (chat center, optional tree + explorer flanks), and a
+//! 5-row rich floating composer (3-row cozy on medium screens).
+//! Narrow terminals drop side panes instead of squeezing the chat;
+//! short terminals compact the input bar to one row.
+//! Right sidebar now hosts the file explorer (replaced former tools panel).
 
 use ratatui::layout::{Constraint, Layout, Rect};
 
@@ -13,9 +15,9 @@ pub struct PaneLayout {
     pub status: Rect,
     pub chat: Rect,
     pub input: Rect,
-    /// Left sidebar; `None` when hidden or too narrow to show.
+    /// Left sidebar (project tree); `None` when hidden or too narrow to show.
     pub tree: Option<Rect>,
-    /// Right sidebar; `None` when hidden or too narrow to show.
+    /// Right sidebar (file explorer — formerly tools); `None` when hidden or too narrow.
     pub tools: Option<Rect>,
 }
 
@@ -23,11 +25,19 @@ impl PaneLayout {
     /// Splits `area` per the current visibility flags.
     ///
     /// Responsive breakpoints:
-    /// - width < 100 → tool panel collapses
-    /// - width < 60  → project tree collapses too (chat goes full-width)
-    /// - height < 20 → input bar shrinks from 3 rows to 1
+    /// - width < 100 → file explorer (right) collapses
+    /// - width < 60  → project tree (left) collapses too (chat goes full-width)
+    /// - height < 20 → 1-row compact (tiny)
+    /// - height < 28 → 3-row cozy
+    /// - otherwise  → 5-row rich floating composer
     pub fn compute(area: Rect, show_tree: bool, show_tools: bool) -> Self {
-        let input_rows = if area.height < 20 { 1 } else { 3 };
+        let input_rows = if area.height < 20 {
+            1
+        } else if area.height < 28 {
+            3
+        } else {
+            5
+        };
 
         let [status, body, input] = Layout::vertical([
             Constraint::Length(1),
@@ -47,9 +57,9 @@ impl PaneLayout {
         // predictable center position regardless of what is visible.
         if want_tree || want_tools {
             let cols = Layout::horizontal([
-                Constraint::Length(if want_tree { 24 } else { 0 }),
+                Constraint::Length(if want_tree { 26 } else { 0 }),
                 Constraint::Min(20), // chat floor — never squeezed below this
-                Constraint::Length(if want_tools { 28 } else { 0 }),
+                Constraint::Length(if want_tools { 26 } else { 0 }),
             ])
             .split(body);
             chat = cols[1];
@@ -85,7 +95,7 @@ mod tests {
         assert!(l.tree.is_some());
         assert!(l.tools.is_some());
         assert_eq!(l.status.height, 1);
-        assert_eq!(l.input.height, 3);
+        assert_eq!(l.input.height, 5);
         // Chat never drops below its floor.
         assert!(l.chat.width >= 20);
     }
@@ -109,6 +119,18 @@ mod tests {
     fn short_terminal_compacts_input() {
         let l = PaneLayout::compute(rect(120, 15), false, false);
         assert_eq!(l.input.height, 1);
+    }
+
+    #[test]
+    fn medium_terminal_uses_cozy_input() {
+        let l = PaneLayout::compute(rect(120, 25), false, false);
+        assert_eq!(l.input.height, 3);
+    }
+
+    #[test]
+    fn tall_terminal_uses_rich_input() {
+        let l = PaneLayout::compute(rect(120, 40), false, false);
+        assert_eq!(l.input.height, 5);
     }
 
     #[test]

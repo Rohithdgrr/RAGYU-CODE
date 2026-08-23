@@ -229,7 +229,7 @@ impl Tui {
                 self.notice(
                     "keys: Tab focus · ↑/↓ history|scroll|tree · Space expand dir · Enter \
                      open/pin file · F5 refresh tree · Esc clear/cancel · Ctrl+C cancel stream \
-                     · Ctrl+L clear · Ctrl+T/P panes · Ctrl+Q quit\n\
+                     · Ctrl+L clear · Ctrl+T left tree · Ctrl+P explorer · Ctrl+Q quit\n\
                      gated calls pause in [REVIEW]: y approve · n decline · a all\n\
                      cmds: /help /clear /theme /tokens /agent <on|off> /plan <task>",
                 );
@@ -262,10 +262,10 @@ impl Tui {
                     {
                         self.pin_file(path);
                     } else {
-                        self.notice("select a file in the tree first (Ctrl+T).");
+                        self.notice("select a file in the explorer first (Ctrl+T / Ctrl+P).");
                     }
                 } else {
-                    self.notice("open the tree with Ctrl+T, then Enter pins the selected file.");
+                    self.notice("open explorer with Ctrl+T or Ctrl+P, then Enter pins the selected file.");
                 }
             }
             "/agent" => {
@@ -350,7 +350,7 @@ impl Tui {
                     return;
                 }
                 KeyCode::Char('p') => {
-                    self.show_tools = !self.show_tools;
+                    self.toggle_explorer();
                     return;
                 }
                 _ => {}
@@ -370,7 +370,7 @@ impl Tui {
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Input => Focus::Chat,
-                    Focus::Chat if self.tree.is_some() && self.show_tree => Focus::Tree,
+                    Focus::Chat if self.tree.is_some() && (self.show_tree || self.show_tools) => Focus::Tree,
                     Focus::Chat => Focus::Input,
                     Focus::Tree => Focus::Input,
                 };
@@ -409,10 +409,8 @@ impl Tui {
         self.mode = self.prev_mode;
     }
 
-    /// Ctrl+T: open (lazily building) or close the sidebar.
-    fn toggle_tree(&mut self) {
-        self.show_tree = !self.show_tree;
-        if self.show_tree && self.tree.is_none() {
+    fn ensure_tree(&mut self) {
+        if self.tree.is_none() {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             self.tree = Some(FileTree::open(&cwd));
             if !self.pinned_files.is_empty() {
@@ -421,6 +419,32 @@ impl Tui {
                     self.pinned_files.len()
                 ));
             }
+        }
+    }
+
+    /// Ctrl+T: open/close left project tree.
+    fn toggle_tree(&mut self) {
+        if self.tree.is_none() {
+            self.ensure_tree();
+            self.show_tree = true;
+            return;
+        }
+        self.show_tree = !self.show_tree;
+        if self.show_tree {
+            self.ensure_tree();
+        }
+    }
+
+    /// Ctrl+P: open/close right file explorer (replaced tools panel).
+    fn toggle_explorer(&mut self) {
+        if self.tree.is_none() {
+            self.ensure_tree();
+            self.show_tools = true;
+            return;
+        }
+        self.show_tools = !self.show_tools;
+        if self.show_tools {
+            self.ensure_tree();
         }
     }
 
@@ -756,7 +780,7 @@ async fn event_loop(
 
     'outer: while !tui.quit {
         // ── Idle phase: draw, react to keys, wait for a submission. ──
-        draw_frame(terminal, &status_info(app), &tui)?;
+        draw_frame(terminal, &status_info(app, &tui), &tui)?;
         let prompt = loop {
             tokio::select! {
                 ev = events.next() => match ev {
@@ -793,11 +817,11 @@ async fn event_loop(
             if let Some(p) = tui.take_submission() {
                 break p;
             }
-            draw_frame(terminal, &status_info(app), &tui)?;
+            draw_frame(terminal, &status_info(app, &tui), &tui)?;
         };
         // ── Busy phase: run the turn, keep reacting to keys. ──
         // Snapshot before the turn takes `&mut App`.
-        let info = status_info(app);
+        let info = status_info(app, &tui);
         let pinned = tui.pinned_files.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnUpdate>();
         let (confirm_tx, confirm_rx) =
@@ -878,12 +902,32 @@ async fn event_loop(
             }
             commands::persist_todos(app);
         }
-        draw_frame(terminal, &status_info(app), &tui)?;
+        draw_frame(terminal, &status_info(app, &tui), &tui)?;
     }
     Ok(())
 }
 
-fn status_info(app: &App) -> draw::StatusInfo {
+fn git_branch_and_dirty() -> (Option<String>, bool) {
+    // Cheap, sync read of .git/HEAD; no process spawn per frame.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let head = cwd.join(".git").join("HEAD");
+    let dirty = false; // keep cheap; file-tree handles precise git marks
+    let branch = std::fs::read_to_string(&head).ok().and_then(|s| {
+        let t = s.trim();
+        if let Some(rest) = t.strip_prefix("ref: refs/heads/") {
+            Some(rest.to_owned())
+        } else if t.len() >= 7 {
+            // detached HEAD — show short sha
+            Some(format!("⨂ {}", &t[..7]))
+        } else {
+            None
+        }
+    });
+    (branch, dirty)
+}
+
+fn status_info(app: &App, tui: &Tui) -> draw::StatusInfo {
+    let (git_branch, git_dirty) = git_branch_and_dirty();
     draw::StatusInfo {
         provider: app.config.provider.id().to_owned(),
         model: app.config.model.to_string(),
@@ -908,6 +952,11 @@ fn status_info(app: &App) -> draw::StatusInfo {
                     .is_some_and(|e| e.requires_confirmation(&t.name)),
             })
             .collect(),
+        git_branch,
+        git_dirty,
+        pinned: tui.pinned_files.len(),
+        focus: tui.focus,
+        busy: tui.busy,
     }
 }
 
