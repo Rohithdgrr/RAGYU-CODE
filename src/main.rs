@@ -157,6 +157,14 @@ async fn main() -> Result<()> {
     }
     specialize_system(&mut app);
 
+    // Rich TUI mode: IDE-like panes around the same agent core. Session
+    // autosave still applies on exit.
+    if args.tui {
+        let result = govinda_cli::tui::run(&mut app).await;
+        autosave(&mut app);
+        return result;
+    }
+
     // One-shot mode: answer the prompt (plus any piped stdin), then exit.
     // No banner, no REPL, no session autosave.
     if let Some(prompt) = args.query {
@@ -238,6 +246,7 @@ struct Args {
     resume: Option<String>,
     query: Option<String>,
     completion: Option<String>,
+    tui: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -245,6 +254,7 @@ fn parse_args() -> Result<Args> {
     let mut resume = None;
     let mut query = None;
     let mut completion = None;
+    let mut tui = false;
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--resume" | "-r" => {
@@ -267,6 +277,7 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("--completion needs a shell name"))?;
                 completion = Some(shell);
             }
+            "--tui" => tui = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -278,12 +289,13 @@ fn parse_args() -> Result<Args> {
         resume,
         query,
         completion,
+        tui,
     })
 }
 
 fn print_usage() {
     println!(
-        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --query, -q <prompt> one-shot mode: answer and exit; piped stdin is appended\n                       to the prompt, e.g. cat file.rs | govinda -q \"review\"\n  --completion <shell> print a completion script (bash, zsh, fish, powershell)\n  --help, -h           show this help",
+        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --query, -q <prompt> one-shot mode: answer and exit; piped stdin is appended\n                       to the prompt, e.g. cat file.rs | govinda -q \"review\"\n  --tui                launch the rich terminal UI (panes, light theme)\n  --completion <shell> print a completion script (bash, zsh, fish, powershell)\n  --help, -h           show this help",
         paint(
             format!("govinda-cli v{}", env!("CARGO_PKG_VERSION")),
             accent()

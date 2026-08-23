@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use todo::Todo;
 
+/// Step parser shared with the TUI planner.
+pub use plan::parse_steps;
+
 /// Every slash command the REPL accepts. Drives the reedline completer and
 /// shell-completion scripts; keep in sync with `dispatch()` / `help()`.
 pub const SLASH_COMMANDS: [&str; 37] = [
@@ -172,6 +175,18 @@ impl App {
 /// Persists the session todo list; used by `/plan` execution in main.
 pub fn persist_todos(app: &mut App) {
     todo::save(app);
+}
+
+/// Replaces the session todo list and persists it (TUI plan tracking).
+pub fn set_todos(app: &mut App, texts: &[String]) {
+    app.todos = texts
+        .iter()
+        .map(|text| Todo {
+            text: text.clone(),
+            done: false,
+        })
+        .collect();
+    persist_todos(app);
 }
 
 pub enum Outcome {

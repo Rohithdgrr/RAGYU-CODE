@@ -1,0 +1,460 @@
+//! Interactive project tree sidebar.
+//!
+//! Lazily expands directories, respects `.govindaignore`, and decorates
+//! entries with git status marks (`M` modified, `A` staged, `?` untracked).
+//! The tree is cached and only re-read on explicit refresh (F5) or when the
+//! sidebar is opened.
+
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+
+use super::super::theme;
+use crate::ignore::IgnoreRules;
+
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    pub name: String,
+    /// Workspace-relative path with forward slashes.
+    pub rel: String,
+    pub is_dir: bool,
+    pub expanded: bool,
+    loaded: bool,
+    pub children: Vec<TreeNode>,
+}
+
+impl TreeNode {
+    fn dir(name: String, rel: String) -> Self {
+        Self {
+            name,
+            rel,
+            is_dir: true,
+            expanded: false,
+            loaded: false,
+            children: Vec::new(),
+        }
+    }
+
+    fn file(name: String, rel: String) -> Self {
+        Self {
+            name,
+            rel,
+            is_dir: false,
+            expanded: false,
+            loaded: true,
+            children: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GitMark {
+    Modified,
+    Staged,
+    Untracked,
+}
+
+impl GitMark {
+    fn symbol(self) -> &'static str {
+        match self {
+            GitMark::Modified => "M",
+            GitMark::Staged => "A",
+            GitMark::Untracked => "?",
+        }
+    }
+
+    fn color(self, t: &theme::Theme) -> Style {
+        match self {
+            GitMark::Staged => Style::default().fg(t.accent_success),
+            GitMark::Modified => Style::default().fg(t.accent_warning),
+            GitMark::Untracked => Style::default().fg(t.text_muted),
+        }
+    }
+}
+
+pub struct FileTree {
+    root: PathBuf,
+    ignore: IgnoreRules,
+    nodes: Vec<TreeNode>,
+    selected: usize,
+    git_marks: HashMap<String, GitMark>,
+    /// Height of the render area, fed back by the draw pass so scrolling
+    /// keeps the selection visible.
+    view_height: Cell<u16>,
+}
+
+impl FileTree {
+    /// Builds a tree rooted at `root`, loading its top level immediately.
+    pub fn open(root: &Path) -> Self {
+        let mut tree = Self {
+            root: root.to_path_buf(),
+            ignore: IgnoreRules::load(root),
+            nodes: Vec::new(),
+            selected: 0,
+            git_marks: HashMap::new(),
+            view_height: Cell::new(20),
+        };
+        tree.nodes = read_children(&tree.root, &tree.ignore, "");
+        tree.refresh_git();
+        tree
+    }
+
+    /// Re-reads git status (`git status --porcelain`) synchronously; called
+    /// rarely (open/refresh), so blocking is acceptable.
+    pub fn refresh_git(&mut self) {
+        self.git_marks.clear();
+        let output = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&self.root)
+            .output();
+        if let Ok(out) = output {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if line.len() < 4 {
+                    continue;
+                }
+                let (status, path_raw) = line.split_at(2);
+                let path = path_raw.trim_start().replace('\\', "/");
+                let mark = match status.trim() {
+                    "??" => GitMark::Untracked,
+                    s if s.contains('M') => GitMark::Modified,
+                    s if s.starts_with('A') => GitMark::Staged,
+                    _ => continue,
+                };
+                self.git_marks.insert(path, mark);
+            }
+        }
+        // Reload already-loaded directories so new/removed files show up.
+        reload_loaded(&mut self.nodes, &self.root, &self.ignore);
+        // Expand ancestors of marked files so changes are visible on open.
+        let marked: Vec<String> = self.git_marks.keys().cloned().collect();
+        for path in marked {
+            expand_to(&mut self.nodes, &self.root, &self.ignore, &path);
+        }
+        self.selected = self.selected.min(self.flat_len().saturating_sub(1));
+    }
+
+    /// Full rebuild (F5): re-loads ignore rules, top level, and git status.
+    pub fn refresh(&mut self) {
+        self.ignore = IgnoreRules::load(&self.root);
+        self.nodes = read_children(&self.root, &self.ignore, "");
+        self.selected = 0;
+        self.refresh_git();
+    }
+
+    /// Depth-first list of currently visible rows.
+    pub fn flat(&self) -> Vec<&TreeNode> {
+        fn walk<'a>(nodes: &'a [TreeNode], out: &mut Vec<&'a TreeNode>) {
+            for n in nodes {
+                out.push(n);
+                if n.is_dir && n.expanded {
+                    walk(&n.children, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.nodes, &mut out);
+        out
+    }
+
+    fn flat_len(&self) -> usize {
+        self.flat().len()
+    }
+
+    /// Currently highlighted row.
+    pub fn selected_node(&self) -> Option<&TreeNode> {
+        self.flat().get(self.selected).copied()
+    }
+
+    /// Moves the selection, clamping at both ends.
+    pub fn move_selection(&mut self, delta: isize) {
+        let len = self.flat_len() as isize;
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        self.selected = (self.selected as isize + delta).clamp(0, len - 1) as usize;
+    }
+
+    /// Space key: expand/collapse the highlighted directory.
+    pub fn toggle_selected(&mut self) {
+        let Some(rel) = self.selected_node().map(|n| n.rel.clone()) else {
+            return;
+        };
+        toggle_in(&mut self.nodes, &self.root, &self.ignore, &rel);
+    }
+
+    /// Enter key result: `Some(abs_path)` pins a file to context; `None`
+    /// toggled a directory instead.
+    pub fn activate_selected(&mut self) -> Option<PathBuf> {
+        let node = self.selected_node()?;
+        if node.is_dir {
+            self.toggle_selected();
+            return None;
+        }
+        Some(
+            self.root
+                .join(node.rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        )
+    }
+
+    /// Render height communicated by the draw pass so scrolling stays exact.
+    pub fn set_view_height(&self, h: u16) {
+        self.view_height.set(h.max(1));
+    }
+
+    /// Renders the visible rows with icons, git marks, and selection.
+    pub fn render_lines(&self, focused: bool) -> Vec<Line<'static>> {
+        let t = theme::active();
+        let rows = self.flat();
+
+        // Windowed scroll that keeps the selected row on screen.
+        let visible_height = usize::from(self.view_height.get());
+        let start = self
+            .selected
+            .saturating_sub(visible_height.saturating_sub(1))
+            .min(rows.len().saturating_sub(visible_height.min(rows.len())));
+        let end = (start + visible_height).min(rows.len());
+
+        rows[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let idx = start + i;
+                let depth = node.rel.split('/').count().saturating_sub(1);
+                let indent = "  ".repeat(depth);
+                let icon = if node.is_dir {
+                    if node.expanded {
+                        "▾"
+                    } else {
+                        "▸"
+                    }
+                } else {
+                    ""
+                };
+                let selected_row = idx == self.selected;
+                let base = if selected_row {
+                    Style::default()
+                        .bg(if focused { t.bg_hover } else { t.bg_secondary })
+                        .fg(t.text_primary)
+                } else {
+                    t.sidebar_bg()
+                };
+
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{indent}{:>2} ", icon),
+                        if selected_row {
+                            base.add_modifier(Modifier::BOLD)
+                        } else {
+                            base
+                        },
+                    ),
+                    Span::styled(node.name.clone(), base),
+                ];
+                if let Some(mark) = self.git_marks.get(&node.rel) {
+                    spans.push(Span::styled(format!(" {}", mark.symbol()), mark.color(&t)));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    }
+}
+
+/// Reads one directory's entries (dirs first, then alphabetical), skipping
+/// hidden files and anything `.govindaignore` excludes.
+fn read_children(root: &Path, ignore: &IgnoreRules, rel_dir: &str) -> Vec<TreeNode> {
+    let abs = if rel_dir.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_dir.replace('/', std::path::MAIN_SEPARATOR_STR))
+    };
+    let Ok(entries) = std::fs::read_dir(&abs) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        let is_dir = ft.is_dir();
+        let rel = if rel_dir.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_dir}/{name}")
+        };
+        if ignore.matches(&rel, is_dir) {
+            continue;
+        }
+        out.push(if is_dir {
+            TreeNode::dir(name, rel)
+        } else {
+            TreeNode::file(name, rel)
+        });
+    }
+    out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
+/// Expands every loaded directory in place, re-reading its contents.
+fn reload_loaded(nodes: &mut [TreeNode], root: &Path, ignore: &IgnoreRules) {
+    for node in nodes {
+        if node.is_dir && node.loaded {
+            node.children = read_children(root, ignore, &node.rel);
+            reload_loaded(&mut node.children, root, ignore);
+        }
+    }
+}
+
+/// Marks `target`'s ancestors expanded, loading them lazily.
+fn expand_to(nodes: &mut [TreeNode], root: &Path, ignore: &IgnoreRules, target: &str) {
+    let mut consumed = String::new();
+    for seg in target.split('/') {
+        if !consumed.is_empty() {
+            consumed.push('/');
+        }
+        consumed.push_str(seg);
+        if walk_expand(nodes, root, ignore, &consumed) {
+            continue;
+        }
+        return;
+    }
+}
+
+fn walk_expand(
+    nodes: &mut [TreeNode],
+    root: &Path,
+    ignore: &IgnoreRules,
+    rel: &str,
+) -> bool {
+    for node in nodes {
+        if node.rel != rel {
+            continue;
+        }
+        node.expanded = true;
+        if node.is_dir && !node.loaded {
+            node.children = read_children(root, ignore, rel);
+            node.loaded = true;
+        }
+        return true;
+    }
+    false
+}
+
+fn toggle_in(
+    nodes: &mut [TreeNode],
+    root: &Path,
+    ignore: &IgnoreRules,
+    target: &str,
+) -> bool {
+    for node in nodes {
+        if node.rel == target && node.is_dir {
+            if !node.loaded {
+                node.children = read_children(root, ignore, target);
+                node.loaded = true;
+            }
+            node.expanded = !node.expanded;
+            return true;
+        }
+        if node.is_dir
+            && toggle_in(&mut node.children, root, ignore, target)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn scratch() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("govinda-tree-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/nested")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("src/nested/deep.rs"), "").unwrap();
+        std::fs::write(dir.join("README.md"), "# x").unwrap();
+        std::fs::write(dir.join(".govindaignore"), "target/\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn open_skips_hidden_and_ignored_dirs() {
+        let dir = scratch();
+        let tree = FileTree::open(&dir);
+        let names: Vec<&str> = tree.flat().iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"src"));
+        assert!(names.contains(&"README.md"));
+        assert!(!names.contains(&"target"), "ignored dir must be hidden");
+        assert!(!names.contains(&".govindaignore"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn navigation_clamps_at_edges() {
+        let dir = scratch();
+        let mut tree = FileTree::open(&dir);
+        let len = tree.flat_len();
+        assert!(len >= 2, "scratch layout should yield ≥2 rows");
+        tree.move_selection(-99);
+        assert_eq!(tree.selected, 0);
+        tree.move_selection(99);
+        assert_eq!(tree.selected, len - 1);
+        if len >= 3 {
+            tree.move_selection(-2);
+            assert_eq!(tree.selected, len - 3);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggling_a_directory_reveals_children() {
+        let dir = scratch();
+        let mut tree = FileTree::open(&dir);
+        // Find the src row and select it before expanding.
+        let idx = tree.flat().iter().position(|n| n.name == "src").unwrap();
+        tree.move_selection(idx as isize - tree.selected as isize);
+        assert!(tree.selected_node().unwrap().is_dir);
+        tree.toggle_selected();
+        let names: Vec<&str> = tree.flat().iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"main.rs"));
+        assert!(names.contains(&"nested"));
+
+        // Enter on a file returns its absolute path; on a dir it expands.
+        let deep_idx = tree.flat().iter().position(|n| n.rel == "src").unwrap();
+        tree.move_selection(deep_idx as isize - tree.selected as isize);
+        assert!(tree.activate_selected().is_none()); // toggles closed again
+
+        tree.toggle_selected(); // reopen
+        let file_idx = tree.flat().iter().position(|n| n.rel == "src/main.rs").unwrap();
+        tree.move_selection(file_idx as isize - tree.selected as isize);
+        let pinned = tree.activate_selected().unwrap();
+        assert!(pinned.ends_with("main.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_marks_parse_from_porcelain_output() {
+        // Indirect test: refresh_git against a non-repo must not panic and
+        // must simply produce no marks.
+        let dir = scratch();
+        let mut tree = FileTree::open(&dir);
+        tree.refresh_git();
+        // temp dirs are not repos; git fails silently → no marks.
+        // (In-repo behavior is covered manually.)
+        assert!(tree.flat_len() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

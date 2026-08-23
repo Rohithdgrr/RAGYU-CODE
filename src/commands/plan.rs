@@ -102,7 +102,8 @@ pub(super) async fn handle(arg: &str, app: &mut App) -> Outcome {
 
 /// Extracts numbered/bulleted steps from a model reply. Tolerates stray
 /// prose by ignoring lines without a list marker; caps at [`MAX_STEPS`].
-fn parse_steps(text: &str) -> Vec<String> {
+/// Shared with the TUI planner (`tui::app`).
+pub fn parse_steps(text: &str) -> Vec<String> {
     static MARKER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = MARKER.get_or_init(|| {
         #[allow(clippy::expect_used)] // static, hand-checked pattern

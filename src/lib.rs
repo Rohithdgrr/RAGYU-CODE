@@ -20,3 +20,4 @@ pub mod sessions;
 pub mod symbols;
 pub mod tokens;
 pub mod tools;
+pub mod tui;
