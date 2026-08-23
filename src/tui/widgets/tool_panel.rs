@@ -33,79 +33,139 @@ pub fn build_lines(
     let mut lines = Vec::new();
 
     // ── Registry ──
-    lines.push(header("TOOLS", &t));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " TOOLS",
+            Style::default()
+                .fg(t.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" ({})", tools.len()),
+            Style::default().fg(t.text_muted),
+        ),
+    ]));
+    lines.push(Line::styled("─".repeat(20), Style::default().fg(t.border_default)));
+
     for tool in tools {
-        let (flag, color) = if tool.enabled {
-            ("on", t.accent_success)
+        let (icon, icon_style) = if tool.enabled {
+            if tool.gated {
+                ("🔒", t.accent_warning)
+            } else {
+                ("●", t.accent_success)
+            }
         } else {
-            ("off", t.accent_error)
+            ("○", t.text_muted)
         };
-        let gate = if tool.gated { " 🔒" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("[{flag}] "),
-                Style::default().fg(color),
+                format!(" {icon} "),
+                icon_style,
             ),
-            Span::styled(format!("{name}{gate}", name = tool.name), t.sidebar_bg()),
+            Span::styled(
+                tool.name.clone(),
+                if tool.enabled {
+                    Style::default().fg(t.text_primary)
+                } else {
+                    Style::default().fg(t.text_muted)
+                },
+            ),
         ]));
     }
 
     // ── Live activity ──
     lines.push(Line::default());
-    lines.push(header("ACTIVITY", &t));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " ACTIVITY",
+            Style::default()
+                .fg(t.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::styled("─".repeat(20), Style::default().fg(t.border_default)));
+
     if activity.is_empty() {
-        lines.push(Line::styled("no calls this session", muted(&t)));
+        lines.push(Line::styled(
+            "  No calls yet",
+            Style::default().fg(t.text_muted),
+        ));
     } else {
         let running = activity.iter().filter(|a| a.ok.is_none()).count();
         let failed = activity.iter().filter(|a| a.ok == Some(false)).count();
         let done = activity.iter().filter(|a| a.ok == Some(true)).count();
-        lines.push(Line::from(vec![
-            Span::styled(format!("✓ {done} "), t.success()),
-            Span::styled(format!("✗ {failed} "), t.error()),
-            Span::styled(
+
+        // Summary line
+        let mut summary = Vec::new();
+        if done > 0 {
+            summary.push(Span::styled(
+                format!("✓ {done}"),
+                t.success(),
+            ));
+        }
+        if failed > 0 {
+            summary.push(Span::raw(" "));
+            summary.push(Span::styled(
+                format!("✗ {failed}"),
+                t.error(),
+            ));
+        }
+        if running > 0 {
+            summary.push(Span::raw(" "));
+            summary.push(Span::styled(
                 format!("… {running}"),
-                if running > 0 { t.warning() } else { muted(&t) },
-            ),
-        ]));
-        // Most recent calls, newest last.
-        for a in activity.iter().rev().take(6) {
+                t.warning(),
+            ));
+        }
+        lines.push(Line::from(summary));
+
+        // Recent calls
+        for a in activity.iter().rev().take(8) {
             let (icon, style) = match a.ok {
-                None => ("…", t.warning()),
+                None => ("⏳", t.warning()),
                 Some(true) => ("✓", t.success()),
                 Some(false) => ("✗", t.error()),
             };
-            lines.push(Span::styled(icon.to_owned(), style).into());
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {icon}"), style),
+            ]));
         }
     }
 
     // ── Session stats ──
     lines.push(Line::default());
-    lines.push(header("STATUS", &t));
-    for (label, value) in [
-        ("Turns", turns.to_string()),
-        ("Errors", errors.to_string()),
-        ("Avg", format!("{avg_latency_ms}ms")),
+    lines.push(Line::from(vec![
+        Span::styled(
+            " STATUS",
+            Style::default()
+                .fg(t.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::styled("─".repeat(20), Style::default().fg(t.border_default)));
+
+    for (icon, label, value) in [
+        ("⟳", "Turns", turns.to_string()),
+        ("!", "Errors", errors.to_string()),
+        ("⚡", "Avg", format!("{avg_latency_ms}ms")),
     ] {
         lines.push(Line::from(vec![
-            Span::styled(format!("{label}: "), muted(&t)),
-            Span::styled(value, t.sidebar_bg()),
+            Span::styled(
+                format!(" {icon} "),
+                Style::default().fg(t.text_muted),
+            ),
+            Span::styled(
+                format!("{label}: "),
+                Style::default().fg(t.text_muted),
+            ),
+            Span::styled(
+                value,
+                Style::default().fg(t.text_primary).add_modifier(Modifier::BOLD),
+            ),
         ]));
     }
 
     lines
-}
-
-fn header(text: &str, t: &theme::Theme) -> Line<'static> {
-    Line::styled(
-        format!("── {text} "),
-        Style::default()
-            .fg(t.accent_secondary)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-fn muted(t: &theme::Theme) -> Style {
-    Style::default().fg(t.text_muted)
 }
 
 /// Extracts the tail of tool activity from the transcript.
@@ -173,7 +233,7 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.clone()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("[on] read_file"));
+        assert!(joined.contains("read_file"));
         assert!(joined.contains("Turns: 4"));
         assert!(joined.contains("Avg: 250ms"));
     }

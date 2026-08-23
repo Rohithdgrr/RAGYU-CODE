@@ -106,58 +106,58 @@ impl Theme {
 
 /// Apple-inspired light theme — the signature look of the redesign.
 pub const LIGHT_THEME: Theme = Theme {
-    bg_primary: Color::Rgb(250, 250, 252),
-    bg_secondary: Color::Rgb(245, 245, 247),
+    bg_primary: Color::Rgb(252, 252, 254),
+    bg_secondary: Color::Rgb(242, 242, 247),
     bg_tertiary: Color::Rgb(255, 255, 255),
-    bg_hover: Color::Rgb(235, 235, 240),
+    bg_hover: Color::Rgb(232, 232, 238),
 
     accent_primary: Color::Rgb(0, 122, 255),
     accent_secondary: Color::Rgb(88, 86, 214),
-    accent_success: Color::Rgb(52, 199, 89),
-    accent_warning: Color::Rgb(255, 149, 0),
-    accent_error: Color::Rgb(255, 59, 48),
+    accent_success: Color::Rgb(48, 176, 78),
+    accent_warning: Color::Rgb(245, 140, 0),
+    accent_error: Color::Rgb(240, 50, 40),
 
-    text_primary: Color::Rgb(28, 28, 30),
-    text_secondary: Color::Rgb(99, 99, 102),
-    text_muted: Color::Rgb(142, 142, 147),
+    text_primary: Color::Rgb(26, 26, 28),
+    text_secondary: Color::Rgb(92, 92, 96),
+    text_muted: Color::Rgb(150, 150, 156),
     text_inverse: Color::Rgb(255, 255, 255),
 
-    border_default: Color::Rgb(200, 200, 205),
+    border_default: Color::Rgb(210, 210, 216),
     border_focus: Color::Rgb(0, 122, 255),
 
-    syntax_keyword: Color::Rgb(175, 0, 145),
-    syntax_string: Color::Rgb(196, 26, 22),
-    syntax_comment: Color::Rgb(0, 128, 0),
-    syntax_function: Color::Rgb(121, 93, 163),
-    syntax_type: Color::Rgb(0, 103, 163),
+    syntax_keyword: Color::Rgb(186, 0, 152),
+    syntax_string: Color::Rgb(200, 32, 28),
+    syntax_comment: Color::Rgb(0, 140, 0),
+    syntax_function: Color::Rgb(128, 88, 170),
+    syntax_type: Color::Rgb(0, 110, 172),
 };
 
 /// Dark counterpart for night sessions (`/theme dark`).
 pub const DARK_THEME: Theme = Theme {
-    bg_primary: Color::Rgb(22, 22, 26),
-    bg_secondary: Color::Rgb(30, 30, 35),
-    bg_tertiary: Color::Rgb(40, 40, 46),
-    bg_hover: Color::Rgb(52, 52, 60),
+    bg_primary: Color::Rgb(20, 20, 24),
+    bg_secondary: Color::Rgb(28, 28, 33),
+    bg_tertiary: Color::Rgb(38, 38, 44),
+    bg_hover: Color::Rgb(48, 48, 56),
 
-    accent_primary: Color::Rgb(64, 156, 255),
-    accent_secondary: Color::Rgb(125, 122, 255),
-    accent_success: Color::Rgb(78, 201, 120),
-    accent_warning: Color::Rgb(255, 179, 71),
-    accent_error: Color::Rgb(255, 105, 97),
+    accent_primary: Color::Rgb(56, 152, 255),
+    accent_secondary: Color::Rgb(118, 114, 255),
+    accent_success: Color::Rgb(68, 195, 112),
+    accent_warning: Color::Rgb(255, 172, 62),
+    accent_error: Color::Rgb(255, 98, 88),
 
-    text_primary: Color::Rgb(235, 235, 240),
-    text_secondary: Color::Rgb(160, 160, 168),
-    text_muted: Color::Rgb(110, 110, 118),
-    text_inverse: Color::Rgb(22, 22, 26),
+    text_primary: Color::Rgb(232, 232, 238),
+    text_secondary: Color::Rgb(156, 156, 164),
+    text_muted: Color::Rgb(106, 106, 114),
+    text_inverse: Color::Rgb(20, 20, 24),
 
-    border_default: Color::Rgb(64, 64, 72),
-    border_focus: Color::Rgb(64, 156, 255),
+    border_default: Color::Rgb(58, 58, 66),
+    border_focus: Color::Rgb(56, 152, 255),
 
-    syntax_keyword: Color::Rgb(255, 121, 222),
-    syntax_string: Color::Rgb(231, 106, 106),
-    syntax_comment: Color::Rgb(106, 153, 85),
-    syntax_function: Color::Rgb(220, 190, 255),
-    syntax_type: Color::Rgb(79, 193, 233),
+    syntax_keyword: Color::Rgb(255, 116, 218),
+    syntax_string: Color::Rgb(228, 100, 100),
+    syntax_comment: Color::Rgb(100, 148, 80),
+    syntax_function: Color::Rgb(216, 186, 252),
+    syntax_type: Color::Rgb(74, 190, 230),
 };
 
 static ACTIVE: RwLock<Theme> = RwLock::new(LIGHT_THEME);

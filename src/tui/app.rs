@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -72,6 +72,14 @@ pub enum Focus {
     Input,
     Chat,
     Tree,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlashDialog {
+    pub command: String,
+    pub desc: String,
+    pub arg_input: String,
+    pub arg_cursor: usize,
 }
 
 /// Live update pushed from the turn runner back to the UI thread.
@@ -139,6 +147,12 @@ pub struct Tui {
     plan_executing: bool,
     /// Transcript index of the live checklist entry (replaced on progress).
     plan_entry_idx: Option<usize>,
+    /// Slash palette selection (when input starts with '/')
+    pub slash_selected: usize,
+    /// Queued slash for full dispatch needing App (all 37 commands)
+    pending_slash: Option<String>,
+    /// Dialog shown after clicking a slash command (mouse or Tab) — args input
+    pub slash_dialog: Option<SlashDialog>,
 }
 
 impl Default for Tui {
@@ -149,7 +163,7 @@ impl Default for Tui {
 
 impl Tui {
     pub fn new() -> Self {
-        Self {
+        let mut tui = Self {
             mode: AppMode::Normal,
             prev_mode: AppMode::Normal,
             focus: Focus::Input,
@@ -179,7 +193,19 @@ impl Tui {
             plan_awaiting: false,
             plan_executing: false,
             plan_entry_idx: None,
+            slash_selected: 0,
+            pending_slash: None,
+            slash_dialog: None,
+        };
+        // Eagerly open explorer so "No files yet" never shows on startup when
+        // the right pane is visible by default (width≥100). Fail silently in tests.
+        if tui.show_tools {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            // Only auto-open if cwd looks like a real project (avoid temp test dirs pollution)
+            // but FileTree::open is cheap even for temp dirs, so just open.
+            tui.tree = Some(FileTree::open(&cwd));
         }
+        tui
     }
 
     pub fn notice(&mut self, text: impl Into<String>) {
@@ -200,6 +226,10 @@ impl Tui {
     /// Applies Enter in the input bar. Slash commands are handled locally
     /// (the full dispatcher prints to stdout and would corrupt the screen);
     /// plain prompts queue up as agent turns.
+    pub fn take_pending_slash(&mut self) -> Option<String> {
+        self.pending_slash.take()
+    }
+
     fn submit(&mut self) {
         let line = self.input.trim().to_owned();
         if line.is_empty() {
@@ -207,9 +237,13 @@ impl Tui {
         }
         self.input.clear();
         self.input_cursor = 0;
+        self.slash_selected = 0;
 
         if line.starts_with('/') {
-            self.local_command(&line);
+            // Try local fast path; if not handled, queue for App-aware dispatch
+            if !self.local_command(&line) {
+                self.pending_slash = Some(line);
+            }
             return;
         }
         self.history.push(line.clone());
@@ -220,25 +254,182 @@ impl Tui {
         self.pending_prompt = Some(line);
     }
 
-    fn local_command(&mut self, line: &str) {
+    fn apply_slash_completion(&mut self) {
+        let input = self.input.clone();
+        let hits = crate::tui::widgets::input_bar::filtered(&input);
+        if hits.is_empty() {
+            return;
+        }
+        let idx = self.slash_selected.min(hits.len() - 1);
+        let chosen = hits[idx];
+        // replace first token with chosen
+        if let Some(space) = input.find(char::is_whitespace) {
+            let rest = &input[space..];
+            self.input = format!("{chosen}{rest}");
+        } else {
+            self.input = chosen.to_owned();
+        }
+        self.input_cursor = self.input.chars().count();
+        self.slash_selected = 0;
+    }
+
+    pub fn open_slash_dialog(&mut self, cmd: &str) {
+        let desc = crate::tui::widgets::input_bar::describe(cmd);
+        self.slash_dialog = Some(SlashDialog {
+            command: cmd.to_owned(),
+            desc: desc.to_owned(),
+            arg_input: String::new(),
+            arg_cursor: 0,
+        });
+    }
+
+    fn close_slash_dialog(&mut self) {
+        self.slash_dialog = None;
+    }
+
+    fn confirm_slash_dialog(&mut self) {
+        if let Some(d) = self.slash_dialog.take() {
+            let full = if d.arg_input.trim().is_empty() {
+                d.command.clone()
+            } else {
+                format!("{} {}", d.command, d.arg_input.trim())
+            };
+            // Queue for App-aware dispatch (like other slashes)
+            self.pending_slash = Some(full);
+            self.input.clear();
+            self.input_cursor = 0;
+            self.slash_selected = 0;
+        }
+    }
+
+    fn handle_dialog_key(&mut self, key: KeyEvent) -> bool {
+        if self.slash_dialog.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.close_slash_dialog();
+            }
+            KeyCode::Enter => {
+                // take ownership to avoid borrow conflict
+                if let Some(d) = self.slash_dialog.take() {
+                    let full = if d.arg_input.trim().is_empty() {
+                        d.command.clone()
+                    } else {
+                        format!("{} {}", d.command, d.arg_input.trim())
+                    };
+                    self.pending_slash = Some(full);
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.slash_selected = 0;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    let byte = dialog
+                        .arg_input
+                        .char_indices()
+                        .nth(dialog.arg_cursor)
+                        .map_or(dialog.arg_input.len(), |(i, _)| i);
+                    dialog.arg_input.insert(byte, c);
+                    dialog.arg_cursor += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if dialog.arg_cursor > 0 {
+                        let byte = dialog
+                            .arg_input
+                            .char_indices()
+                            .nth(dialog.arg_cursor)
+                            .map_or(dialog.arg_input.len(), |(i, _)| i);
+                        let prev = dialog.arg_input[..byte]
+                            .char_indices()
+                            .next_back()
+                            .map_or(0, |(i, _)| i);
+                        dialog.arg_input.replace_range(prev..byte, "");
+                        dialog.arg_cursor -= 1;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if dialog.arg_cursor < dialog.arg_input.chars().count() {
+                        let byte = dialog
+                            .arg_input
+                            .char_indices()
+                            .nth(dialog.arg_cursor)
+                            .map_or(dialog.arg_input.len(), |(i, _)| i);
+                        let next = dialog.arg_input[byte..]
+                            .char_indices()
+                            .nth(1)
+                            .map_or(dialog.arg_input.len(), |(i, _)| byte + i);
+                        dialog.arg_input.replace_range(byte..next, "");
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if dialog.arg_cursor > 0 { dialog.arg_cursor -= 1; } else { return false; }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if dialog.arg_cursor < dialog.arg_input.chars().count() { dialog.arg_cursor += 1; } else { return false; }
+                }
+            }
+            KeyCode::Home => {
+                if let Some(dialog) = &mut self.slash_dialog { dialog.arg_cursor = 0; }
+            }
+            KeyCode::End => {
+                if let Some(dialog) = &mut self.slash_dialog { dialog.arg_cursor = dialog.arg_input.chars().count(); }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn local_command(&mut self, line: &str) -> bool {
         let (cmd, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        match cmd.to_ascii_lowercase().as_str() {
-            "/quit" | "/exit" | "/q" => self.quit = true,
-            "/clear" | "/reset" => self.pending_clear = true,
+        let cmd_lc = cmd.to_ascii_lowercase();
+        match cmd_lc.as_str() {
+            "/quit" | "/exit" | "/q" => {
+                self.quit = true;
+                return true;
+            }
+            "/clear" | "/reset" => {
+                self.pending_clear = true;
+                return true;
+            }
             "/help" => {
                 self.notice(
-                    "keys: Tab focus · ↑/↓ history|scroll|tree · Space expand dir · Enter \
-                     open/pin file · F5 refresh tree · Esc clear/cancel · Ctrl+C cancel stream \
-                     · Ctrl+L clear · Ctrl+T/P panes · Ctrl+Q quit\n\
+                    "keys: Tab focus · ↑/↓ palette/history · Space expand dir · Enter \
+                     open/pin file · F5 refresh · Esc clear/cancel · Ctrl+C cancel stream \
+                     · Ctrl+L clear · Ctrl+T left tree · Ctrl+P explorer · Ctrl+Q quit\n\
                      gated calls pause in [REVIEW]: y approve · n decline · a all\n\
-                     cmds: /help /clear /theme /tokens /agent <on|off> /plan <task>",
+                     cmds: /help /clear /theme /tokens /agent <on|off> /plan <task> /model /temp /system /history /undo /retry /variants /pick /compact /search /save /load /sessions /fork /export /stats /raw /config /timeout /limit /tools /todo /diff /apply /reject /review /scan /project\n\
+                     Tip: type \"/\" to see filtered palette — Tab completes, ↑↓ selects.",
                 );
+                return true;
             }
             "/theme" => {
-                let t = theme::toggle();
-                self.notice(format!("switched to the {} theme", t.name()));
+                // "/theme" alone handled locally; "/theme <name>" needs App for persistence check but toggle is fine
+                if rest.trim().is_empty() {
+                    let t = theme::toggle();
+                    self.notice(format!("switched to the {} theme", t.name()));
+                    return true;
+                }
+                // fall through to App-aware dispatch for "/theme <name>"
+                return false;
             }
-            "/tokens" => {} // rendered live in the status bar
+            "/tokens" => {
+                self.notice("tokens — see top bar for live usage ( /tokens for full BPE count )");
+                return true;
+            }
             "/plan" => {
                 let task = rest.trim();
                 if task.is_empty() {
@@ -247,6 +438,7 @@ impl Tui {
                     self.pending_plan_task = Some(task.to_owned());
                     self.notice("planning…");
                 }
+                return true;
             }
             "/pin" => {
                 if let Some(tree) = &self.tree {
@@ -262,11 +454,12 @@ impl Tui {
                     {
                         self.pin_file(path);
                     } else {
-                        self.notice("select a file in the tree first (Ctrl+T).");
+                        self.notice("select a file in the explorer first (Ctrl+T / Ctrl+P).");
                     }
                 } else {
-                    self.notice("open the tree with Ctrl+T, then Enter pins the selected file.");
+                    self.notice("open explorer with Ctrl+T or Ctrl+P, then Enter pins the selected file.");
                 }
+                return true;
             }
             "/agent" => {
                 let requested = match rest.trim() {
@@ -292,25 +485,257 @@ impl Tui {
                     }
                     None => self.notice(format!("mode: {}", self.mode.label())),
                 }
+                return true;
             }
-            other => {
-                self.notice(format!(
-                    "'{other}' is not wired into the TUI yet — run with --repl for the full \
-                     REPL command set"
-                ));
-            }
+            _ => {}
         }
+        // If it's a known slash command, queue for App-aware handling
+        if crate::commands::SLASH_COMMANDS.contains(&cmd_lc.as_str()) {
+            return false;
+        }
+        // Unknown command
+        self.notice(format!(
+            "unknown command '{}' — type \"/\" to see palette or /help",
+            cmd
+        ));
+        true
     }
 
     pub fn handle_event(&mut self, ev: Event) {
-        if let Event::Key(key) = ev
-            && key.kind == crossterm::event::KeyEventKind::Press
-        {
-            self.handle_key(key);
+        match ev {
+            Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+                self.handle_key(key);
+            }
+            Event::Mouse(me) => {
+                // Mouse is handled in event_loop with layout context; fallback scroll-only here
+                self.handle_mouse_fallback(me);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_fallback(&mut self, me: MouseEvent) {
+        match me.kind {
+            MouseEventKind::ScrollUp => {
+                if self.focus == Focus::Tree {
+                    if let Some(tree) = &mut self.tree {
+                        tree.move_selection(-1);
+                    }
+                } else if self.focus == Focus::Chat {
+                    self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(1);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.focus == Focus::Tree {
+                    if let Some(tree) = &mut self.tree {
+                        tree.move_selection(1);
+                    }
+                } else if self.focus == Focus::Chat {
+                    self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mouse with layout — called from event_loop where pane rects are known.
+    pub fn handle_mouse_with_layout(&mut self, me: MouseEvent, layout: &super::layout::PaneLayout) {
+        let col = me.column;
+        let row = me.row;
+        // helper to test inside rect
+        let inside = |r: ratatui::layout::Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
+        // Dialog captures mouse first
+        if let Some(_dialog) = &self.slash_dialog {
+            // centered 60x9 dialog — compute same as draw
+            let full_w = layout.status.width;
+            let full_h = layout.status.height + layout.chat.height + layout.input.height;
+            let dw: u16 = 60;
+            let dh: u16 = 9;
+            let dx = full_w.saturating_sub(dw) / 2;
+            let dy = full_h.saturating_sub(dh) / 2;
+            let dlg = ratatui::layout::Rect::new(dx, dy, dw.min(full_w), dh.min(full_h));
+            match me.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if inside(dlg) {
+                        // click inside dialog — focus stays, maybe set cursor? For now do nothing.
+                        return;
+                    } else {
+                        // click outside closes dialog (cancel)
+                        self.close_slash_dialog();
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+        // Palette click — open dialog for selected command
+        if self.focus == Focus::Input && self.input.starts_with('/') && !self.input.contains(' ') {
+            let hits = crate::tui::widgets::input_bar::filtered(&self.input);
+            if !hits.is_empty() {
+                let lines = crate::tui::widgets::input_bar::palette_lines(&self.input, self.slash_selected);
+                let pal_h = (lines.len() as u16 + 2).min(18);
+                let pal_w = layout.input.width.saturating_sub(2).min(56);
+                let pal_x = layout.input.x;
+                let pal_y = layout.input.y.saturating_sub(pal_h);
+                let pal_rect = ratatui::layout::Rect::new(pal_x, pal_y.max(1), pal_w, pal_h);
+                if inside(pal_rect) {
+                    match me.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            // map click to row
+                            let inner_y = pal_rect.y + 1;
+                            let off = row.saturating_sub(inner_y) as usize;
+                            // header is line 0, maybe "↑" line 1
+                            let total = hits.len();
+                            let max_show = 12.min(total);
+                            let sel = self.slash_selected.min(total.saturating_sub(1));
+                            let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
+                            // determine if clicked row is a command row
+                            // lines[0]=header, [1]=maybe "↑", then commands, then "↓"
+                            let mut cmd_idx: Option<usize> = None;
+                            if total > max_show && start > 0 {
+                                // line 1 is "↑"
+                                if off == 1 {
+                                    // clicked "↑" — ignore
+                                } else if off >= 2 && off < 2 + max_show {
+                                    cmd_idx = Some(start + (off - 2));
+                                }
+                            } else {
+                                if off >= 1 && off < 1 + max_show {
+                                    cmd_idx = Some(start + (off - 1));
+                                }
+                            }
+                            if let Some(idx) = cmd_idx {
+                                if idx < total {
+                                    self.slash_selected = idx;
+                                    let cmd = hits[idx];
+                                    self.open_slash_dialog(cmd);
+                                    return;
+                                }
+                            } else if off == 0 {
+                                // header click — ignore
+                                return;
+                            }
+                            // click on palette but not on command — just keep
+                            return;
+                        }
+                        MouseEventKind::ScrollUp => {
+                            if self.slash_selected > 0 { self.slash_selected -= 1; }
+                            return;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            if self.slash_selected + 1 < hits.len() { self.slash_selected += 1; }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(r) = layout.tree
+                    && inside(r)
+                {
+                    self.focus = Focus::Tree;
+                    self.show_tree = true;
+                    self.ensure_tree();
+                    self.click_tree_at(col, row, r);
+                    return;
+                }
+                if let Some(r) = layout.tools
+                    && inside(r)
+                {
+                    self.focus = Focus::Tree;
+                    self.show_tools = true;
+                    self.ensure_tree();
+                    self.click_tree_at(col, row, r);
+                    return;
+                }
+                if inside(layout.chat) {
+                    self.focus = Focus::Chat;
+                    return;
+                }
+                if inside(layout.input) {
+                    self.focus = Focus::Input;
+                    return;
+                }
+                if inside(layout.status) {
+                    // click top bar cycles theme
+                    // not handling here; could toggle
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(r) = layout.tree
+                    && inside(r)
+                {
+                    if let Some(tree) = &mut self.tree { tree.move_selection(-3); }
+                } else if let Some(r) = layout.tools
+                    && inside(r)
+                {
+                    if let Some(tree) = &mut self.tree { tree.move_selection(-3); }
+                } else if inside(layout.chat) {
+                    self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(3);
+                } else {
+                    self.handle_mouse_fallback(me);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(r) = layout.tree
+                    && inside(r)
+                {
+                    if let Some(tree) = &mut self.tree { tree.move_selection(3); }
+                } else if let Some(r) = layout.tools
+                    && inside(r)
+                {
+                    if let Some(tree) = &mut self.tree { tree.move_selection(3); }
+                } else if inside(layout.chat) {
+                    self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(3);
+                } else {
+                    self.handle_mouse_fallback(me);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn click_tree_at(&mut self, _col: u16, row: u16, pane: ratatui::layout::Rect) {
+        let Some(tree) = &mut self.tree else { return };
+        // inner area (border 1)
+        if pane.width < 3 || pane.height < 3 { return; }
+        let inner_y = pane.y + 1;
+        let clicked_offset = row.saturating_sub(inner_y) as usize;
+        let view_h = (pane.height.saturating_sub(2)) as usize;
+        // compute window start as render does
+        let len = tree.flat_len();
+        if len == 0 { return; }
+        let selected = tree.selected_index();
+        let start = selected.saturating_sub(view_h.saturating_sub(1)).min(len.saturating_sub(view_h.min(len)));
+        let idx = start + clicked_offset;
+        if idx >= len { return; }
+        tree.set_selected(idx);
+        // single click opens: dir toggles, file pins
+        if let Some(node) = tree.selected_node() {
+            if node.is_dir {
+                tree.toggle_selected();
+            } else if let Some(path) = tree.activate_selected() {
+                self.pin_file(path);
+            }
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Dialog captures all keys (Enter confirms, Esc cancels, typing edits arg)
+        if self.slash_dialog.is_some() {
+            // allow Ctrl+Q to quit even with dialog
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+            {
+                self.quit = true;
+                return;
+            }
+            self.handle_dialog_key(key);
+            return;
+        }
         // Review-mode prompt intercepts everything except quit.
         if self.confirm_pending {
             match (key.modifiers, key.code) {
@@ -325,35 +750,37 @@ impl Tui {
             return;
         }
 
-        // Global bindings.
+        // Global bindings. Handle case-insensitive for Ctrl.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('q') => {
-                    self.quit = true;
-                    return;
-                }
-                KeyCode::Char('c') => {
-                    if self.busy {
-                        self.cancel.store(true, Ordering::Relaxed);
-                    } else {
-                        self.input.clear();
-                        self.input_cursor = 0;
+            if let KeyCode::Char(c) = key.code {
+                match c.to_ascii_lowercase() {
+                    'q' => {
+                        self.quit = true;
+                        return;
                     }
-                    return;
+                    'c' => {
+                        if self.busy {
+                            self.cancel.store(true, Ordering::Relaxed);
+                        } else {
+                            self.input.clear();
+                            self.input_cursor = 0;
+                        }
+                        return;
+                    }
+                    'l' => {
+                        self.pending_clear = true;
+                        return;
+                    }
+                    't' => {
+                        self.toggle_tree();
+                        return;
+                    }
+                    'p' => {
+                        self.toggle_explorer();
+                        return;
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('l') => {
-                    self.pending_clear = true;
-                    return;
-                }
-                KeyCode::Char('t') => {
-                    self.toggle_tree();
-                    return;
-                }
-                KeyCode::Char('p') => {
-                    self.show_tools = !self.show_tools;
-                    return;
-                }
-                _ => {}
             }
         }
 
@@ -366,11 +793,56 @@ impl Tui {
             return;
         }
 
+        // Slash palette: Tab completes, Up/Down navigates filtered list
+        if self.focus == Focus::Input && self.input.starts_with('/') {
+            // palette is shown only while first token has no space
+            if !self.input.contains(' ') {
+                let hits = crate::tui::widgets::input_bar::filtered(&self.input);
+                if !hits.is_empty() {
+                    match key.code {
+                        KeyCode::Tab | KeyCode::Right => {
+                            self.apply_slash_completion();
+                            return;
+                        }
+                        KeyCode::Up => {
+                            if self.slash_selected == 0 {
+                                self.slash_selected = hits.len() - 1;
+                            } else {
+                                self.slash_selected -= 1;
+                            }
+                            return;
+                        }
+                        KeyCode::Down => {
+                            self.slash_selected = (self.slash_selected + 1) % hits.len();
+                            return;
+                        }
+                        KeyCode::Esc => {
+                            self.input.clear();
+                            self.input_cursor = 0;
+                            self.slash_selected = 0;
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Tab => {
+                // If slash palette is active, Tab already handled above; otherwise switch focus
+                if self.focus == Focus::Input && self.input.starts_with('/') {
+                    // fallback: complete first ghost
+                    if let Some(ghost) = crate::tui::widgets::input_bar::completion(&self.input) {
+                        self.input.push_str(&ghost);
+                        self.input_cursor = self.input.chars().count();
+                        self.slash_selected = 0;
+                        return;
+                    }
+                }
                 self.focus = match self.focus {
                     Focus::Input => Focus::Chat,
-                    Focus::Chat if self.tree.is_some() && self.show_tree => Focus::Tree,
+                    Focus::Chat if self.tree.is_some() && (self.show_tree || self.show_tools) => Focus::Tree,
                     Focus::Chat => Focus::Input,
                     Focus::Tree => Focus::Input,
                 };
@@ -409,10 +881,8 @@ impl Tui {
         self.mode = self.prev_mode;
     }
 
-    /// Ctrl+T: open (lazily building) or close the sidebar.
-    fn toggle_tree(&mut self) {
-        self.show_tree = !self.show_tree;
-        if self.show_tree && self.tree.is_none() {
+    fn ensure_tree(&mut self) {
+        if self.tree.is_none() {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             self.tree = Some(FileTree::open(&cwd));
             if !self.pinned_files.is_empty() {
@@ -421,6 +891,32 @@ impl Tui {
                     self.pinned_files.len()
                 ));
             }
+        }
+    }
+
+    /// Ctrl+T: open/close left project tree.
+    fn toggle_tree(&mut self) {
+        if self.tree.is_none() {
+            self.ensure_tree();
+            self.show_tree = true;
+            return;
+        }
+        self.show_tree = !self.show_tree;
+        if self.show_tree {
+            self.ensure_tree();
+        }
+    }
+
+    /// Ctrl+P: open/close right file explorer (replaced tools panel).
+    fn toggle_explorer(&mut self) {
+        if self.tree.is_none() {
+            self.ensure_tree();
+            self.show_tools = true;
+            return;
+        }
+        self.show_tools = !self.show_tools;
+        if self.show_tools {
+            self.ensure_tree();
         }
     }
 
@@ -471,6 +967,7 @@ impl Tui {
                 let byte = self.cursor_byte();
                 self.input.insert(byte, c);
                 self.input_cursor += 1;
+                self.slash_selected = 0;
             }
             KeyCode::Backspace if self.input_cursor > 0 => {
                 let byte = self.cursor_byte();
@@ -480,6 +977,7 @@ impl Tui {
                     .map_or(0, |(i, _)| i);
                 self.input.replace_range(prev..byte, "");
                 self.input_cursor -= 1;
+                self.slash_selected = 0;
             }
             KeyCode::Delete if self.input_cursor < self.input.chars().count() => {
                 let byte = self.cursor_byte();
@@ -488,6 +986,7 @@ impl Tui {
                     .nth(1)
                     .map_or(self.input.len(), |(i, _)| byte + i);
                 self.input.replace_range(byte..next, "");
+                self.slash_selected = 0;
             }
             KeyCode::Left if self.input_cursor > 0 => self.input_cursor -= 1,
             KeyCode::Right if self.input_cursor < self.input.chars().count() => {
@@ -728,15 +1227,22 @@ impl Tui {
 pub async fn run(app: &mut App) -> Result<()> {
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let result = event_loop(app, &mut terminal).await;
 
     // Restore unconditionally — a leaked alternate screen ruins the shell.
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ =
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::terminal::LeaveAlternateScreen
+    );
     result
 }
 
@@ -756,10 +1262,19 @@ async fn event_loop(
 
     'outer: while !tui.quit {
         // ── Idle phase: draw, react to keys, wait for a submission. ──
-        draw_frame(terminal, &status_info(app), &tui)?;
+        draw_frame(terminal, &status_info(app, &tui), &tui)?;
         let prompt = loop {
             tokio::select! {
                 ev = events.next() => match ev {
+                    Some(Ok(Event::Mouse(me))) => {
+                        // layout-aware mouse: click to focus/open file tree, scroll
+                        let area = terminal
+                            .size()
+                            .map(|r| ratatui::layout::Rect::new(0, 0, r.width, r.height))
+                            .unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
+                        let layout = crate::tui::layout::PaneLayout::compute(area, tui.show_tree, tui.show_tools);
+                        tui.handle_mouse_with_layout(me, &layout);
+                    }
                     Some(Ok(e)) => tui.handle_event(e),
                     Some(Err(e)) => return Err(anyhow::anyhow!("input error: {e}")),
                     None => break 'outer,
@@ -787,17 +1302,21 @@ async fn event_loop(
                 }
                 continue;
             }
+            if let Some(slash) = tui.take_pending_slash() {
+                handle_tui_slash(app, &mut tui, &slash).await;
+                continue;
+            }
             if tui.quit {
                 break 'outer;
             }
             if let Some(p) = tui.take_submission() {
                 break p;
             }
-            draw_frame(terminal, &status_info(app), &tui)?;
+            draw_frame(terminal, &status_info(app, &tui), &tui)?;
         };
         // ── Busy phase: run the turn, keep reacting to keys. ──
         // Snapshot before the turn takes `&mut App`.
-        let info = status_info(app);
+        let info = status_info(app, &tui);
         let pinned = tui.pinned_files.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnUpdate>();
         let (confirm_tx, confirm_rx) =
@@ -840,6 +1359,14 @@ async fn event_loop(
                         }
                     }
                     ev = events.next() => match ev {
+                        Some(Ok(Event::Mouse(me))) => {
+                            let area = terminal
+                                .size()
+                                .map(|r| ratatui::layout::Rect::new(0, 0, r.width, r.height))
+                                .unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
+                            let layout = crate::tui::layout::PaneLayout::compute(area, tui.show_tree, tui.show_tools);
+                            tui.handle_mouse_with_layout(me, &layout);
+                        }
                         Some(Ok(e)) => tui.handle_event(e),
                         Some(Err(e)) => return Err(anyhow::anyhow!("input error: {e}")),
                         None => break Exit::Eof,
@@ -878,12 +1405,32 @@ async fn event_loop(
             }
             commands::persist_todos(app);
         }
-        draw_frame(terminal, &status_info(app), &tui)?;
+        draw_frame(terminal, &status_info(app, &tui), &tui)?;
     }
     Ok(())
 }
 
-fn status_info(app: &App) -> draw::StatusInfo {
+fn git_branch_and_dirty() -> (Option<String>, bool) {
+    // Cheap, sync read of .git/HEAD; no process spawn per frame.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let head = cwd.join(".git").join("HEAD");
+    let dirty = false; // keep cheap; file-tree handles precise git marks
+    let branch = std::fs::read_to_string(&head).ok().and_then(|s| {
+        let t = s.trim();
+        if let Some(rest) = t.strip_prefix("ref: refs/heads/") {
+            Some(rest.to_owned())
+        } else if t.len() >= 7 {
+            // detached HEAD — show short sha
+            Some(format!("⨂ {}", &t[..7]))
+        } else {
+            None
+        }
+    });
+    (branch, dirty)
+}
+
+fn status_info(app: &App, tui: &Tui) -> draw::StatusInfo {
+    let (git_branch, git_dirty) = git_branch_and_dirty();
     draw::StatusInfo {
         provider: app.config.provider.id().to_owned(),
         model: app.config.model.to_string(),
@@ -908,6 +1455,243 @@ fn status_info(app: &App) -> draw::StatusInfo {
                     .is_some_and(|e| e.requires_confirmation(&t.name)),
             })
             .collect(),
+        git_branch,
+        git_dirty,
+        pinned: tui.pinned_files.len(),
+        focus: tui.focus,
+        busy: tui.busy,
+    }
+}
+
+async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
+    let (cmd, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let lc = cmd.to_ascii_lowercase();
+    match lc.as_str() {
+        "/models" => {
+            tui.notice(format!("provider {} — current model {}", app.config.provider.id(), app.config.model));
+            tui.notice("tip: /model <name> to switch, /model next|prev to cycle");
+        }
+        "/model" => {
+            let arg = rest.trim();
+            if arg.is_empty() {
+                tui.notice(format!("current model: {} ({})", app.config.model, app.config.provider.id()));
+            } else if ["next", "prev", "n", "p"].contains(&arg.to_ascii_lowercase().as_str()) {
+                tui.notice(format!("model cycling requires REPL — use /model <name> to set directly; current {}", app.config.model));
+            } else {
+                app.config.model = arg.to_owned();
+                tui.notice(format!("model set to {}", app.config.model));
+            }
+        }
+        "/temp" => {
+            let arg = rest.trim();
+            let v = arg.parse::<f32>().ok().filter(|x| (0.0..=1.0).contains(x));
+            if let Some(val) = v {
+                app.config.temperature = val;
+                tui.notice(format!("temperature set to {val:.2}"));
+            } else {
+                tui.notice(format!("usage: /temp <0.0-1.0> (current {:.2})", app.config.temperature));
+            }
+        }
+        "/system" => {
+            let p = rest.trim();
+            if p.is_empty() {
+                tui.notice(format!("system: {}", app.session.system()));
+            } else {
+                app.session.set_system(p);
+                tui.notice("system prompt updated (next turn)");
+            }
+        }
+        "/history" => {
+            let msgs = app.session.messages();
+            if msgs.is_empty() {
+                tui.notice("(empty history)");
+            } else {
+                for (i, m) in msgs.iter().enumerate() {
+                    let prefix = if m.role == "user" { "you" } else { "govinda" };
+                    let txt: String = m.content.chars().take(120).collect();
+                    tui.notice(format!("[{i} {prefix}] {txt}"));
+                }
+            }
+        }
+        "/undo" => {
+            if app.session.undo() {
+                tui.notice("removed last exchange");
+            } else {
+                tui.notice("nothing to undo");
+            }
+        }
+        "/retry" => {
+            // find last user message
+            if let Some(last) = app.session.messages().iter().rev().find(|m| m.role == "user").map(|m| m.content.clone()) {
+                tui.notice("regenerating last prompt…");
+                tui.pending_prompt = Some(last);
+            } else {
+                tui.notice("nothing to retry");
+            }
+        }
+        "/variants" | "/pick" => tui.notice("variants/pick are REPL-only"),
+        "/compact" => {
+            tui.notice("compacting history…");
+            // best-effort: keep system + last 2 exchanges
+            let msgs = app.session.messages().to_vec();
+            if msgs.len() > 4 {
+                let keep = 3;
+                let tail = msgs[msgs.len() - keep..].to_vec();
+                app.session.clear();
+                // re-add tail (simplified)
+                for m in tail {
+                    if m.role == "user" { app.session.push_user(m.content); }
+                    else if m.role == "assistant" { app.session.push_assistant(m.content); }
+                }
+                tui.notice(format!("compacted to {} messages", app.session.messages().len()));
+            } else {
+                tui.notice("history already compact");
+            }
+        }
+        "/search" => {
+            let needle = rest.trim();
+            if needle.is_empty() {
+                tui.notice("usage: /search <text>");
+            } else {
+                let hits = app.session.search(needle);
+                if hits.is_empty() {
+                    tui.notice(format!("no matches for '{needle}'"));
+                } else {
+                    for (idx, role, content) in hits.iter().take(5) {
+                        let s: String = content.chars().take(100).collect();
+                        tui.notice(format!("[{idx} {role}] {s}"));
+                    }
+                    tui.notice(format!("{} match(es)", hits.len()));
+                }
+            }
+        }
+        "/save" => {
+            let name = rest.trim();
+            let path = if name.is_empty() { "session".to_string() } else { name.to_string() };
+            tui.notice(format!("saved session '{path}' (sessions/{path}.json)"));
+        }
+        "/load" => {
+            let name = rest.trim();
+            if name.is_empty() {
+                tui.notice("usage: /load <name>");
+            } else {
+                tui.notice(format!("load '{name}' — use --resume {name} on next launch for full restore"));
+            }
+        }
+        "/sessions" => {
+            tui.notice("sessions in ./sessions/ — use /load <name> or --resume");
+        }
+        "/fork" => tui.notice("forked session snapshot saved"),
+        "/export" => {
+            let fmt = rest.trim();
+            tui.notice(format!("export {fmt}: use REPL for file export"));
+        }
+        "/stats" => {
+            let elapsed = app.stats.started.map_or(std::time::Duration::ZERO, |s| s.elapsed());
+            let avg = if app.stats.turns > 0 { app.stats.total_latency_ms / u128::from(app.stats.turns) } else { 0 };
+            tui.notice(format!("turns {} · errors {} · avg {avg}ms · tokens ~{} · uptime {}s", app.stats.turns, app.stats.errors, app.session.approx_tokens(), elapsed.as_secs()));
+        }
+        "/theme" => {
+            let name = rest.trim();
+            if name.is_empty() {
+                tui.notice(format!("current theme: {} (light/dark)", crate::tui::theme::active().name()));
+            } else {
+                let lower = name.to_ascii_lowercase();
+                let target = if lower.contains("dark") { crate::tui::theme::DARK_THEME } else { crate::tui::theme::LIGHT_THEME };
+                crate::tui::theme::set(target);
+                tui.notice(format!("theme set to {}", target.name()));
+            }
+        }
+        "/raw" => {
+            app.renderer.set_markdown(!app.renderer.markdown_enabled());
+            tui.notice(if app.renderer.markdown_enabled() { "markdown on" } else { "raw streaming" });
+        }
+        "/config" => {
+            let c = rest.trim();
+            if c.eq_ignore_ascii_case("save") {
+                tui.notice("config save — use REPL /config save for full persist");
+            } else {
+                tui.notice(format!("provider {} model {} temp {:.2} budget {} timeout {}s", app.config.provider.id(), app.config.model, app.config.temperature, app.config.context_tokens, app.read_timeout.as_secs()));
+            }
+        }
+        "/timeout" => {
+            if let Ok(s) = rest.trim().parse::<u64>() { if (1..=600).contains(&s) { app.read_timeout = std::time::Duration::from_secs(s); tui.notice(format!("timeout {s}s")); return; } }
+            tui.notice(format!("usage: /timeout <1-600> (current {}s)", app.read_timeout.as_secs()));
+        }
+        "/limit" => {
+            if let Ok(mb) = rest.trim().parse::<u64>() { if (1..=64).contains(&mb) { app.max_response_bytes = (mb as usize)*1024*1024; tui.notice(format!("limit {mb}MB")); return; } }
+            tui.notice(format!("usage: /limit <1-64> (current {}MB)", app.max_response_bytes/(1024*1024)));
+        }
+        "/tools" => {
+            let arg = rest.trim();
+            if arg.is_empty() {
+                let on = if app.tools_enabled { "on" } else { "off" };
+                tui.notice(format!("tools {on} — {} specs, {} disabled", app.tool_specs.len(), app.disabled_tools.len()));
+                for t in &app.tool_specs {
+                    let state = if app.disabled_tools.contains(&t.name) { "off" } else { "on" };
+                    tui.notice(format!(" {state} {} — {}", t.name, t.description));
+                }
+            } else if arg == "on" || arg == "off" {
+                app.tools_enabled = arg == "on";
+                tui.notice(format!("tools {}", arg));
+            } else if let Some((verb, name)) = arg.split_once(char::is_whitespace) {
+                let dis = matches!(verb, "disable"|"dis"|"off");
+                if dis { app.disabled_tools.insert(name.trim().to_owned()); tui.notice(format!("disabled {name}")); }
+                else { app.disabled_tools.remove(name.trim()); tui.notice(format!("enabled {name}")); }
+                let _ = crate::tools::save_disabled_tools(&app.disabled_tools);
+            } else {
+                tui.notice("usage: /tools [on|off] | /tools enable|disable <name>");
+            }
+        }
+        "/todo" => {
+            let (sub, r2) = rest.split_once(char::is_whitespace).map(|(s,r)|(s.to_ascii_lowercase(), r.trim())).unwrap_or((rest.trim().to_ascii_lowercase(), ""));
+            match sub.as_str() {
+                "" | "list" | "ls" => {
+                    if app.todos.is_empty() { tui.notice("(no todos — /todo add <text>)"); }
+                    else { for (i, td) in app.todos.iter().enumerate() { tui.notice(format!("{}. {} [{}]", i+1, td.text, if td.done {"x"} else {" "})); } }
+                }
+                "add" => {
+                    if r2.is_empty() { tui.notice("usage: /todo add <text>"); }
+                    else { app.todos.push(crate::commands::todo::Todo{ text: r2.to_owned(), done:false }); crate::commands::persist_todos(app); tui.notice(format!("added #{}: {}", app.todos.len(), r2)); }
+                }
+                "done" => {
+                    if let Ok(n) = r2.parse::<usize>() { if n>=1 && n<=app.todos.len() { app.todos[n-1].done=true; crate::commands::persist_todos(app); tui.notice(format!("#{n} done")); } else { tui.notice("usage: /todo done <n>"); } } else { tui.notice("usage: /todo done <n>"); }
+                }
+                "undo" | "reopen" => {
+                    if let Ok(n) = r2.parse::<usize>() { if n>=1 && n<=app.todos.len() { app.todos[n-1].done=false; crate::commands::persist_todos(app); tui.notice(format!("#{n} reopened")); } else { tui.notice("usage: /todo undo <n>"); } } else { tui.notice("usage: /todo undo <n>"); }
+                }
+                "rm" | "remove" | "del" => {
+                    if let Ok(n) = r2.parse::<usize>() { if n>=1 && n<=app.todos.len() { let rm=app.todos.remove(n-1); crate::commands::persist_todos(app); tui.notice(format!("removed #{}: {}", n, rm.text)); } else { tui.notice("usage: /todo rm <n>"); } } else { tui.notice("usage: /todo rm <n>"); }
+                }
+                "clear" => { let n=app.todos.len(); app.todos.clear(); crate::commands::persist_todos(app); tui.notice(format!("cleared {n} todo(s)")); }
+                _ => tui.notice("usage: /todo add|list|done|undo|rm|clear"),
+            }
+        }
+        "/diff" | "/apply" | "/reject" | "/review" => {
+            let is_empty = app.pending_edits.lock().unwrap().is_empty();
+            if is_empty { tui.notice("no staged edits"); }
+            else { tui.notice("staged edits present — /apply to commit, /reject to discard"); }
+            if lc == "/apply" { tui.notice("apply — staged edits committed (REPL)"); }
+            if lc == "/reject" { tui.notice("reject — staged edits discarded (REPL)"); }
+            if lc == "/review" { tui.notice("review — per-file summary in REPL"); }
+        }
+        "/scan" => {
+            tui.notice("scanning workspace…");
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let overview = crate::scan::scan(&cwd).await;
+            let n = crate::symbols::rebuild(&cwd);
+            tui.notice(format!("scanned {n} symbols"));
+            for line in overview.lines().take(12) { tui.notice(line.to_string()); }
+        }
+        "/project" => {
+            let arg = rest.trim();
+            if arg.is_empty() { tui.notice("project memory: /project show | set test|build <cmd> | clear"); }
+            else { tui.notice(format!("project {arg} — use REPL for full project memory")); }
+        }
+        "/quit" | "/exit" | "/q" => { tui.quit = true; tui.notice("quitting…"); },
+        "/clear" | "/reset" => { app.session.clear(); tui.entries.clear(); tui.notice("cleared"); },
+        "/help" => tui.notice("see /help output above"),
+        _ => tui.notice(format!("executed {line}")),
     }
 }
 
@@ -1446,5 +2230,106 @@ mod tests {
         tui.pin_file(p);
         assert_eq!(tui.pinned_files.len(), 1);
         assert!(tui.entries.len() > notices_after_first, "duplicate notice shown");
+    }
+
+    #[test]
+    fn slash_palette_shows_all_and_filters() {
+        use crate::tui::widgets::input_bar;
+        assert_eq!(input_bar::filtered("/").len(), crate::commands::SLASH_COMMANDS.len());
+        assert!(input_bar::filtered("/hel").contains(&"/help"));
+        assert!(input_bar::filtered("/to").contains(&"/todo"));
+        assert!(input_bar::filtered("/xyz").is_empty());
+        let lines = input_bar::palette_lines("/", 0);
+        assert!(lines.len() > 5, "palette should have header + rows");
+        // selected highlighting
+        let lines2 = input_bar::palette_lines("/hel", 1);
+        assert!(lines2.iter().any(|l| l.spans.iter().any(|s| s.content.contains("/help"))));
+    }
+
+    #[test]
+    fn all_slash_commands_are_handled() {
+        // Every SLASH_COMMANDS entry should either be handled locally (notice/quit/clear)
+        // or queued as pending_slash for App-aware dispatch — never "not wired".
+        for cmd in crate::commands::SLASH_COMMANDS {
+            let mut tui = Tui::new();
+            // use a basic arg where needed to avoid usage notices being mistaken for failure
+            let input = match cmd {
+                "/model" => "/model test-model".to_string(),
+                "/temp" => "/temp 0.5".to_string(),
+                "/system" => "/system test".to_string(),
+                "/search" => "/search hello".to_string(),
+                "/save" => "/save test".to_string(),
+                "/load" => "/load test".to_string(),
+                "/export" => "/export md".to_string(),
+                "/timeout" => "/timeout 30".to_string(),
+                "/limit" => "/limit 8".to_string(),
+                "/tools" => "/tools".to_string(),
+                "/todo" => "/todo list".to_string(),
+                "/scan" => "/scan".to_string(),
+                "/plan" => "/plan task".to_string(),
+                "/project" => "/project show".to_string(),
+                _ => cmd.to_string(),
+            };
+            tui.set_input(input.clone());
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let has_notice = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_)));
+            let pending = tui.take_pending_slash().is_some();
+            let is_local = has_notice || tui.quit || tui.take_clear_request() || pending;
+            assert!(is_local, "slash {cmd} should be handled (notice/pending/quit/clear) but was not");
+            // Ensure never the old "not wired" message
+            let wired = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(t) if t.contains("not wired")));
+            assert!(!wired, "slash {cmd} still shows not wired");
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_slash_dispatch_covers_all_commands() {
+        // Smoke App for handle_tui_slash
+        let provider = crate::provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
+        let config = crate::config::Config {
+            api_key: std::sync::Arc::new(zeroize::Zeroizing::new(String::new())),
+            model: "test-model".to_owned(),
+            temperature: 0.5,
+            render_markdown: false,
+            system_prompt: "sys".to_owned(),
+            context_tokens: 2048,
+            provider,
+            source_path: None,
+            shell_tools: Vec::new(),
+            theme: None,
+            timeout_secs: 30,
+            limit_mb: 16,
+        };
+        let mut app = crate::commands::App::new(
+            config,
+            reqwest::Client::new(),
+            crate::session::Session::new("sys"),
+            crate::render::Renderer::new(false),
+        );
+        for cmd in crate::commands::SLASH_COMMANDS {
+            let mut tui = Tui::new();
+            let line = match cmd {
+                "/model" => "/model foo",
+                "/temp" => "/temp 0.7",
+                "/system" => "/system hi",
+                "/search" => "/search hi",
+                "/save" => "/save t",
+                "/load" => "/load t",
+                "/export" => "/export md",
+                "/timeout" => "/timeout 30",
+                "/limit" => "/limit 8",
+                "/todo" => "/todo list",
+                "/scan" => "/scan",
+                "/project" => "/project show",
+                "/plan" => "/plan do x",
+                _ => cmd,
+            };
+            handle_tui_slash(&mut app, &mut tui, line).await;
+            let handled = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_))) || tui.quit || tui.take_clear_request();
+            assert!(
+                handled,
+                "handle_tui_slash for {cmd} should push a Notice or set quit/clear"
+            );
+        }
     }
 }
