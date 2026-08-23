@@ -1,12 +1,20 @@
 # govinda-cli
 
-A minimal, pure-Rust CLI chatbot with streaming responses, conversation memory, and markdown rendering. Works with any OpenAI-compatible chat API: Mistral, OpenAI, Groq, Ollama, LM Studio, vLLM…
+A minimal, pure-Rust CLI chatbot with streaming responses, conversation memory, and markdown rendering. Works with any OpenAI-compatible chat API: Mistral, OpenAI, Groq, Ollama, OpenRouter, NVIDIA, DeepSeek, and more.
 
 ## Features
 
 - **Multi-provider** — one binary for any OpenAI-compatible backend (`provider = "ollama"` in the config and you're talking to localhost)
+- **11 provider presets** — Mistral, OpenAI, OpenRouter, NVIDIA, DeepSeek, Kimi (Moonshot), GLM (Zhipu), MiniMax, Groq, ByteZ, Ollama
 - **Coding agent** — the model can read, grep, scan, stage surgical edits (`edit_file`/`insert_after`/`insert_before` reviewed via `/diff`, applied atomically with `/apply`), run shell commands/tests/compile checks, and use git tools — all sandboxed to the working directory with confirmation gates on anything destructive
-- **Symbol index** — an in-memory `file:line` index of functions, structs, enums, traits, impls, and macros built at startup; `find_symbol` locates definitions without grep-guessing
+- **Web tools** — `web_search` (DuckDuckGo) and `web_fetch` (URL content extraction) for internet access
+- **AskUserQuestion tool** — clarification gate that pauses the agent to ask the user a question
+- **Project memory** — loads instructions from `AGENTS.md`, `CLAUDE.md`, and `.govinda/memory.md` at startup and injects them into the system prompt
+- **Checkpointing + rewind** — `/checkpoint` saves session state, `/rewind [id]` restores; auto-checkpoints before every turn
+- **Custom skills** — drop `.md` files in `~/.config/govinda/skills/` to create custom slash commands with frontmatter metadata
+- **Auto-compact** — automatically compacts session history when approaching the token budget limit (`/auto-compact on|off`)
+- **Branch/PR workflow** — `/commit <message>` for git commits, `/pr create|list|branch` for branching
+- **Symbol index** — an in-memory `file:line` index of functions, structs, enums, traits, impls, and macros; rebuilt automatically after `/apply`
 - **Context-aware window** — files your prompt mentions ride along in the context window (plus manifest + same-dir siblings) even if they only appeared in old messages
 - **Self-correction loop** — failed verifications (non-zero exit codes, compile errors) grant up to 3 extra agent rounds so the model can fix its own mistakes
 - **Plan mode** — `/plan <task>` decomposes a task into steps, confirms with y/N, then executes them autonomously
@@ -30,7 +38,7 @@ A minimal, pure-Rust CLI chatbot with streaming responses, conversation memory, 
    MISTRAL_API_KEY=your-key
    ```
 
-   or as an environment variable (`setx MISTRAL_API_KEY "your-key"` on Windows). Environment variables take precedence over `.env`. Each provider preset has its own key variable (`MISTRAL_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`); local runtimes need none.
+   or as an environment variable (`setx MISTRAL_API_KEY "your-key"` on Windows). Environment variables take precedence over `.env`. Each provider preset has its own key variable; local runtimes need none.
 
 Optional env vars: `MISTRAL_MODEL` (default `mistral-small-latest`), `MISTRAL_TEMPERATURE` (default `0.7`, clamped to 0–1).
 
@@ -42,7 +50,14 @@ Set `provider` in the config file to switch backends:
 |---|---|---|
 | `mistral` (default) | api.mistral.ai | `MISTRAL_API_KEY` |
 | `openai` | api.openai.com | `OPENAI_API_KEY` |
-| `groq` | api.groq.com | `GROQ_API_KEY` |
+| `openrouter` | openrouter.ai/api/v1 | `OPENROUTER_API_KEY` |
+| `nvidia` | integrate.api.nvidia.com/v1 | `NVIDIA_API_KEY` |
+| `deepseek` | api.deepseek.com/v1 | `DEEPSEEK_API_KEY` |
+| `kimi` | api.moonshot.cn/v1 | `KIMI_API_KEY` |
+| `glm` | open.bigmodel.cn/api/paas/v4 | `GLM_API_KEY` |
+| `minimax` | api.minimax.chat/v1 | `MINIMAX_API_KEY` |
+| `groq` | api.groq.com/openai/v1 | `GROQ_API_KEY` |
+| `bytez` | api.bytez.com/v1 | `BYTEZ_API_KEY` |
 | `ollama` | localhost:11434 | none |
 
 Any other OpenAI-compatible server works via `base_url`:
@@ -57,7 +72,7 @@ base_url = "http://192.168.1.10:8080/v0"   # LM Studio / vLLM / llama.cpp server
 Settings can also live in a TOML file (default `~/.config/govinda/config.toml`, override the location with `GOVINDA_CONFIG`):
 
 ```toml
-provider = "mistral"        # mistral | openai | groq | ollama
+provider = "mistral"        # mistral | openai | groq | ollama | openrouter | nvidia | deepseek | kimi | glm | minimax | bytez
 base_url = ""               # optional override for custom servers
 api_key_env = "MY_KEY_VAR"  # optional env-var name for the API key
 model = "mistral-large-latest"
@@ -113,6 +128,7 @@ pane. For the intended look install:
 | `/variants [1-5]` | Generate alternate answers concurrently for the last question |
 | `/pick <n>` | Commit one of the generated variants |
 | `/compact` | Fold history into one API-generated summary to free context |
+| `/auto-compact [on\|off]` | Toggle automatic context compaction when nearing token budget |
 | `/search <text>` | Case-insensitive search through the conversation |
 | `/save [name]` | Save conversation to JSON (default `sessions/`) |
 | `/load <name>` | Load a saved conversation (paths restricted to `sessions/`) |
@@ -129,15 +145,64 @@ pane. For the intended look install:
 | `/tools en\|dis <name>` | Enable/disable a single tool (persisted in `.govinda_tools.json`) |
 | `/todo [sub]` | Persistent task list: `list` · `add <text>` · `done <n>` · `undo <n>` · `rm <n>` · `clear` |
 | `/diff` | Show staged edits as a unified diff (nothing applied yet) |
-| `/apply` | Commit all staged edits to disk (atomic batch) |
+| `/apply` | Commit all staged edits to disk (atomic batch) + rebuild symbol index |
 | `/reject` | Discard all staged edits |
 | `/scan` | Rebuild the symbol index and print a workspace overview |
 | `/plan <task>` | Decompose a task into steps, confirm, execute autonomously |
 | `/config [save]` | Show current settings; `save` persists them to the config file |
+| `/checkpoint [label]` | Save a session checkpoint for later rewind |
+| `/rewind [id]` | Rewind to a saved checkpoint (most recent if no id given) |
+| `/memory [add <note>]` | View or append to `.govinda/memory.md` project memory |
+| `/skills` | List loaded custom skills from `~/.config/govinda/skills/` |
+| `/commit <message>` | Stage all changes and git commit |
+| `/pr [create\|list\|branch]` | Branch/PR workflow: create `govinda/<timestamp>` branch, list, or switch |
+| `/pty` | PTY panel hint for long-running commands |
 
 Input line supports up/down history recall (persisted to `.govinda_history`), slash-command completion as you type, and standard editing keys.
 
 Sessions are saved with real ISO-8601 `created_at` / `updated_at` timestamps, and the current conversation is auto-saved on exit (named sessions keep their name; unnamed ones become `auto-<epoch>`).
+
+## Project Memory
+
+Govinda loads project-specific instructions from these files at startup (if present) and injects them into the system prompt:
+
+- **`AGENTS.md`** — general agent instructions for the project
+- **`CLAUDE.md`** — Claude-style instructions (also supported for compatibility)
+- **`.govinda/memory.md`** — persistent memory notes that survive across sessions
+
+Use `/memory add <note>` to append a timestamped note to `.govinda/memory.md`.
+
+## Custom Skills
+
+Create custom slash commands by placing `.md` files in `~/.config/govinda/skills/`:
+
+```markdown
+---
+name: /review-pr
+description: Review a pull request
+args: required
+---
+Review the current pull request for code quality, bugs, and improvements.
+Focus on security issues, performance, and adherence to project conventions.
+```
+
+- The `name` field becomes the slash command (e.g., `/review-pr`)
+- The `body` is sent to the model as the prompt when the skill is invoked
+- Skills with `args: required` show a hint when invoked without arguments
+- Skills are listed with `/skills` and appear in the command dispatch
+
+## Checkpointing
+
+Session state is automatically checkpointed before every turn. You can also manually save checkpoints:
+
+```
+/checkpoint              # save with auto-generated label
+/checkpoint before-refactor  # save with custom label
+/rewind                  # rewind to most recent checkpoint
+/rewind 3                # rewind to checkpoint #3
+```
+
+Checkpoints are persisted to `.govinda/checkpoints/` and survive restarts.
 
 ## Function calling
 
@@ -145,19 +210,19 @@ Models that support OpenAI-style tools can invoke built-ins, which execute local
 
 - `current_time`, `count_words` — simple utilities
 - **Workspace**: `read_file` (with symbol outlines), `write_file`, `list_files`, `grep` — all paths sandboxed to the working directory; reads capped at 2 MB, writes confirmation-gated
+- **Web**: `web_search` (DuckDuckGo search), `web_fetch` (URL content extraction)
 - **Staged editing**: `edit_file` (unique-match replace), `insert_after`, `insert_before` queue edits that are reviewed via `view_diff`/`/diff` and committed atomically by `/apply`
 - **Code intelligence**: `find_symbol` (kind-filtered definition lookup in the startup-built index), `explain_code` (one symbol's source block), `scan_project` (workspace overview + index refresh)
 - **Execution**: `run_shell` (confirmation, timeout, output caps), `run_test` (detected runner: cargo test / pytest / npm test), `check_project` (cargo check / tsc / mypy)
 - **Git**: `git_diff`, `git_log` (read-only), `git_branch`, `git_commit` (mutations confirmation-gated)
+- **Interaction**: `ask_user` (clarification gate — pauses to ask the user a question)
 - **User-defined** `[[tools]]` blocks in config.toml spawn external commands via argv templates with `{placeholder}` substitution — never a shell
 
-The agent loop runs up to 5 model↔tool rounds per turn; failed rounds (non-zero exit codes, compile errors) grant up to 3 self-correction rounds. Each requested call executes concurrently after sequential y/N confirmations (its invocation and truncated result print dimmed); results go back to the model as `role: "tool"` messages and tool rounds move atomically in history (`/undo` never splits one). Safety rails:
+The agent loop runs up to 5 model↔tool rounds per turn; failed rounds (non-zero exit codes, compile errors) grant up to 3 self-correction rounds. Safety rails:
 
 - `/tools off` stops advertising tools entirely — nothing can be invoked
 - at most 64 parallel calls per turn, 256 KB of arguments per call, 8 K chars per stored result
 - executor failures send only a sanitized error line back to the model
-
-New tools plug in by implementing the `ToolExecutor` trait (`src/tools.rs`) and registering it on `App`.
 
 ## Development
 
@@ -172,7 +237,8 @@ cargo fmt --check
 - The API key lives only in memory (zeroized where practical) and is never logged.
 - Conversations saved via `/save` are plaintext JSON on disk — treat them accordingly.
 - TLS certificate validation is always on.
+- Checkpoints stored in `.govinda/checkpoints/` contain full conversation snapshots.
 
 ## Roadmap
 
-File attachments/RAG · full-TUI mode · incremental symbol-index updates on edit
+File attachments/RAG · full-TUI mode · PTY panel for live command output · enhanced streaming markdown in TUI
