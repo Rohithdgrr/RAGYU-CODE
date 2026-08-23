@@ -38,10 +38,10 @@ const MAX_TOOL_RESULT_CHARS: usize = 8 * 1024;
 
 /// Slash commands that never take an argument — Enter on the palette runs
 /// them directly instead of opening the args dialog.
-const ZERO_ARG_SLASH: [&str; 21] = [
+const ZERO_ARG_SLASH: [&str; 22] = [
     "/help", "/exit", "/quit", "/q", "/clear", "/reset", "/sessions", "/stats", "/history",
     "/models", "/tools", "/config", "/tokens", "/undo", "/retry", "/compact", "/raw", "/scan",
-    "/pin", "/variants", "/pick",
+    "/pin", "/variants", "/pick", "/agent",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +88,10 @@ pub struct SlashDialog {
     pub desc: String,
     pub arg_input: String,
     pub arg_cursor: usize,
+    /// Available model IDs (populated for `/model` dialog).
+    pub models: Vec<String>,
+    /// Index of the currently highlighted model in the list.
+    pub models_selected: usize,
 }
 
 /// Live update pushed from the turn runner back to the UI thread.
@@ -165,6 +169,11 @@ pub struct Tui {
     pending_slash: Option<String>,
     /// Dialog shown after clicking a slash command (mouse or Tab) — args input
     pub slash_dialog: Option<SlashDialog>,
+    /// Cached model list fetched from the API (used by `/model` dialog).
+    pub models_cache: Vec<String>,
+    /// Set when `/model` is selected from palette — triggers async model fetch
+    /// in the event loop before opening the dialog.
+    pending_model_fetch: bool,
 }
 
 impl Default for Tui {
@@ -210,6 +219,8 @@ impl Tui {
             tree_hover: None,
             pending_slash: None,
             slash_dialog: None,
+            models_cache: Vec::new(),
+            pending_model_fetch: false,
         };
         // Eagerly open explorer so "No files yet" never shows on startup when
         // the right pane is visible by default (width≥100). Fail silently in tests.
@@ -237,6 +248,12 @@ impl Tui {
         std::mem::take(&mut self.pending_clear)
     }
 
+    /// Consumes a pending model-fetch request (triggered when `/model` is
+    /// selected from the palette). Returns `true` once.
+    pub fn take_model_fetch_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_model_fetch)
+    }
+
     /// Applies Enter in the input bar. Slash commands are handled locally
     /// (the full dispatcher prints to stdout and would corrupt the screen);
     /// plain prompts queue up as agent turns.
@@ -254,6 +271,14 @@ impl Tui {
         self.slash_selected = 0;
 
         if line.starts_with('/') {
+            // Bare "/" (or "/ " …): restore it so the palette dropdown
+            // reopens instead of failing as an unknown command.
+            if line.chars().all(|c| c == '/' || c == ' ') {
+                self.input.push('/');
+                self.input_cursor = 1;
+                self.slash_selected = 0;
+                return;
+            }
             // Try local fast path; if not handled, queue for App-aware dispatch
             if !self.local_command(&line) {
                 self.pending_slash = Some(line);
@@ -293,11 +318,19 @@ impl Tui {
         self.input.clear();
         self.input_cursor = 0;
         self.slash_selected = 0;
+        // For `/model`, populate the dialog with available models from cache.
+        let models = if cmd == "/model" && !self.models_cache.is_empty() {
+            self.models_cache.clone()
+        } else {
+            Vec::new()
+        };
         self.slash_dialog = Some(SlashDialog {
             command: cmd.to_owned(),
             desc: desc.to_owned(),
             arg_input: String::new(),
             arg_cursor: 0,
+            models,
+            models_selected: 0,
         });
     }
 
@@ -309,7 +342,17 @@ impl Tui {
     fn confirm_slash_dialog(&mut self) {
         if let Some(d) = self.slash_dialog.take() {
             let full = if d.arg_input.trim().is_empty() {
-                d.command.clone()
+                // For `/model`, use the highlighted model from the list.
+                if d.command == "/model" && !d.models.is_empty() {
+                    let name = d
+                        .models
+                        .get(d.models_selected)
+                        .cloned()
+                        .unwrap_or_default();
+                    format!("{} {}", d.command, name)
+                } else {
+                    d.command.clone()
+                }
             } else {
                 format!("{} {}", d.command, d.arg_input.trim())
             };
@@ -387,6 +430,37 @@ impl Tui {
             KeyCode::Right => {
                 if let Some(dialog) = &mut self.slash_dialog {
                     if dialog.arg_cursor < dialog.arg_input.chars().count() { dialog.arg_cursor += 1; } else { return false; }
+                }
+            }
+            KeyCode::Up => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if !dialog.models.is_empty() {
+                        dialog.models_selected = if dialog.models_selected == 0 {
+                            dialog.models.len() - 1
+                        } else {
+                            dialog.models_selected - 1
+                        };
+                        // Pre-fill arg_input with the highlighted model name.
+                        if let Some(name) = dialog.models.get(dialog.models_selected) {
+                            dialog.arg_input = name.clone();
+                            dialog.arg_cursor = dialog.arg_input.chars().count();
+                        }
+                    } else {
+                        if dialog.arg_cursor > 0 { dialog.arg_cursor -= 1; } else { return false; }
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if !dialog.models.is_empty() {
+                        dialog.models_selected = (dialog.models_selected + 1) % dialog.models.len();
+                        if let Some(name) = dialog.models.get(dialog.models_selected) {
+                            dialog.arg_input = name.clone();
+                            dialog.arg_cursor = dialog.arg_input.chars().count();
+                        }
+                    } else {
+                        if dialog.arg_cursor < dialog.arg_input.chars().count() { dialog.arg_cursor += 1; } else { return false; }
+                    }
                 }
             }
             KeyCode::Home => {
@@ -552,12 +626,13 @@ impl Tui {
         // helper to test inside rect
         let inside = |r: ratatui::layout::Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
         // Dialog captures mouse first
-        if let Some(_dialog) = &self.slash_dialog {
-            // centered 60x9 dialog — compute same as draw
+        if let Some(dialog) = &self.slash_dialog {
+            // centered dialog — compute same as draw (dynamic height for model list)
             let full_w = layout.status.width;
             let full_h = layout.status.height + layout.chat.height + layout.input.height;
             let dw: u16 = 60;
-            let dh: u16 = 9;
+            let model_visible = if !dialog.models.is_empty() { dialog.models.len().min(8) as u16 } else { 0 };
+            let dh: u16 = if !dialog.models.is_empty() { 9 + model_visible + 1 } else { 9 };
             let dx = full_w.saturating_sub(dw) / 2;
             let dy = full_h.saturating_sub(dh) / 2;
             let dlg = ratatui::layout::Rect::new(dx, dy, dw.min(full_w), dh.min(full_h));
@@ -671,7 +746,11 @@ impl Tui {
                                 if idx < total {
                                     self.slash_selected = idx;
                                     let cmd = hits[idx];
-                                    self.open_slash_dialog(cmd);
+                                    if cmd == "/model" {
+                                        self.pending_model_fetch = true;
+                                    } else {
+                                        self.open_slash_dialog(cmd);
+                                    }
                                     return;
                                 }
                             } else if off == 0 {
@@ -888,6 +967,11 @@ impl Tui {
                             let cmd = hits[self.slash_selected.min(hits.len() - 1)];
                             if ZERO_ARG_SLASH.contains(&cmd) {
                                 // fall through to submit() below
+                            } else if cmd == "/model" {
+                                // `/model` needs an async model list fetch before
+                                // opening the dialog, so flag it for the event loop.
+                                self.pending_model_fetch = true;
+                                return;
                             } else {
                                 self.open_slash_dialog(cmd);
                                 return;
@@ -1384,6 +1468,27 @@ async fn event_loop(
                 }
                 continue;
             }
+            // Fetch available models from the API, then open the /model dialog.
+            if tui.take_model_fetch_request() {
+                let models = if let Some(url) = app.config.provider.models_url() {
+                    match api::list_models(&app.http, &url, app.config.provider.auth().token()).await {
+                        Ok(list) => list,
+                        Err(e) => {
+                            tui.notice(format!("failed to fetch models: {e:#}"));
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    tui.notice(format!(
+                        "provider '{}' has no model-listing endpoint",
+                        app.config.provider.id()
+                    ));
+                    Vec::new()
+                };
+                tui.models_cache = models;
+                tui.open_slash_dialog("/model");
+                continue;
+            }
             if let Some(slash) = tui.take_pending_slash() {
                 handle_tui_slash(app, &mut tui, &slash).await;
                 continue;
@@ -1555,6 +1660,21 @@ async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
     match lc.as_str() {
         "/models" => {
             tui.notice(format!("provider {} — current model {}", app.config.provider.id(), app.config.model));
+            // Also fetch and cache models so the `/model` dialog has them.
+            if let Some(url) = app.config.provider.models_url() {
+                match api::list_models(&app.http, &url, app.config.provider.auth().token()).await {
+                    Ok(list) => {
+                        for id in &list {
+                            let marker = if *id == app.config.model { "  \u{2190} current" } else { "" };
+                            tui.notice(format!("  {id}{marker}"));
+                        }
+                        tui.models_cache = list;
+                    }
+                    Err(e) => tui.notice(format!("failed to list models: {e:#}")),
+                }
+            } else {
+                tui.notice(format!("provider '{}' has no model-listing endpoint", app.config.provider.id()));
+            }
             tui.notice("tip: /model <name> to switch, /model next|prev to cycle");
         }
         "/model" => {
@@ -1562,7 +1682,33 @@ async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
             if arg.is_empty() {
                 tui.notice(format!("current model: {} ({})", app.config.model, app.config.provider.id()));
             } else if ["next", "prev", "n", "p"].contains(&arg.to_ascii_lowercase().as_str()) {
-                tui.notice(format!("model cycling requires REPL — use /model <name> to set directly; current {}", app.config.model));
+                if tui.models_cache.is_empty() {
+                    // Try fetching models first.
+                    if let Some(url) = app.config.provider.models_url() {
+                        match api::list_models(&app.http, &url, app.config.provider.auth().token()).await {
+                            Ok(list) => {
+                                tui.models_cache = list;
+                            }
+                            Err(e) => {
+                                tui.notice(format!("could not fetch models: {e:#}"));
+                                return;
+                            }
+                        }
+                    }
+                }
+                if !tui.models_cache.is_empty() {
+                    let pos = tui.models_cache.iter().position(|m| *m == app.config.model);
+                    let step = if ["next", "n"].contains(&arg.to_ascii_lowercase().as_str()) {
+                        1
+                    } else {
+                        tui.models_cache.len() - 1
+                    };
+                    let idx = pos.map_or(0, |p| (p + step) % tui.models_cache.len());
+                    app.config.model = tui.models_cache[idx].clone();
+                    tui.notice(format!("model set to {}", app.config.model));
+                } else {
+                    tui.notice(format!("could not cycle models — set directly with /model <name>; current {}", app.config.model));
+                }
             } else {
                 app.config.model = arg.to_owned();
                 tui.notice(format!("model set to {}", app.config.model));
@@ -2026,18 +2172,71 @@ async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
                 tui.notice("usage: /project show | set test|build <cmd> | clear test|build");
             }
         }
+        "/plan" => {
+            let task = rest.trim();
+            if task.is_empty() {
+                tui.notice("usage: /plan <task> — decompose a task and execute step by step");
+            } else {
+                tui.pending_plan_task = Some(task.to_owned());
+                tui.notice("planning…");
+            }
+        }
+        "/agent" => {
+            let requested = match rest.trim() {
+                "on" => Some(AppMode::Agent),
+                "off" => Some(AppMode::Normal),
+                "" => None,
+                _ => {
+                    tui.notice("usage: /agent <on|off>");
+                    None
+                }
+            };
+            match requested {
+                Some(next) => {
+                    if tui.mode.transition_to(next) {
+                        tui.notice(format!("mode: {}", tui.mode.label()));
+                    } else {
+                        tui.notice(format!(
+                            "cannot enter {} from {}",
+                            next.label(),
+                            tui.mode.label()
+                        ));
+                    }
+                }
+                None => tui.notice(format!("mode: {}", tui.mode.label())),
+            }
+        }
+        "/pin" => {
+            let selected = tui
+                .tree
+                .as_ref()
+                .and_then(|tree| tree.selected_node())
+                .filter(|n| !n.is_dir)
+                .map(|n| n.rel.clone());
+            match selected {
+                Some(rel) => {
+                    let path = std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    tui.pin_file(path);
+                }
+                None => tui.notice(
+                    "select a file in the explorer first (Ctrl+T / Ctrl+P), then /pin.",
+                ),
+            }
+        }
         "/quit" | "/exit" | "/q" => { tui.quit = true; tui.notice("quitting…"); },
         "/clear" | "/reset" => { app.session.clear(); tui.entries.clear(); tui.notice("cleared"); },
         "/help" => {
             for l in [
                 "keys: Tab focus · ↑/↓ palette · Enter opens args dialog · F5 refresh",
                 "      dialog: type args · Enter execute · Esc cancel · click outside closes",
-                "type \"/\" in the input to browse all 37 commands",
+                "type \"/\" in the input to browse all commands",
             ] {
                 tui.notice(l.to_string());
             }
         }
-        _ => tui.notice(format!("executed {line}")),
+        _ => tui.notice(format!("'{lc}' is not available in the TUI")),
     }
 }
 
@@ -2426,6 +2625,22 @@ mod tests {
     }
 
     #[test]
+    fn plan_via_dialog_reaches_plan_runner() {
+        // Regression: /plan confirmed through the args dialog used to fall
+        // into handle_tui_slash's dead fallback instead of queueing the task.
+        let mut t = Tui::new();
+        type_str(&mut t, "/plan");
+        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(t.slash_dialog.is_some(), "/plan should open the args dialog");
+        type_str(&mut t, "build the parser");
+        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            t.take_pending_slash().as_deref(),
+            Some("/plan build the parser")
+        );
+    }
+
+    #[test]
     fn dialog_accepts_args_and_confirms() {
         let mut t = Tui::new();
         type_str(&mut t, "/sav");
@@ -2440,15 +2655,15 @@ mod tests {
     fn navigated_palette_enter_opens_selected() {
         let mut t = Tui::new();
         type_str(&mut t, "/");
-        // Navigate down to "/model" (index 6) — an arg-taking command.
-        for _ in 0..6 {
+        // Navigate down to "/model" — an arg-taking command.
+        let hits = crate::tui::widgets::input_bar::filtered("/");
+        let idx = hits.iter().position(|c| *c == "/model").expect("/model listed");
+        for _ in 0..idx {
             t.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let d = t.slash_dialog.as_ref().expect("dialog opens on navigated enter");
-        let hits = crate::tui::widgets::input_bar::filtered("/");
-        assert_eq!(d.command, hits[6]);
-        assert_eq!(d.command, "/model");
+        // `/model` triggers async model fetch, not a direct dialog open.
+        assert!(t.take_model_fetch_request(), "/model should trigger model fetch");
     }
 
     #[test]
@@ -2764,6 +2979,15 @@ mod tests {
             assert!(
                 handled,
                 "handle_tui_slash for {cmd} should push a Notice or set quit/clear"
+            );
+            // The old `_ => "executed {line}"` fallback masked missing arms —
+            // no command may land there anymore.
+            let fell_through = tui.entries.iter().any(
+                |e| matches!(e, ChatEntry::Notice(t) if t.contains("executed ")),
+            );
+            assert!(
+                !fell_through,
+                "handle_tui_slash for {cmd} hit the dead 'executed …' fallback — add a real arm"
             );
         }
     }
