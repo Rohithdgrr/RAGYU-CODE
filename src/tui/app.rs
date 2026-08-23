@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -371,10 +371,137 @@ impl Tui {
     }
 
     pub fn handle_event(&mut self, ev: Event) {
-        if let Event::Key(key) = ev
-            && key.kind == crossterm::event::KeyEventKind::Press
-        {
-            self.handle_key(key);
+        match ev {
+            Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+                self.handle_key(key);
+            }
+            Event::Mouse(me) => {
+                // Mouse is handled in event_loop with layout context; fallback scroll-only here
+                self.handle_mouse_fallback(me);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_fallback(&mut self, me: MouseEvent) {
+        match me.kind {
+            MouseEventKind::ScrollUp => {
+                if self.focus == Focus::Tree {
+                    if let Some(tree) = &mut self.tree {
+                        tree.move_selection(-1);
+                    }
+                } else if self.focus == Focus::Chat {
+                    self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(1);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.focus == Focus::Tree {
+                    if let Some(tree) = &mut self.tree {
+                        tree.move_selection(1);
+                    }
+                } else if self.focus == Focus::Chat {
+                    self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mouse with layout — called from event_loop where pane rects are known.
+    pub fn handle_mouse_with_layout(&mut self, me: MouseEvent, layout: &super::layout::PaneLayout) {
+        let col = me.column;
+        let row = me.row;
+        // helper to test inside rect
+        let inside = |r: ratatui::layout::Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(r) = layout.tree
+                    && inside(r)
+                {
+                    self.focus = Focus::Tree;
+                    self.show_tree = true;
+                    self.ensure_tree();
+                    self.click_tree_at(col, row, r);
+                    return;
+                }
+                if let Some(r) = layout.tools
+                    && inside(r)
+                {
+                    self.focus = Focus::Tree;
+                    self.show_tools = true;
+                    self.ensure_tree();
+                    self.click_tree_at(col, row, r);
+                    return;
+                }
+                if inside(layout.chat) {
+                    self.focus = Focus::Chat;
+                    return;
+                }
+                if inside(layout.input) {
+                    self.focus = Focus::Input;
+                    return;
+                }
+                if inside(layout.status) {
+                    // click top bar cycles theme
+                    // not handling here; could toggle
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(r) = layout.tree
+                    && inside(r)
+                {
+                    if let Some(tree) = &mut self.tree { tree.move_selection(-3); }
+                } else if let Some(r) = layout.tools
+                    && inside(r)
+                {
+                    if let Some(tree) = &mut self.tree { tree.move_selection(-3); }
+                } else if inside(layout.chat) {
+                    self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(3);
+                } else {
+                    self.handle_mouse_fallback(me);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(r) = layout.tree
+                    && inside(r)
+                {
+                    if let Some(tree) = &mut self.tree { tree.move_selection(3); }
+                } else if let Some(r) = layout.tools
+                    && inside(r)
+                {
+                    if let Some(tree) = &mut self.tree { tree.move_selection(3); }
+                } else if inside(layout.chat) {
+                    self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(3);
+                } else {
+                    self.handle_mouse_fallback(me);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn click_tree_at(&mut self, _col: u16, row: u16, pane: ratatui::layout::Rect) {
+        let Some(tree) = &mut self.tree else { return };
+        // inner area (border 1)
+        if pane.width < 3 || pane.height < 3 { return; }
+        let inner_y = pane.y + 1;
+        let clicked_offset = row.saturating_sub(inner_y) as usize;
+        let view_h = (pane.height.saturating_sub(2)) as usize;
+        // compute window start as render does
+        let len = tree.flat_len();
+        if len == 0 { return; }
+        let selected = tree.selected_index();
+        let start = selected.saturating_sub(view_h.saturating_sub(1)).min(len.saturating_sub(view_h.min(len)));
+        let idx = start + clicked_offset;
+        if idx >= len { return; }
+        tree.set_selected(idx);
+        // single click opens: dir toggles, file pins
+        if let Some(node) = tree.selected_node() {
+            if node.is_dir {
+                tree.toggle_selected();
+            } else if let Some(path) = tree.activate_selected() {
+                self.pin_file(path);
+            }
         }
     }
 
@@ -867,15 +994,22 @@ impl Tui {
 pub async fn run(app: &mut App) -> Result<()> {
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let result = event_loop(app, &mut terminal).await;
 
     // Restore unconditionally — a leaked alternate screen ruins the shell.
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ =
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::terminal::LeaveAlternateScreen
+    );
     result
 }
 
@@ -899,6 +1033,15 @@ async fn event_loop(
         let prompt = loop {
             tokio::select! {
                 ev = events.next() => match ev {
+                    Some(Ok(Event::Mouse(me))) => {
+                        // layout-aware mouse: click to focus/open file tree, scroll
+                        let area = terminal
+                            .size()
+                            .map(|r| ratatui::layout::Rect::new(0, 0, r.width, r.height))
+                            .unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
+                        let layout = crate::tui::layout::PaneLayout::compute(area, tui.show_tree, tui.show_tools);
+                        tui.handle_mouse_with_layout(me, &layout);
+                    }
                     Some(Ok(e)) => tui.handle_event(e),
                     Some(Err(e)) => return Err(anyhow::anyhow!("input error: {e}")),
                     None => break 'outer,
@@ -983,6 +1126,14 @@ async fn event_loop(
                         }
                     }
                     ev = events.next() => match ev {
+                        Some(Ok(Event::Mouse(me))) => {
+                            let area = terminal
+                                .size()
+                                .map(|r| ratatui::layout::Rect::new(0, 0, r.width, r.height))
+                                .unwrap_or(ratatui::layout::Rect::new(0, 0, 80, 24));
+                            let layout = crate::tui::layout::PaneLayout::compute(area, tui.show_tree, tui.show_tools);
+                            tui.handle_mouse_with_layout(me, &layout);
+                        }
                         Some(Ok(e)) => tui.handle_event(e),
                         Some(Err(e)) => return Err(anyhow::anyhow!("input error: {e}")),
                         None => break Exit::Eof,

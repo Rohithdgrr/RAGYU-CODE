@@ -161,8 +161,21 @@ impl FileTree {
         out
     }
 
-    fn flat_len(&self) -> usize {
+    pub fn flat_len(&self) -> usize {
         self.flat().len()
+    }
+
+    pub fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    pub fn set_selected(&mut self, idx: usize) {
+        let len = self.flat_len();
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = idx.min(len - 1);
+        }
     }
 
     /// Currently highlighted row.
