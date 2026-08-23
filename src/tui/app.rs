@@ -74,6 +74,14 @@ pub enum Focus {
     Tree,
 }
 
+#[derive(Debug, Clone)]
+pub struct SlashDialog {
+    pub command: String,
+    pub desc: String,
+    pub arg_input: String,
+    pub arg_cursor: usize,
+}
+
 /// Live update pushed from the turn runner back to the UI thread.
 pub enum TurnUpdate {
     AssistantProse(String),
@@ -143,6 +151,8 @@ pub struct Tui {
     pub slash_selected: usize,
     /// Queued slash for full dispatch needing App (all 37 commands)
     pending_slash: Option<String>,
+    /// Dialog shown after clicking a slash command (mouse or Tab) — args input
+    pub slash_dialog: Option<SlashDialog>,
 }
 
 impl Default for Tui {
@@ -185,6 +195,7 @@ impl Tui {
             plan_entry_idx: None,
             slash_selected: 0,
             pending_slash: None,
+            slash_dialog: None,
         };
         // Eagerly open explorer so "No files yet" never shows on startup when
         // the right pane is visible by default (width≥100). Fail silently in tests.
@@ -260,6 +271,126 @@ impl Tui {
         }
         self.input_cursor = self.input.chars().count();
         self.slash_selected = 0;
+    }
+
+    pub fn open_slash_dialog(&mut self, cmd: &str) {
+        let desc = crate::tui::widgets::input_bar::describe(cmd);
+        self.slash_dialog = Some(SlashDialog {
+            command: cmd.to_owned(),
+            desc: desc.to_owned(),
+            arg_input: String::new(),
+            arg_cursor: 0,
+        });
+    }
+
+    fn close_slash_dialog(&mut self) {
+        self.slash_dialog = None;
+    }
+
+    fn confirm_slash_dialog(&mut self) {
+        if let Some(d) = self.slash_dialog.take() {
+            let full = if d.arg_input.trim().is_empty() {
+                d.command.clone()
+            } else {
+                format!("{} {}", d.command, d.arg_input.trim())
+            };
+            // Queue for App-aware dispatch (like other slashes)
+            self.pending_slash = Some(full);
+            self.input.clear();
+            self.input_cursor = 0;
+            self.slash_selected = 0;
+        }
+    }
+
+    fn handle_dialog_key(&mut self, key: KeyEvent) -> bool {
+        if self.slash_dialog.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.close_slash_dialog();
+            }
+            KeyCode::Enter => {
+                // take ownership to avoid borrow conflict
+                if let Some(d) = self.slash_dialog.take() {
+                    let full = if d.arg_input.trim().is_empty() {
+                        d.command.clone()
+                    } else {
+                        format!("{} {}", d.command, d.arg_input.trim())
+                    };
+                    self.pending_slash = Some(full);
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.slash_selected = 0;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    let byte = dialog
+                        .arg_input
+                        .char_indices()
+                        .nth(dialog.arg_cursor)
+                        .map_or(dialog.arg_input.len(), |(i, _)| i);
+                    dialog.arg_input.insert(byte, c);
+                    dialog.arg_cursor += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if dialog.arg_cursor > 0 {
+                        let byte = dialog
+                            .arg_input
+                            .char_indices()
+                            .nth(dialog.arg_cursor)
+                            .map_or(dialog.arg_input.len(), |(i, _)| i);
+                        let prev = dialog.arg_input[..byte]
+                            .char_indices()
+                            .next_back()
+                            .map_or(0, |(i, _)| i);
+                        dialog.arg_input.replace_range(prev..byte, "");
+                        dialog.arg_cursor -= 1;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if dialog.arg_cursor < dialog.arg_input.chars().count() {
+                        let byte = dialog
+                            .arg_input
+                            .char_indices()
+                            .nth(dialog.arg_cursor)
+                            .map_or(dialog.arg_input.len(), |(i, _)| i);
+                        let next = dialog.arg_input[byte..]
+                            .char_indices()
+                            .nth(1)
+                            .map_or(dialog.arg_input.len(), |(i, _)| byte + i);
+                        dialog.arg_input.replace_range(byte..next, "");
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if dialog.arg_cursor > 0 { dialog.arg_cursor -= 1; } else { return false; }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(dialog) = &mut self.slash_dialog {
+                    if dialog.arg_cursor < dialog.arg_input.chars().count() { dialog.arg_cursor += 1; } else { return false; }
+                }
+            }
+            KeyCode::Home => {
+                if let Some(dialog) = &mut self.slash_dialog { dialog.arg_cursor = 0; }
+            }
+            KeyCode::End => {
+                if let Some(dialog) = &mut self.slash_dialog { dialog.arg_cursor = dialog.arg_input.chars().count(); }
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn local_command(&mut self, line: &str) -> bool {
@@ -413,6 +544,93 @@ impl Tui {
         let row = me.row;
         // helper to test inside rect
         let inside = |r: ratatui::layout::Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
+        // Dialog captures mouse first
+        if let Some(_dialog) = &self.slash_dialog {
+            // centered 60x9 dialog — compute same as draw
+            let full_w = layout.status.width;
+            let full_h = layout.status.height + layout.chat.height + layout.input.height;
+            let dw: u16 = 60;
+            let dh: u16 = 9;
+            let dx = full_w.saturating_sub(dw) / 2;
+            let dy = full_h.saturating_sub(dh) / 2;
+            let dlg = ratatui::layout::Rect::new(dx, dy, dw.min(full_w), dh.min(full_h));
+            match me.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if inside(dlg) {
+                        // click inside dialog — focus stays, maybe set cursor? For now do nothing.
+                        return;
+                    } else {
+                        // click outside closes dialog (cancel)
+                        self.close_slash_dialog();
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+        // Palette click — open dialog for selected command
+        if self.focus == Focus::Input && self.input.starts_with('/') && !self.input.contains(' ') {
+            let hits = crate::tui::widgets::input_bar::filtered(&self.input);
+            if !hits.is_empty() {
+                let lines = crate::tui::widgets::input_bar::palette_lines(&self.input, self.slash_selected);
+                let pal_h = (lines.len() as u16 + 2).min(18);
+                let pal_w = layout.input.width.saturating_sub(2).min(56);
+                let pal_x = layout.input.x;
+                let pal_y = layout.input.y.saturating_sub(pal_h);
+                let pal_rect = ratatui::layout::Rect::new(pal_x, pal_y.max(1), pal_w, pal_h);
+                if inside(pal_rect) {
+                    match me.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            // map click to row
+                            let inner_y = pal_rect.y + 1;
+                            let off = row.saturating_sub(inner_y) as usize;
+                            // header is line 0, maybe "↑" line 1
+                            let total = hits.len();
+                            let max_show = 12.min(total);
+                            let sel = self.slash_selected.min(total.saturating_sub(1));
+                            let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
+                            // determine if clicked row is a command row
+                            // lines[0]=header, [1]=maybe "↑", then commands, then "↓"
+                            let mut cmd_idx: Option<usize> = None;
+                            if total > max_show && start > 0 {
+                                // line 1 is "↑"
+                                if off == 1 {
+                                    // clicked "↑" — ignore
+                                } else if off >= 2 && off < 2 + max_show {
+                                    cmd_idx = Some(start + (off - 2));
+                                }
+                            } else {
+                                if off >= 1 && off < 1 + max_show {
+                                    cmd_idx = Some(start + (off - 1));
+                                }
+                            }
+                            if let Some(idx) = cmd_idx {
+                                if idx < total {
+                                    self.slash_selected = idx;
+                                    let cmd = hits[idx];
+                                    self.open_slash_dialog(cmd);
+                                    return;
+                                }
+                            } else if off == 0 {
+                                // header click — ignore
+                                return;
+                            }
+                            // click on palette but not on command — just keep
+                            return;
+                        }
+                        MouseEventKind::ScrollUp => {
+                            if self.slash_selected > 0 { self.slash_selected -= 1; }
+                            return;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            if self.slash_selected + 1 < hits.len() { self.slash_selected += 1; }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         match me.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(r) = layout.tree
@@ -506,6 +724,18 @@ impl Tui {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Dialog captures all keys (Enter confirms, Esc cancels, typing edits arg)
+        if self.slash_dialog.is_some() {
+            // allow Ctrl+Q to quit even with dialog
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+            {
+                self.quit = true;
+                return;
+            }
+            self.handle_dialog_key(key);
+            return;
+        }
         // Review-mode prompt intercepts everything except quit.
         if self.confirm_pending {
             match (key.modifiers, key.code) {
@@ -565,32 +795,35 @@ impl Tui {
 
         // Slash palette: Tab completes, Up/Down navigates filtered list
         if self.focus == Focus::Input && self.input.starts_with('/') {
-            let hits = crate::tui::widgets::input_bar::filtered(&self.input);
-            if !hits.is_empty() {
-                match key.code {
-                    KeyCode::Tab | KeyCode::Right => {
-                        self.apply_slash_completion();
-                        return;
-                    }
-                    KeyCode::Up => {
-                        if self.slash_selected == 0 {
-                            self.slash_selected = hits.len() - 1;
-                        } else {
-                            self.slash_selected -= 1;
+            // palette is shown only while first token has no space
+            if !self.input.contains(' ') {
+                let hits = crate::tui::widgets::input_bar::filtered(&self.input);
+                if !hits.is_empty() {
+                    match key.code {
+                        KeyCode::Tab | KeyCode::Right => {
+                            self.apply_slash_completion();
+                            return;
                         }
-                        return;
+                        KeyCode::Up => {
+                            if self.slash_selected == 0 {
+                                self.slash_selected = hits.len() - 1;
+                            } else {
+                                self.slash_selected -= 1;
+                            }
+                            return;
+                        }
+                        KeyCode::Down => {
+                            self.slash_selected = (self.slash_selected + 1) % hits.len();
+                            return;
+                        }
+                        KeyCode::Esc => {
+                            self.input.clear();
+                            self.input_cursor = 0;
+                            self.slash_selected = 0;
+                            return;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Down => {
-                        self.slash_selected = (self.slash_selected + 1) % hits.len();
-                        return;
-                    }
-                    KeyCode::Esc => {
-                        self.input.clear();
-                        self.input_cursor = 0;
-                        self.slash_selected = 0;
-                        return;
-                    }
-                    _ => {}
                 }
             }
         }

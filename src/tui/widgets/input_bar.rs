@@ -100,7 +100,7 @@ pub fn palette_lines(input: &str, selected: usize) -> Vec<Line<'static>> {
     out
 }
 
-fn describe(cmd: &str) -> &'static str {
+pub fn describe(cmd: &str) -> &'static str {
     match cmd {
         "/help" => "show help",
         "/exit" | "/quit" => "quit",

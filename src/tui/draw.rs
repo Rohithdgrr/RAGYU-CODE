@@ -59,6 +59,11 @@ pub fn draw(f: &mut Frame<'_>, tui: &Tui, info: &StatusInfo) {
     }
 
     render_input(f, layout.input, tui);
+
+    // Centered dialog for slash command args (after clicking palette)
+    if let Some(dialog) = &tui.slash_dialog {
+        render_slash_dialog(f, f.area(), dialog);
+    }
 }
 
 fn render_status(f: &mut Frame<'_>, area: Rect, mode: AppMode, info: &StatusInfo) {
@@ -262,6 +267,69 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
             }
         }
     }
+}
+
+fn render_slash_dialog(f: &mut Frame<'_>, area: Rect, dialog: &crate::tui::app::SlashDialog) {
+    let t = theme::active();
+    let w: u16 = 60;
+    let h: u16 = 9;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect::new(x, y, w.min(area.width.saturating_sub(2)), h.min(area.height.saturating_sub(2)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent_primary).bg(t.bg_tertiary))
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(format!(" {} ", dialog.command))
+        .title_style(Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(t.bg_tertiary));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    // desc
+    let desc_line = Line::styled(
+        format!(" {}", dialog.desc),
+        Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+    );
+    let input_line = {
+        let prompt = "› ";
+        let before: String = dialog.arg_input.chars().take(dialog.arg_cursor).collect();
+        let after: String = dialog.arg_input.chars().skip(dialog.arg_cursor).collect();
+        let base = Style::default().fg(t.text_primary).bg(t.bg_tertiary);
+        if after.is_empty() {
+            Line::from(vec![
+                ratatui::text::Span::styled(prompt, Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
+                ratatui::text::Span::styled(before, base),
+                ratatui::text::Span::styled("▌", Style::default().fg(t.accent_primary).bg(t.bg_tertiary)),
+                ratatui::text::Span::styled("  args (optional)", Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::DIM)),
+            ])
+        } else {
+            Line::from(vec![
+                ratatui::text::Span::styled(prompt, Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
+                ratatui::text::Span::styled(before, base),
+                ratatui::text::Span::styled(after.chars().next().map(|c| c.to_string()).unwrap_or_default(), Style::default().fg(t.text_primary).bg(t.bg_hover).add_modifier(Modifier::BOLD)),
+                ratatui::text::Span::styled(after.chars().skip(1).collect::<String>(), base),
+            ])
+        }
+    };
+    let footer = Line::from(vec![
+        ratatui::text::Span::styled(" Enter ", Style::default().fg(t.text_inverse).bg(t.accent_success).add_modifier(Modifier::BOLD)),
+        ratatui::text::Span::styled(" execute  ", Style::default().fg(t.text_secondary).bg(t.bg_tertiary)),
+        ratatui::text::Span::styled(" Esc ", Style::default().fg(t.text_inverse).bg(t.border_default).add_modifier(Modifier::BOLD)),
+        ratatui::text::Span::styled(" cancel ", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
+    ]);
+    let lines = vec![Line::default(), desc_line, Line::default(), input_line, Line::default(), footer];
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)), inner);
+    // place cursor inside dialog input
+    let prompt_w: u16 = 2; // "› " width
+    let before_w = before_width(&dialog.arg_input, dialog.arg_cursor);
+    let cx = inner.x + prompt_w + before_w;
+    let cy = inner.y + 3; // input line is 4th line (0-indexed 3)
+    f.set_cursor_position((cx.min(inner.x + inner.width.saturating_sub(1)), cy));
+}
+
+fn before_width(s: &str, cursor: usize) -> u16 {
+    let before: String = s.chars().take(cursor).collect();
+    before.width() as u16
 }
 
 /// Positions the terminal cursor after the `❯ ` prompt at `x`.
