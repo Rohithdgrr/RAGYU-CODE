@@ -295,7 +295,10 @@ impl Tui {
                 // fall through to App-aware dispatch for "/theme <name>"
                 return false;
             }
-            "/tokens" => return true, // rendered live in the status bar
+            "/tokens" => {
+                self.notice("tokens — see top bar for live usage ( /tokens for full BPE count )");
+                return true;
+            }
             "/plan" => {
                 let task = rest.trim();
                 if task.is_empty() {
@@ -1301,7 +1304,7 @@ async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
             if arg.is_empty() { tui.notice("project memory: /project show | set test|build <cmd> | clear"); }
             else { tui.notice(format!("project {arg} — use REPL for full project memory")); }
         }
-        "/quit" | "/exit" | "/q" => tui.quit = true,
+        "/quit" | "/exit" | "/q" => { tui.quit = true; tui.notice("quitting…"); },
         "/clear" | "/reset" => { app.session.clear(); tui.entries.clear(); tui.notice("cleared"); },
         "/help" => tui.notice("see /help output above"),
         _ => tui.notice(format!("executed {line}")),
@@ -1843,5 +1846,106 @@ mod tests {
         tui.pin_file(p);
         assert_eq!(tui.pinned_files.len(), 1);
         assert!(tui.entries.len() > notices_after_first, "duplicate notice shown");
+    }
+
+    #[test]
+    fn slash_palette_shows_all_and_filters() {
+        use crate::tui::widgets::input_bar;
+        assert_eq!(input_bar::filtered("/").len(), crate::commands::SLASH_COMMANDS.len());
+        assert!(input_bar::filtered("/hel").contains(&"/help"));
+        assert!(input_bar::filtered("/to").contains(&"/todo"));
+        assert!(input_bar::filtered("/xyz").is_empty());
+        let lines = input_bar::palette_lines("/", 0);
+        assert!(lines.len() > 5, "palette should have header + rows");
+        // selected highlighting
+        let lines2 = input_bar::palette_lines("/hel", 1);
+        assert!(lines2.iter().any(|l| l.spans.iter().any(|s| s.content.contains("/help"))));
+    }
+
+    #[test]
+    fn all_slash_commands_are_handled() {
+        // Every SLASH_COMMANDS entry should either be handled locally (notice/quit/clear)
+        // or queued as pending_slash for App-aware dispatch — never "not wired".
+        for cmd in crate::commands::SLASH_COMMANDS {
+            let mut tui = Tui::new();
+            // use a basic arg where needed to avoid usage notices being mistaken for failure
+            let input = match cmd {
+                "/model" => "/model test-model".to_string(),
+                "/temp" => "/temp 0.5".to_string(),
+                "/system" => "/system test".to_string(),
+                "/search" => "/search hello".to_string(),
+                "/save" => "/save test".to_string(),
+                "/load" => "/load test".to_string(),
+                "/export" => "/export md".to_string(),
+                "/timeout" => "/timeout 30".to_string(),
+                "/limit" => "/limit 8".to_string(),
+                "/tools" => "/tools".to_string(),
+                "/todo" => "/todo list".to_string(),
+                "/scan" => "/scan".to_string(),
+                "/plan" => "/plan task".to_string(),
+                "/project" => "/project show".to_string(),
+                _ => cmd.to_string(),
+            };
+            tui.set_input(input.clone());
+            tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let has_notice = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_)));
+            let pending = tui.take_pending_slash().is_some();
+            let is_local = has_notice || tui.quit || tui.take_clear_request() || pending;
+            assert!(is_local, "slash {cmd} should be handled (notice/pending/quit/clear) but was not");
+            // Ensure never the old "not wired" message
+            let wired = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(t) if t.contains("not wired")));
+            assert!(!wired, "slash {cmd} still shows not wired");
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_slash_dispatch_covers_all_commands() {
+        // Smoke App for handle_tui_slash
+        let provider = crate::provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
+        let config = crate::config::Config {
+            api_key: std::sync::Arc::new(zeroize::Zeroizing::new(String::new())),
+            model: "test-model".to_owned(),
+            temperature: 0.5,
+            render_markdown: false,
+            system_prompt: "sys".to_owned(),
+            context_tokens: 2048,
+            provider,
+            source_path: None,
+            shell_tools: Vec::new(),
+            theme: None,
+            timeout_secs: 30,
+            limit_mb: 16,
+        };
+        let mut app = crate::commands::App::new(
+            config,
+            reqwest::Client::new(),
+            crate::session::Session::new("sys"),
+            crate::render::Renderer::new(false),
+        );
+        for cmd in crate::commands::SLASH_COMMANDS {
+            let mut tui = Tui::new();
+            let line = match cmd {
+                "/model" => "/model foo",
+                "/temp" => "/temp 0.7",
+                "/system" => "/system hi",
+                "/search" => "/search hi",
+                "/save" => "/save t",
+                "/load" => "/load t",
+                "/export" => "/export md",
+                "/timeout" => "/timeout 30",
+                "/limit" => "/limit 8",
+                "/todo" => "/todo list",
+                "/scan" => "/scan",
+                "/project" => "/project show",
+                "/plan" => "/plan do x",
+                _ => cmd,
+            };
+            handle_tui_slash(&mut app, &mut tui, line).await;
+            let handled = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_))) || tui.quit || tui.take_clear_request();
+            assert!(
+                handled,
+                "handle_tui_slash for {cmd} should push a Notice or set quit/clear"
+            );
+        }
     }
 }
