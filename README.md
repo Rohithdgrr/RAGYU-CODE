@@ -76,6 +76,26 @@ cargo run --release                 # start a new conversation
 cargo run --release -- --resume work   # continue a saved session
 ```
 
+## TUI design (glassmorphism)
+
+The terminal UI uses a **frosted-glass design with sharp edges** — layered
+misty surfaces, hairline glass borders, and one glowing accent on the focused
+pane. For the intended look install:
+
+- **A Nerd Font** (required for icons — the UI never uses emoji). Any patched
+  font works; e.g. *JetBrainsMono Nerd Font* or *SymbolsNFMono*.
+- Recommended typography stack:
+  | Role | Font |
+  |---|---|
+  | Headings / display | **Space Grotesk** |
+  | Body / UI text | **DM Sans**, Manrope, or Inter |
+  | Code / numbers | **JetBrains Mono** |
+
+  Terminals render with the configured font, so set these in your terminal
+  profile — headings are uppercase + bold, numerals land in the mono face.
+- Light ("Frosted Daylight") and dark ("Midnight Glass") palettes ship
+  built-in; `/theme` toggles.
+
 ## Commands
 
 | Command | Description |

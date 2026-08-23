@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::super::app::{AppMode, Focus};
-use super::super::theme;
+use super::super::{icons, theme};
 
 /// Minimal rich context passed from `draw`.
 #[allow(dead_code)]
@@ -61,10 +61,10 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
 
     // ── mode chip ────────────────────────────────────────────
     let (mode_icon, mode_label, mode_bg) = match mode {
-        AppMode::Normal => ("●", " READY ", t.accent_success),
-        AppMode::Agent => ("✦", " AGENT ", t.accent_secondary),
-        AppMode::Review => ("⚠", " REVIEW ", t.accent_warning),
-        AppMode::Plan => ("⬢", " PLAN ", t.accent_primary),
+        AppMode::Normal => (icons::MODE_READY, " READY ", t.accent_success),
+        AppMode::Agent => (icons::MODE_AGENT, " AGENT ", t.accent_secondary),
+        AppMode::Review => (icons::MODE_REVIEW, " REVIEW ", t.accent_warning),
+        AppMode::Plan => (icons::MODE_PLAN, " PLAN ", t.accent_primary),
     };
     let mode_style = Style::default().fg(t.text_inverse).bg(mode_bg).add_modifier(Modifier::BOLD);
     let mode_sub = Style::default().fg(mode_bg).bg(bg).add_modifier(Modifier::BOLD);
@@ -72,7 +72,7 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     // brand + version
-    spans.push(Span::styled(" ⬢ ", Style::default().fg(t.accent_secondary).bg(bg).add_modifier(Modifier::BOLD)));
+    spans.push(Span::styled(format!(" {} ", icons::LOGO), Style::default().fg(t.accent_secondary).bg(bg).add_modifier(Modifier::BOLD)));
     spans.push(Span::styled("GOVINDA", Style::default().fg(t.text_primary).bg(bg).add_modifier(Modifier::BOLD)));
     spans.push(Span::styled(
         format!(" v{} ", env!("CARGO_PKG_VERSION")),
@@ -93,8 +93,8 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
             } else {
                 Style::default().fg(t.text_secondary).bg(bg)
             };
-            let dirty_dot = if info.git_dirty { " ●" } else { "" };
-            spans.push(Span::styled("⎇ ", muted));
+            let dirty_dot = if info.git_dirty { icons::DIRTY_DOT } else { "" };
+            spans.push(Span::styled(format!("{} ", icons::GIT_BRANCH), muted));
             spans.push(Span::styled(format!("{branch}{dirty_dot}"), branch_style));
         }
     }
@@ -103,7 +103,7 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
 
     // provider / model
     let model_short = truncate_model(&info.model, if width < 110 { 18 } else { 28 });
-    spans.push(Span::styled("◆ ", Style::default().fg(t.accent_primary).bg(bg)));
+    spans.push(Span::styled(format!("{} ", icons::MODEL_CHIP), Style::default().fg(t.accent_primary).bg(bg)));
     spans.push(Span::styled(info.provider.clone(), Style::default().fg(t.text_secondary).bg(bg).add_modifier(Modifier::BOLD)));
     spans.push(dot());
     spans.push(Span::styled(model_short, secondary));
@@ -131,12 +131,12 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
         // usage numbers compact: 3.7k/8.2k
         let used_s = fmt_tokens(info.tokens);
         let total_s = fmt_tokens(info.budget);
-        spans.push(Span::styled("⚡ ", muted));
+        spans.push(Span::styled(format!("{} ", icons::TOKENS), muted));
         spans.push(Span::styled(bar, pct_style));
         spans.push(Span::styled(format!(" {used_s}/{total_s}"), num_style));
         spans.push(Span::styled(format!(" {pct}%"), pct_style));
     } else {
-        spans.push(Span::styled(format!("⚡ {} tok", fmt_tokens(info.tokens)), muted));
+        spans.push(Span::styled(format!("{} {} tok", icons::TOKENS, fmt_tokens(info.tokens)), muted));
     }
 
     // right-side stats (hide progressively on narrow screens)
@@ -152,13 +152,13 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
         } else {
             muted
         };
-        spans.push(Span::styled("⟳ ", muted));
+        spans.push(Span::styled(format!("{} ", icons::TURNS), muted));
         spans.push(Span::styled(format!("{}", info.turns), turns_style));
     }
 
     if show_latency && info.avg_latency_ms > 0 {
         spans.push(dot());
-        spans.push(Span::styled("◷ ", muted));
+        spans.push(Span::styled(format!("{} ", icons::LATENCY), muted));
         spans.push(Span::styled(format!("{}ms", info.avg_latency_ms), secondary));
     }
 
@@ -168,28 +168,28 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
         let gated = info.tools.iter().filter(|t| t.gated).count();
         if total > 0 {
             spans.push(dot());
-            spans.push(Span::styled("⛭ ", muted));
+            spans.push(Span::styled(format!("{} ", icons::TOOLS), muted));
             spans.push(Span::styled(format!("{enabled}/{total}"), secondary));
             if gated > 0 {
-                spans.push(Span::styled(format!(" ·{gated}⚑"), Style::default().fg(t.accent_warning).bg(bg)));
+                spans.push(Span::styled(format!(" ·{gated}{}", icons::GATED), Style::default().fg(t.accent_warning).bg(bg)));
             }
         }
     }
 
     if info.pinned > 0 && width >= 90 {
         spans.push(dot());
-        spans.push(Span::styled("📎 ", muted));
+        spans.push(Span::styled(format!("{} ", icons::PINNED), muted));
         spans.push(Span::styled(format!("{}", info.pinned), Style::default().fg(t.accent_secondary).bg(bg).add_modifier(Modifier::BOLD)));
     }
 
     if info.errors > 0 {
         spans.push(Span::styled(" ", muted));
-        spans.push(Span::styled(format!(" ✗ {} ", info.errors), Style::default().fg(t.text_inverse).bg(t.accent_error).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!(" {} {} ", icons::ERRORS, info.errors), Style::default().fg(t.text_inverse).bg(t.accent_error).add_modifier(Modifier::BOLD)));
     }
 
     if info.busy {
         spans.push(Span::styled(" ", muted));
-        spans.push(Span::styled(" ⏺ LIVE ", Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!(" {} LIVE ", icons::LIVE), Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD)));
     } else if width >= 120 {
         // focus hint far right, dim
         let hint = focus_hint(info.focus);

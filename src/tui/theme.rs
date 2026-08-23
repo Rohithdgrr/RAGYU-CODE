@@ -1,8 +1,15 @@
-//! TUI color themes.
+//! TUI color themes — frosted-glass (glassmorphism), sharp edges.
 //!
-//! The TUI ships a light-first palette (the whole point of the redesign —
-//! every other coding-agent CLI is dark-only) plus a dark fallback. The
-//! active theme lives in a process-wide `RwLock` so any pane can ask for
+//! The design language: layered translucent-looking surfaces over a deep
+//! backdrop, low-contrast hairline borders that read as glass edges, one
+//! vivid accent glow on the focused surface. All corners are square —
+//! sharpness is part of the identity ("cut glass", not "bubbles").
+//!
+//! Typography the palette targets (set these in your terminal):
+//! - Space Grotesk / Outfit for display, DM Sans / Manrope for UI text,
+//!   JetBrains Mono for numerals and code.
+//!
+//! The active theme lives in a process-wide `RwLock` so any pane can ask for
 //! colors without threading a `Theme` through every call; a poisoned lock
 //! falls back to the last-known value instead of panicking mid-frame.
 
@@ -15,7 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 /// live.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
-    // Backgrounds
+    // Backgrounds — backdrop → frosted panel → raised glass card → hover sheen
     pub bg_primary: Color,
     pub bg_secondary: Color,
     pub bg_tertiary: Color,
@@ -34,7 +41,7 @@ pub struct Theme {
     pub text_muted: Color,
     pub text_inverse: Color,
 
-    // Borders
+    // Borders — hairline glass edges + focused glow
     pub border_default: Color,
     pub border_focus: Color,
 
@@ -55,9 +62,14 @@ impl Theme {
         }
     }
 
-    /// Base text style for a pane's body.
+    /// Base text style for a pane's body (backdrop surface).
     pub fn text(&self) -> Style {
         Style::default().fg(self.text_primary).bg(self.bg_primary)
+    }
+
+    /// Frosted-panel text (sidebars, code blocks).
+    pub fn text_on_panel(&self) -> Style {
+        Style::default().fg(self.text_primary).bg(self.bg_secondary)
     }
 
     /// Dimmed/secondary text.
@@ -65,13 +77,11 @@ impl Theme {
         Style::default().fg(self.text_secondary).bg(self.bg_primary)
     }
 
-    /// Border style; focused panes get the accent border per the spec.
+    /// Border style; focused panes get the glowing accent edge.
     pub fn border_style(&self, focused: bool) -> Style {
-        Style::default().fg(if focused {
-            self.border_focus
-        } else {
-            self.border_default
-        })
+        Style::default()
+            .fg(if focused { self.border_focus } else { self.border_default })
+            .bg(self.bg_primary)
     }
 
     /// Accent-tinted text (titles, highlights).
@@ -98,66 +108,66 @@ impl Theme {
         Style::default().fg(self.accent_error)
     }
 
-    /// Sidebar background (file tree, tool panel).
+    /// Sidebar background (file tree, tool panel) — frosted panel layer.
     pub fn sidebar_bg(&self) -> Style {
         Style::default().fg(self.text_primary).bg(self.bg_secondary)
     }
 }
 
-/// Apple-inspired light theme — the signature look of the redesign.
+/// "Frosted Daylight" — misty cool-white layers with a cobalt glow.
 pub const LIGHT_THEME: Theme = Theme {
-    bg_primary: Color::Rgb(252, 252, 254),
-    bg_secondary: Color::Rgb(242, 242, 247),
-    bg_tertiary: Color::Rgb(255, 255, 255),
-    bg_hover: Color::Rgb(232, 232, 238),
+    bg_primary: Color::Rgb(236, 240, 247),   // mist backdrop
+    bg_secondary: Color::Rgb(224, 230, 241), // frosted panel
+    bg_tertiary: Color::Rgb(248, 250, 253),  // raised glass card
+    bg_hover: Color::Rgb(214, 222, 236),     // hover sheen
 
-    accent_primary: Color::Rgb(0, 122, 255),
-    accent_secondary: Color::Rgb(88, 86, 214),
-    accent_success: Color::Rgb(48, 176, 78),
-    accent_warning: Color::Rgb(245, 140, 0),
-    accent_error: Color::Rgb(240, 50, 40),
+    accent_primary: Color::Rgb(63, 118, 227),  // glass blue
+    accent_secondary: Color::Rgb(124, 92, 255), // violet
+    accent_success: Color::Rgb(28, 176, 118),  // mint
+    accent_warning: Color::Rgb(235, 156, 32),  // amber
+    accent_error: Color::Rgb(232, 74, 74),     // rose
 
-    text_primary: Color::Rgb(26, 26, 28),
-    text_secondary: Color::Rgb(92, 92, 96),
-    text_muted: Color::Rgb(150, 150, 156),
-    text_inverse: Color::Rgb(255, 255, 255),
+    text_primary: Color::Rgb(24, 30, 44),
+    text_secondary: Color::Rgb(78, 90, 112),
+    text_muted: Color::Rgb(140, 152, 174),
+    text_inverse: Color::Rgb(248, 250, 253),
 
-    border_default: Color::Rgb(210, 210, 216),
-    border_focus: Color::Rgb(0, 122, 255),
+    border_default: Color::Rgb(190, 200, 218),
+    border_focus: Color::Rgb(63, 118, 227),
 
-    syntax_keyword: Color::Rgb(186, 0, 152),
-    syntax_string: Color::Rgb(200, 32, 28),
-    syntax_comment: Color::Rgb(0, 140, 0),
-    syntax_function: Color::Rgb(128, 88, 170),
-    syntax_type: Color::Rgb(0, 110, 172),
+    syntax_keyword: Color::Rgb(146, 58, 219),
+    syntax_string: Color::Rgb(197, 62, 56),
+    syntax_comment: Color::Rgb(96, 132, 100),
+    syntax_function: Color::Rgb(122, 82, 178),
+    syntax_type: Color::Rgb(20, 108, 180),
 };
 
-/// Dark counterpart for night sessions (`/theme dark`).
+/// "Midnight Glass" — deep navy layers with neon edge-lighting.
 pub const DARK_THEME: Theme = Theme {
-    bg_primary: Color::Rgb(20, 20, 24),
-    bg_secondary: Color::Rgb(28, 28, 33),
-    bg_tertiary: Color::Rgb(38, 38, 44),
-    bg_hover: Color::Rgb(48, 48, 56),
+    bg_primary: Color::Rgb(13, 17, 27),   // midnight backdrop
+    bg_secondary: Color::Rgb(21, 27, 42), // frosted panel
+    bg_tertiary: Color::Rgb(29, 37, 56),  // raised glass card
+    bg_hover: Color::Rgb(38, 48, 72),     // hover sheen
 
-    accent_primary: Color::Rgb(56, 152, 255),
-    accent_secondary: Color::Rgb(118, 114, 255),
-    accent_success: Color::Rgb(68, 195, 112),
-    accent_warning: Color::Rgb(255, 172, 62),
-    accent_error: Color::Rgb(255, 98, 88),
+    accent_primary: Color::Rgb(88, 148, 255),   // neon blue
+    accent_secondary: Color::Rgb(158, 130, 255), // violet
+    accent_success: Color::Rgb(52, 211, 153),   // mint neon
+    accent_warning: Color::Rgb(251, 191, 36),   // amber neon
+    accent_error: Color::Rgb(248, 113, 113),    // coral
 
-    text_primary: Color::Rgb(232, 232, 238),
-    text_secondary: Color::Rgb(156, 156, 164),
-    text_muted: Color::Rgb(106, 106, 114),
-    text_inverse: Color::Rgb(20, 20, 24),
+    text_primary: Color::Rgb(228, 234, 245),
+    text_secondary: Color::Rgb(150, 162, 186),
+    text_muted: Color::Rgb(96, 108, 134),
+    text_inverse: Color::Rgb(13, 17, 27),
 
-    border_default: Color::Rgb(58, 58, 66),
-    border_focus: Color::Rgb(56, 152, 255),
+    border_default: Color::Rgb(52, 64, 92),
+    border_focus: Color::Rgb(88, 148, 255),
 
     syntax_keyword: Color::Rgb(255, 116, 218),
-    syntax_string: Color::Rgb(228, 100, 100),
-    syntax_comment: Color::Rgb(100, 148, 80),
-    syntax_function: Color::Rgb(216, 186, 252),
-    syntax_type: Color::Rgb(74, 190, 230),
+    syntax_string: Color::Rgb(255, 138, 128),
+    syntax_comment: Color::Rgb(120, 168, 120),
+    syntax_function: Color::Rgb(196, 181, 253),
+    syntax_type: Color::Rgb(103, 202, 255),
 };
 
 static ACTIVE: RwLock<Theme> = RwLock::new(LIGHT_THEME);

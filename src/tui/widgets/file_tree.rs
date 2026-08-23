@@ -255,8 +255,19 @@ impl FileTree {
         self.render_lines_with_width(focused, 34)
     }
 
-    /// Width-aware variant used by draw for perfect clipping.
+    /// Width-aware variant used by draw for perfect clipping. `hovered` is
+    /// the absolute flat index under the mouse (soft sheen), if any.
     pub fn render_lines_with_width(&self, focused: bool, width: u16) -> Vec<Line<'static>> {
+        self.render_lines_hover(focused, width, None)
+    }
+
+    /// Full variant with mouse-hover support.
+    pub fn render_lines_hover(
+        &self,
+        focused: bool,
+        width: u16,
+        hovered: Option<usize>,
+    ) -> Vec<Line<'static>> {
         let t = theme::active();
         let rows = self.flat();
 
@@ -277,15 +288,15 @@ impl FileTree {
                 let depth = node.rel.matches('/').count();
                 // guides: "│ " style via indent, but keep simple 2-space
                 let indent = "  ".repeat(depth);
-                // richer icons: dirs vs files
+                // richer icons: dirs vs files (Nerd Font glyphs, no emoji)
                 let (icon, icon_fg) = if node.is_dir {
                     if node.expanded {
-                        ("▾", t.accent_secondary)
+                        ("\u{f07c}", t.accent_secondary) // folder-open
                     } else {
-                        ("▸", t.text_muted)
+                        ("\u{f07b}", t.text_muted) // folder
                     }
                 } else {
-                    // file type hint
+                    // file-type glyph keeps recognition instant
                     let ext = node.name.rsplit('.').next().unwrap_or("");
                     let c = match ext {
                         "rs" => t.syntax_type,
@@ -293,20 +304,27 @@ impl FileTree {
                         "exe" | "dll" | "pdb" | "rmeta" | "rlib" | "d" => t.text_muted,
                         _ => t.text_primary,
                     };
-                    ("·", c)
+                    (super::super::icons::file_icon(&node.name), c)
                 };
                 let selected_row = idx == self.selected;
+                let hovered_row = hovered == Some(idx) && !selected_row;
                 let base = if selected_row {
                     Style::default()
                         .bg(if focused { t.bg_hover } else { t.bg_secondary })
                         .fg(t.text_primary)
+                } else if hovered_row {
+                    // soft glass sheen under the mouse
+                    Style::default()
+                        .bg(t.bg_tertiary)
+                        .fg(t.text_primary)
+                        .add_modifier(Modifier::UNDERLINED)
                 } else {
                     t.sidebar_bg()
                 };
                 let icon_style = if selected_row {
                     Style::default().fg(icon_fg).bg(base.bg.unwrap_or(t.bg_secondary)).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(icon_fg).bg(t.bg_secondary)
+                    Style::default().fg(icon_fg).bg(base.bg.unwrap_or(t.bg_secondary))
                 };
 
                 // compute truncation for perfect fit

@@ -27,7 +27,7 @@ use ratatui::Terminal;
 
 use super::widgets::chat_pane::ChatEntry;
 use super::widgets::file_tree::FileTree;
-use super::{draw, theme};
+use super::{draw, icons, theme};
 use crate::api::{self, ChatOptions, StreamSink};
 use crate::commands::{self, App};
 
@@ -35,6 +35,14 @@ use crate::commands::{self, App};
 const MAX_TOOL_ROUNDS: usize = 5;
 /// Cap applied *before* a tool result enters session history.
 const MAX_TOOL_RESULT_CHARS: usize = 8 * 1024;
+
+/// Slash commands that never take an argument — Enter on the palette runs
+/// them directly instead of opening the args dialog.
+const ZERO_ARG_SLASH: [&str; 21] = [
+    "/help", "/exit", "/quit", "/q", "/clear", "/reset", "/sessions", "/stats", "/history",
+    "/models", "/tools", "/config", "/tokens", "/undo", "/retry", "/compact", "/raw", "/scan",
+    "/pin", "/variants", "/pick",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
@@ -149,6 +157,10 @@ pub struct Tui {
     plan_entry_idx: Option<usize>,
     /// Slash palette selection (when input starts with '/')
     pub slash_selected: usize,
+    /// Palette row under the mouse (hover sheen), absolute hit index
+    pub palette_hover: Option<usize>,
+    /// File-tree row under the mouse (hover sheen), absolute flat index
+    pub tree_hover: Option<usize>,
     /// Queued slash for full dispatch needing App (all 37 commands)
     pending_slash: Option<String>,
     /// Dialog shown after clicking a slash command (mouse or Tab) — args input
@@ -194,6 +206,8 @@ impl Tui {
             plan_executing: false,
             plan_entry_idx: None,
             slash_selected: 0,
+            palette_hover: None,
+            tree_hover: None,
             pending_slash: None,
             slash_dialog: None,
         };
@@ -275,6 +289,10 @@ impl Tui {
 
     pub fn open_slash_dialog(&mut self, cmd: &str) {
         let desc = crate::tui::widgets::input_bar::describe(cmd);
+        // Clear the palette input so the dropdown hides behind the dialog.
+        self.input.clear();
+        self.input_cursor = 0;
+        self.slash_selected = 0;
         self.slash_dialog = Some(SlashDialog {
             command: cmd.to_owned(),
             desc: desc.to_owned(),
@@ -287,6 +305,7 @@ impl Tui {
         self.slash_dialog = None;
     }
 
+    /// Confirms the dialog: queues `command [args]` for App-aware dispatch.
     fn confirm_slash_dialog(&mut self) {
         if let Some(d) = self.slash_dialog.take() {
             let full = if d.arg_input.trim().is_empty() {
@@ -294,7 +313,6 @@ impl Tui {
             } else {
                 format!("{} {}", d.command, d.arg_input.trim())
             };
-            // Queue for App-aware dispatch (like other slashes)
             self.pending_slash = Some(full);
             self.input.clear();
             self.input_cursor = 0;
@@ -311,18 +329,7 @@ impl Tui {
                 self.close_slash_dialog();
             }
             KeyCode::Enter => {
-                // take ownership to avoid borrow conflict
-                if let Some(d) = self.slash_dialog.take() {
-                    let full = if d.arg_input.trim().is_empty() {
-                        d.command.clone()
-                    } else {
-                        format!("{} {}", d.command, d.arg_input.trim())
-                    };
-                    self.pending_slash = Some(full);
-                    self.input.clear();
-                    self.input_cursor = 0;
-                    self.slash_selected = 0;
-                }
+                self.confirm_slash_dialog();
             }
             KeyCode::Char(c) => {
                 if let Some(dialog) = &mut self.slash_dialog {
@@ -412,7 +419,7 @@ impl Tui {
                      · Ctrl+L clear · Ctrl+T left tree · Ctrl+P explorer · Ctrl+Q quit\n\
                      gated calls pause in [REVIEW]: y approve · n decline · a all\n\
                      cmds: /help /clear /theme /tokens /agent <on|off> /plan <task> /model /temp /system /history /undo /retry /variants /pick /compact /search /save /load /sessions /fork /export /stats /raw /config /timeout /limit /tools /todo /diff /apply /reject /review /scan /project\n\
-                     Tip: type \"/\" to see filtered palette — Tab completes, ↑↓ selects.",
+                      Tip: type \"/\" to see the palette — Enter/↑↓/click open the args dialog, Tab completes.",
                 );
                 return true;
             }
@@ -501,7 +508,7 @@ impl Tui {
         true
     }
 
-    pub fn handle_event(&mut self, ev: Event) {
+    pub     fn handle_event(&mut self, ev: Event) {
         match ev {
             Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
                 self.handle_key(key);
@@ -569,37 +576,93 @@ impl Tui {
             }
         }
         // Palette click — open dialog for selected command
+        if let MouseEventKind::Moved = me.kind {
+            // default: outside any hoverable region
+            self.palette_hover = None;
+        }
+        if let MouseEventKind::Moved = me.kind {
+            // file-tree hover sheen (left tree or right explorer)
+            let pane = layout
+                .tree
+                .filter(|r| inside(*r))
+                .or_else(|| layout.tools.filter(|r| inside(*r)));
+            self.tree_hover = pane.and_then(|r| {
+                let Some(tree) = &self.tree else { return None };
+                if r.width < 3 || r.height < 3 {
+                    return None;
+                }
+                let inner_y = r.y + 1;
+                let off = row.saturating_sub(inner_y) as usize;
+                let view_h = (r.height.saturating_sub(2)) as usize;
+                let len = tree.flat_len();
+                if len == 0 {
+                    return None;
+                }
+                let selected = tree.selected_index();
+                let start = selected
+                    .saturating_sub(view_h.saturating_sub(1))
+                    .min(len.saturating_sub(view_h.min(len)));
+                let idx = start + off;
+                (idx < len).then_some(idx)
+            });
+        }
         if self.focus == Focus::Input && self.input.starts_with('/') && !self.input.contains(' ') {
             let hits = crate::tui::widgets::input_bar::filtered(&self.input);
             if !hits.is_empty() {
-                let lines = crate::tui::widgets::input_bar::palette_lines(&self.input, self.slash_selected);
+                let lines = crate::tui::widgets::input_bar::palette_lines(&self.input, self.slash_selected, self.palette_hover);
                 let pal_h = (lines.len() as u16 + 2).min(18);
                 let pal_w = layout.input.width.saturating_sub(2).min(56);
                 let pal_x = layout.input.x;
                 let pal_y = layout.input.y.saturating_sub(pal_h);
                 let pal_rect = ratatui::layout::Rect::new(pal_x, pal_y.max(1), pal_w, pal_h);
                 if inside(pal_rect) {
+                    // Hover sheen: track which palette row the mouse is over.
+                    if let MouseEventKind::Moved = me.kind {
+                        let inner_y = pal_rect.y + 1;
+                        let off = row.saturating_sub(inner_y) as usize;
+                        let total = hits.len();
+                        let max_show = 12.min(total);
+                        let sel = self.slash_selected.min(total.saturating_sub(1));
+                        let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
+                        self.palette_hover = if total > max_show && start > 0 {
+                            (off >= 2 && off < 2 + max_show).then(|| start + (off - 2))
+                        } else {
+                            (off >= 1 && off < 1 + max_show).then(|| start + (off - 1))
+                        };
+                        return;
+                    }
                     match me.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             // map click to row
                             let inner_y = pal_rect.y + 1;
                             let off = row.saturating_sub(inner_y) as usize;
-                            // header is line 0, maybe "↑" line 1
+                            // header is line 0, maybe "↑" line 1, then commands, then "↓"
                             let total = hits.len();
                             let max_show = 12.min(total);
                             let sel = self.slash_selected.min(total.saturating_sub(1));
                             let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
-                            // determine if clicked row is a command row
-                            // lines[0]=header, [1]=maybe "↑", then commands, then "↓"
+                            let end = (start + max_show).min(total);
+                            // determine which row was clicked
                             let mut cmd_idx: Option<usize> = None;
                             if total > max_show && start > 0 {
                                 // line 1 is "↑"
                                 if off == 1 {
-                                    // clicked "↑" — ignore
+                                    // clicked "↑" — page selection up
+                                    self.slash_selected = sel.saturating_sub(max_show);
+                                    return;
                                 } else if off >= 2 && off < 2 + max_show {
                                     cmd_idx = Some(start + (off - 2));
+                                } else if off == 2 + max_show && end < total {
+                                    // clicked "↓" — page selection down
+                                    self.slash_selected = (sel + max_show).min(total - 1);
+                                    return;
                                 }
                             } else {
+                                if off == 1 + max_show && end < total {
+                                    // clicked "↓" — page selection down
+                                    self.slash_selected = (sel + max_show).min(total - 1);
+                                    return;
+                                }
                                 if off >= 1 && off < 1 + max_show {
                                     cmd_idx = Some(start + (off - 1));
                                 }
@@ -816,6 +879,20 @@ impl Tui {
                             self.slash_selected = (self.slash_selected + 1) % hits.len();
                             return;
                         }
+                        KeyCode::Enter => {
+                            // Commands that take no argument run straight away;
+                            // everything else opens the args dialog so required
+                            // arguments are collected first (same as clicking a
+                            // palette row). Running e.g. "/save" bare would only
+                            // yield a usage notice.
+                            let cmd = hits[self.slash_selected.min(hits.len() - 1)];
+                            if ZERO_ARG_SLASH.contains(&cmd) {
+                                // fall through to submit() below
+                            } else {
+                                self.open_slash_dialog(cmd);
+                                return;
+                            }
+                        }
                         KeyCode::Esc => {
                             self.input.clear();
                             self.input_cursor = 0;
@@ -887,7 +964,8 @@ impl Tui {
             self.tree = Some(FileTree::open(&cwd));
             if !self.pinned_files.is_empty() {
                 self.notice(format!(
-                    "📎 {} pinned file(s) still ride along in every turn",
+                    "{} {} pinned file(s) still ride along in every turn",
+                    icons::PINNED,
                     self.pinned_files.len()
                 ));
             }
@@ -953,7 +1031,7 @@ impl Tui {
             .to_string_lossy()
             .replace('\\', "/");
         self.pinned_files.push(path);
-        self.notice(format!("📎 pinned {rel} to context"));
+        self.notice(format!("{} pinned {rel} to context", crate::tui::icons::PINNED));
     }
 
     pub fn take_plan_request(&mut self) -> Option<String> {
@@ -1100,7 +1178,7 @@ impl Tui {
                     ok: None,
                 });
                 self.entries.push(ChatEntry::Notice(
-                    "⚠ workspace change — [y] approve · [n] decline · [a] approve all remaining"
+                    "{} workspace change — [y] approve · [n] decline · [a] approve all remaining"
                         .into(),
                 ));
                 self.scroll_from_bottom = 0;
@@ -1208,7 +1286,7 @@ impl Tui {
                 step
             ));
         } else {
-            self.notice("✓ plan complete.");
+            self.notice(format!("{} plan complete.", icons::SUCCESS));
             self.plan_executing = false;
             self.plan_entry_idx = None;
         }
@@ -1575,24 +1653,102 @@ async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
         }
         "/save" => {
             let name = rest.trim();
-            let path = if name.is_empty() { "session".to_string() } else { name.to_string() };
-            tui.notice(format!("saved session '{path}' (sessions/{path}.json)"));
+            match sanitize_session_name(name) {
+                Some(n) => {
+                    let dir = std::path::Path::new("sessions");
+                    let _ = std::fs::create_dir_all(dir);
+                    let path = dir.join(format!("{n}.json"));
+                    match app.session.save_to(&path) {
+                        Ok(()) => tui.notice(format!("saved session → {}", path.display())),
+                        Err(e) => tui.notice(format!("save failed: {e:#}")),
+                    }
+                }
+                None => tui.notice("usage: /save <name> (letters, digits, - and _ only)"),
+            }
         }
         "/load" => {
             let name = rest.trim();
-            if name.is_empty() {
-                tui.notice("usage: /load <name>");
-            } else {
-                tui.notice(format!("load '{name}' — use --resume {name} on next launch for full restore"));
+            match sanitize_session_name(name) {
+                Some(n) => {
+                    let path = std::path::Path::new("sessions").join(format!("{n}.json"));
+                    match crate::session::Session::load_from(&path) {
+                        Ok(s) => {
+                            app.session = s;
+                            // Rebuild transcript from loaded history.
+                            tui.entries.clear();
+                            for m in app.session.messages() {
+                                if m.role == "user" {
+                                    tui.entries.push(ChatEntry::User(m.content.clone()));
+                                } else if m.role == "assistant" {
+                                    tui.entries.push(ChatEntry::Assistant(m.content.clone()));
+                                }
+                            }
+                            tui.scroll_from_bottom = 0;
+                            tui.notice(format!("loaded session '{}' ({} messages)", n, app.session.messages().len()));
+                        }
+                        Err(e) => tui.notice(format!("load failed: {e:#}")),
+                    }
+                }
+                None => tui.notice("usage: /load <name>"),
             }
         }
         "/sessions" => {
-            tui.notice("sessions in ./sessions/ — use /load <name> or --resume");
+            let mut names: Vec<String> = std::fs::read_dir("sessions")
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| {
+                            let n = e.file_name().to_string_lossy().to_string();
+                            n.strip_suffix(".json").map(str::to_owned)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            if names.is_empty() {
+                tui.notice("no saved sessions — /save <name> creates one");
+            } else {
+                tui.notice(format!("{} saved session(s):", names.len()));
+                for n in names.iter().take(15) {
+                    tui.notice(format!("  {n}"));
+                }
+                tui.notice("load with /load <name>");
+            }
         }
-        "/fork" => tui.notice("forked session snapshot saved"),
+        "/fork" => {
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let name = rest.trim();
+            let n = if name.is_empty() {
+                format!("fork-{stamp}")
+            } else {
+                format!("{}-{}", sanitize_session_name(name).unwrap_or_else(|| "fork".into()), stamp)
+            };
+            let dir = std::path::Path::new("sessions");
+            let _ = std::fs::create_dir_all(dir);
+            let path = dir.join(format!("{n}.json"));
+            match app.session.save_to(&path) {
+                Ok(()) => tui.notice(format!("forked snapshot → {}", path.display())),
+                Err(e) => tui.notice(format!("fork failed: {e:#}")),
+            }
+        }
         "/export" => {
-            let fmt = rest.trim();
-            tui.notice(format!("export {fmt}: use REPL for file export"));
+            let fmt = rest.trim().to_ascii_lowercase();
+            let md = fmt != "txt";
+            let mut out = String::new();
+            for m in app.session.messages() {
+                if md {
+                    out.push_str(if m.role == "user" { "**You:** " } else { "**Govinda:** " });
+                } else {
+                    out.push_str(if m.role == "user" { "You: " } else { "Govinda: " });
+                }
+                out.push_str(&m.content);
+                out.push_str("\n\n");
+            }
+            let ext = if md { "md" } else { "txt" };
+            let path = std::path::Path::new("sessions").join(format!("export.{ext}"));
+            match std::fs::write(&path, out) {
+                Ok(()) => tui.notice(format!("exported {} message(s) → {}", app.session.messages().len(), path.display())),
+                Err(e) => tui.notice(format!("export failed: {e:#}")),
+            }
         }
         "/stats" => {
             let elapsed = app.stats.started.map_or(std::time::Duration::ZERO, |s| s.elapsed());
@@ -1675,13 +1831,146 @@ async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
                 _ => tui.notice("usage: /todo add|list|done|undo|rm|clear"),
             }
         }
-        "/diff" | "/apply" | "/reject" | "/review" => {
-            let is_empty = app.pending_edits.lock().unwrap().is_empty();
-            if is_empty { tui.notice("no staged edits"); }
-            else { tui.notice("staged edits present — /apply to commit, /reject to discard"); }
-            if lc == "/apply" { tui.notice("apply — staged edits committed (REPL)"); }
-            if lc == "/reject" { tui.notice("reject — staged edits discarded (REPL)"); }
-            if lc == "/review" { tui.notice("review — per-file summary in REPL"); }
+        "/diff" => {
+            let ops: Vec<crate::tools::EditOp> = match app.pending_edits.lock() {
+                Ok(q) => q.ops().to_vec(),
+                Err(_) => {
+                    tui.notice("staged-edit queue poisoned");
+                    return;
+                }
+            };
+            if ops.is_empty() {
+                tui.notice("no staged edits — nothing to diff");
+                return;
+            }
+            for (i, op) in ops.iter().enumerate().take(8) {
+                tui.notice(format!("{}. {}", i + 1, op.describe()));
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match crate::tools::staged_diff(&cwd, &ops) {
+                Ok(diff) if diff.trim().is_empty() => tui.notice("(edits cancel out — empty diff)"),
+                Ok(diff) => {
+                    for line in diff.lines().take(14) {
+                        tui.notice(line.to_string());
+                    }
+                    tui.notice(format!("(+{} more lines) … /apply to commit", diff.lines().count().saturating_sub(14)));
+                }
+                Err(e) => tui.notice(format!("cannot build diff: {e:#}")),
+            }
+        }
+        "/apply" => {
+            let ops: Vec<crate::tools::EditOp> = match app.pending_edits.lock() {
+                Ok(q) => q.ops().to_vec(),
+                Err(_) => {
+                    tui.notice("staged-edit queue poisoned");
+                    return;
+                }
+            };
+            if ops.is_empty() {
+                tui.notice("no staged edits to apply");
+                return;
+            }
+            // Group by path (first-seen order), validate all, then write atomically.
+            let mut grouped: Vec<(String, Vec<&crate::tools::EditOp>)> = Vec::new();
+            for op in &ops {
+                match grouped.iter_mut().find(|(p, _)| *p == op.path()) {
+                    Some((_, g)) => g.push(op),
+                    None => grouped.push((op.path().to_owned(), vec![op])),
+                }
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let mut writes: Vec<(std::path::PathBuf, String)> = Vec::new();
+            for (path, group) in &grouped {
+                // Read current content, apply this group's ops.
+                let full = match crate::tools::resolve_in(&cwd, path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tui.notice(format!("apply aborted (nothing written): {e:#}"));
+                        return;
+                    }
+                };
+                match std::fs::read_to_string(&full) {
+                    Ok(content) => {
+                        let refs: Vec<&crate::tools::EditOp> = group.iter().copied().collect();
+                        match crate::tools::apply_ops_to_content(&content, path, &refs) {
+                            Ok(updated) => writes.push((full, updated)),
+                            Err(e) => {
+                                tui.notice(format!("apply aborted (nothing written): {e:#}"));
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tui.notice(format!("apply aborted: cannot read '{path}': {e}"));
+                        return;
+                    }
+                }
+            }
+            let mut failed = 0;
+            for (full, content) in &writes {
+                if std::fs::write(full, content).is_err() {
+                    failed += 1;
+                }
+            }
+            if failed > 0 {
+                tui.notice(format!("{failed} write(s) failed — inspect files before retrying"));
+            } else if let Ok(mut q) = app.pending_edits.lock() {
+                let n = ops.len();
+                let f = grouped.len();
+                q.clear();
+                tui.notice(format!("{} applied {n} edit(s) across {f} file(s)", icons::CHECK));
+                if let Some(tree) = tui.tree.as_mut() {
+                    tree.mark_dirty();
+                }
+            }
+        }
+        "/reject" => {
+            let n = app.pending_edits.lock().map(|q| q.ops().len()).unwrap_or(0);
+            if let Ok(mut q) = app.pending_edits.lock() {
+                q.clear();
+            }
+            if n == 0 {
+                tui.notice("nothing staged to reject");
+            } else {
+                tui.notice(format!("discarded {n} staged edit(s); no files changed"));
+            }
+        }
+        "/review" => {
+            let ops: Vec<crate::tools::EditOp> = match app.pending_edits.lock() {
+                Ok(q) => q.ops().to_vec(),
+                Err(_) => {
+                    tui.notice("staged-edit queue poisoned");
+                    return;
+                }
+            };
+            if ops.is_empty() {
+                tui.notice("no staged edits — nothing to review");
+                return;
+            }
+            let mut grouped: Vec<(String, Vec<&crate::tools::EditOp>)> = Vec::new();
+            for op in &ops {
+                match grouped.iter_mut().find(|(p, _)| *p == op.path()) {
+                    Some((_, g)) => g.push(op),
+                    None => grouped.push((op.path().to_owned(), vec![op])),
+                }
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let mut total_add = 0usize;
+            let mut total_rm = 0usize;
+            tui.notice(format!("{} file(s) modified:", grouped.len()));
+            for (path, group) in &grouped {
+                let owned: Vec<crate::tools::EditOp> = group.iter().map(|op| (*op).clone()).collect();
+                match crate::tools::staged_diff(&cwd, &owned) {
+                    Ok(diff) => {
+                        let (a, r) = crate::diff::count_changes(&diff);
+                        total_add += a;
+                        total_rm += r;
+                        tui.notice(format!("  {path}: +{a}/-{r}"));
+                    }
+                    Err(e) => tui.notice(format!("  {path}: diff failed ({e:#})")),
+                }
+            }
+            tui.notice(format!("total +{total_add}/-{total_rm} — /apply to commit, /reject to discard"));
         }
         "/scan" => {
             tui.notice("scanning workspace…");
@@ -1693,14 +1982,76 @@ async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
         }
         "/project" => {
             let arg = rest.trim();
-            if arg.is_empty() { tui.notice("project memory: /project show | set test|build <cmd> | clear"); }
-            else { tui.notice(format!("project {arg} — use REPL for full project memory")); }
+            if arg.is_empty() {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                match std::fs::read_to_string(cwd.join(".govinda_project.json")) {
+                    Ok(raw) => {
+                        for line in raw.lines().take(8) {
+                            tui.notice(line.to_string());
+                        }
+                    }
+                    Err(_) => tui.notice("no project memory yet — /project set test|build <cmd>"),
+                }
+            } else if let Some((verb, r)) = arg.split_once(char::is_whitespace) {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let path = cwd.join(".govinda_project.json");
+                let mut map: serde_json::Value = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                match verb {
+                    "set" => {
+                        if let Some((key, cmd)) = r.split_once(char::is_whitespace) {
+                            map[key.trim()] = serde_json::json!(cmd.trim());
+                            match serde_json::to_string_pretty(&map).map(|j| std::fs::write(&path, j)) {
+                                Ok(Ok(())) => tui.notice(format!("project {key} = '{cmd}'")),
+                                _ => tui.notice("could not write project memory"),
+                            }
+                        } else {
+                            tui.notice("usage: /project set test|build <cmd>");
+                        }
+                    }
+                    "clear" => {
+                        if let Some(obj) = map.as_object_mut() {
+                            obj.remove(r.trim());
+                        }
+                        match serde_json::to_string_pretty(&map).map(|j| std::fs::write(&path, j)) {
+                            Ok(Ok(())) => tui.notice(format!("cleared project {r}")),
+                            _ => tui.notice("could not write project memory"),
+                        }
+                    }
+                    _ => tui.notice("usage: /project show | set test|build <cmd> | clear test|build"),
+                }
+            } else {
+                tui.notice("usage: /project show | set test|build <cmd> | clear test|build");
+            }
         }
         "/quit" | "/exit" | "/q" => { tui.quit = true; tui.notice("quitting…"); },
         "/clear" | "/reset" => { app.session.clear(); tui.entries.clear(); tui.notice("cleared"); },
-        "/help" => tui.notice("see /help output above"),
+        "/help" => {
+            for l in [
+                "keys: Tab focus · ↑/↓ palette · Enter opens args dialog · F5 refresh",
+                "      dialog: type args · Enter execute · Esc cancel · click outside closes",
+                "type \"/\" in the input to browse all 37 commands",
+            ] {
+                tui.notice(l.to_string());
+            }
+        }
         _ => tui.notice(format!("executed {line}")),
     }
+}
+
+/// Session-name sanitizer for /save, /load, /fork: lowercase word chars and
+/// dashes only; anything else (paths, dots) is rejected.
+fn sanitize_session_name(raw: &str) -> Option<String> {
+    let n = raw.trim();
+    if n.is_empty() || n.len() > 64 {
+        return None;
+    }
+    if !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    Some(n.to_ascii_lowercase())
 }
 
 /// One non-interactive model call that decomposes a task into steps.
@@ -2034,6 +2385,72 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    fn type_str(t: &mut Tui, s: &str) {
+        for c in s.chars() {
+            t.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn zero_arg_command_enter_runs_directly() {
+        let mut t = Tui::new();
+        type_str(&mut t, "/history");
+        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(t.slash_dialog.is_none(), "no dialog for zero-arg command");
+        assert_eq!(t.take_pending_slash().as_deref(), Some("/history"));
+    }
+
+    #[test]
+    fn exact_arg_command_enter_opens_dialog() {
+        let mut t = Tui::new();
+        type_str(&mut t, "/save");
+        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Bare "/save" must NOT execute (it would only print a usage notice);
+        // the args dialog collects the name instead.
+        let d = t.slash_dialog.as_ref().expect("dialog should open for /save");
+        assert_eq!(d.command, "/save");
+        assert!(t.take_pending_slash().is_none());
+        // Confirming with empty arg queues the bare command.
+        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(t.slash_dialog.is_none());
+        assert_eq!(t.take_pending_slash().as_deref(), Some("/save"));
+    }
+
+    #[test]
+    fn partial_command_enter_opens_dialog() {
+        let mut t = Tui::new();
+        type_str(&mut t, "/sav");
+        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let d = t.slash_dialog.as_ref().expect("dialog should open");
+        assert_eq!(d.command, "/save");
+    }
+
+    #[test]
+    fn dialog_accepts_args_and_confirms() {
+        let mut t = Tui::new();
+        type_str(&mut t, "/sav");
+        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_str(&mut t, "mysession");
+        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(t.slash_dialog.is_none());
+        assert_eq!(t.take_pending_slash().as_deref(), Some("/save mysession"));
+    }
+
+    #[test]
+    fn navigated_palette_enter_opens_selected() {
+        let mut t = Tui::new();
+        type_str(&mut t, "/");
+        // Navigate down to "/model" (index 6) — an arg-taking command.
+        for _ in 0..6 {
+            t.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let d = t.slash_dialog.as_ref().expect("dialog opens on navigated enter");
+        let hits = crate::tui::widgets::input_bar::filtered("/");
+        assert_eq!(d.command, hits[6]);
+        assert_eq!(d.command, "/model");
+    }
+
     #[test]
     fn mode_transitions_follow_spec() {
         let mut m = AppMode::Normal;
@@ -2253,10 +2670,10 @@ mod tests {
         assert!(input_bar::filtered("/hel").contains(&"/help"));
         assert!(input_bar::filtered("/to").contains(&"/todo"));
         assert!(input_bar::filtered("/xyz").is_empty());
-        let lines = input_bar::palette_lines("/", 0);
+        let lines = input_bar::palette_lines("/", 0, None);
         assert!(lines.len() > 5, "palette should have header + rows");
         // selected highlighting
-        let lines2 = input_bar::palette_lines("/hel", 1);
+        let lines2 = input_bar::palette_lines("/hel", 1, Some(1));
         assert!(lines2.iter().any(|l| l.spans.iter().any(|s| s.content.contains("/help"))));
     }
 
@@ -2286,6 +2703,10 @@ mod tests {
             };
             tui.set_input(input.clone());
             tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            // Arg-taking commands open the args dialog on Enter — confirm it.
+            if tui.slash_dialog.is_some() {
+                tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
             let has_notice = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_)));
             let pending = tui.take_pending_slash().is_some();
             let is_local = has_notice || tui.quit || tui.take_clear_request() || pending;

@@ -47,12 +47,12 @@ pub fn draw(f: &mut Frame<'_>, tui: &Tui, info: &StatusInfo) {
     if let Some(rect) = layout.tree
         && let Some(tree) = &tui.tree
     {
-        render_tree(f, rect, tree, tui.focus == Focus::Tree, " PROJECT ");
+        render_tree(f, rect, tree, tui.focus == Focus::Tree, " PROJECT ", tui.tree_hover);
     }
     if let Some(rect) = layout.tools {
         if let Some(tree) = &tui.tree {
             // Right sidebar now hosts file explorer (replaced tools panel)
-            render_tree(f, rect, tree, tui.focus == Focus::Tree, " FILES ");
+            render_tree(f, rect, tree, tui.focus == Focus::Tree, " FILES ", tui.tree_hover);
         } else {
             render_explorer_placeholder(f, rect);
         }
@@ -106,14 +106,14 @@ fn render_tree(
     tree: &crate::tui::widgets::file_tree::FileTree,
     focused: bool,
     title: &str,
+    hovered: Option<usize>,
 ) {
     let t = theme::active();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {title} "))
+        .title(format!(" {} {} ", super::icons::TREE_TITLE, title.trim()))
         .border_style(t.border_style(focused))
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title_style(Style::default().fg(t.accent_secondary).add_modifier(Modifier::BOLD))
+        .title_style(Style::default().fg(t.accent_secondary).bg(t.bg_primary).add_modifier(Modifier::BOLD))
         .style(t.sidebar_bg());
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -121,7 +121,7 @@ fn render_tree(
     // Tell the tree how tall it can draw so scrolling stays exact.
     tree.set_view_height(inner.height);
     f.render_widget(
-        Paragraph::new(tree.render_lines_with_width(focused, inner.width)),
+        Paragraph::new(tree.render_lines_hover(focused, inner.width, hovered)),
         inner,
     );
 }
@@ -130,10 +130,9 @@ fn render_explorer_placeholder(f: &mut Frame<'_>, area: Rect) {
     let t = theme::active();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" FILES ")
+        .title(format!(" {} FILES ", super::icons::FILES_TITLE))
         .border_style(t.border_style(false))
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title_style(Style::default().fg(t.accent_secondary).add_modifier(Modifier::BOLD))
+        .title_style(Style::default().fg(t.accent_secondary).bg(t.bg_primary).add_modifier(Modifier::BOLD))
         .style(t.sidebar_bg());
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -195,13 +194,16 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
         );
         // top gutter (row 0): subtle hint when idle — show context status
         let gutter_line = if tui.busy {
+            // animated pulse: cycling braille spinner + LIVE chip
+            let frame = tick_frame(4);
+            let dots = ["   ", ".  ", ".. ", "..."][frame];
             Line::from(vec![
                 ratatui::text::Span::styled(
-                    "  ⏺ streaming…  ",
+                    format!("  {} streaming{dots}  ", super::icons::LIVE),
                     Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::styled(
-                    format!("{} pinned", tui.pinned_files.len()),
+                    format!("{} {} pinned", super::icons::PINNED, tui.pinned_files.len()),
                     Style::default().fg(t.text_muted).bg(t.bg_tertiary),
                 ),
             ])
@@ -234,7 +236,7 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
     if focus_input && tui.input.starts_with('/') && !tui.input.contains(' ') {
         let hits = input_bar::filtered(&tui.input);
         if !hits.is_empty() {
-            let lines = input_bar::palette_lines(&tui.input, tui.slash_selected);
+            let lines = input_bar::palette_lines(&tui.input, tui.slash_selected, tui.palette_hover);
             if !lines.is_empty() {
                 let pal_h = (lines.len() as u16 + 2).min(18);
                 let pal_w = area.width.saturating_sub(2).min(56);
@@ -249,9 +251,8 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
                 };
                 let pal_block = Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(t.accent_primary).bg(t.bg_tertiary))
-                    .border_type(ratatui::widgets::BorderType::Rounded)
-                    .title(" ⌘ COMMANDS ")
+                    .border_style(Style::default().fg(t.border_focus).bg(t.bg_tertiary))
+                    .title(format!(" {} COMMANDS ", super::icons::COMMANDS_TITLE))
                     .title_style(
                         Style::default()
                             .fg(t.accent_primary)
@@ -278,9 +279,8 @@ fn render_slash_dialog(f: &mut Frame<'_>, area: Rect, dialog: &crate::tui::app::
     let rect = Rect::new(x, y, w.min(area.width.saturating_sub(2)), h.min(area.height.saturating_sub(2)));
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.accent_primary).bg(t.bg_tertiary))
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(format!(" {} ", dialog.command))
+        .border_style(Style::default().fg(t.border_focus).bg(t.bg_tertiary))
+        .title(format!(" {} {} ", super::icons::command(&dialog.command), dialog.command))
         .title_style(Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(t.bg_tertiary));
     let inner = block.inner(rect);
@@ -337,4 +337,14 @@ fn place_cursor(f: &mut Frame<'_>, x: u16, y: u16, input: &str, cursor_chars: us
     let before: String = input.chars().take(cursor_chars).collect();
     let col = x.saturating_add(before.width().min(200) as u16);
     f.set_cursor_position((col, y));
+}
+
+/// Frame counter for subtle animations — driven by the 250ms event-loop tick.
+pub fn tick_frame(modulo: usize) -> usize {
+    if modulo == 0 {
+        return 0;
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| (d.as_millis() / 250) as usize % modulo)
 }

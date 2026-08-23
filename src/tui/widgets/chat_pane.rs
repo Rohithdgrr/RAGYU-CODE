@@ -13,10 +13,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::super::theme;
+use super::super::{icons, theme};
 
-/// Width used for code-block gutters.
-const CODE_GUTTER: usize = 2;
 
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
@@ -719,7 +717,7 @@ fn user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(4) as usize;
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            " YOU ",
+            format!(" {} YOU ", icons::USER),
             Style::default()
                 .fg(t.text_inverse)
                 .bg(t.accent_secondary)
@@ -745,7 +743,7 @@ fn assistant_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(4) as usize;
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            " GOVINDA ",
+            format!(" {} GOVINDA ", icons::ASSISTANT),
             Style::default()
                 .fg(t.text_inverse)
                 .bg(t.accent_primary)
@@ -842,42 +840,94 @@ fn assistant_lines(text: &str, width: u16) -> Vec<Line<'static>> {
             }
             Segment::Code { lang, body } => {
                 let lang_label = lang.unwrap_or("code");
-                // chip-style header
-                let header_style = Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD);
+                let is_shell = matches!(
+                    lang.map(str::to_ascii_lowercase).as_deref(),
+                    Some("sh") | Some("bash") | Some("zsh") | Some("shell") | Some("console")
+                        | Some("terminal") | Some("cmd") | Some("powershell") | Some("ps1") | Some("pwsh"),
+                );
+                // Icon: terminal glyph for shell blocks, code glyph otherwise.
+                let block_icon = if is_shell {
+                    icons::COMMANDS_TITLE
+                } else {
+                    icons::FILE_CODE
+                };
+                let label = format!(" {} {} ", block_icon, lang_label);
                 let border = Style::default().fg(t.border_default).bg(t.bg_secondary);
-                let bar = "─".repeat(inner.saturating_sub(lang_label.len() + 8).min(48));
+                let label_style = Style::default()
+                    .fg(if is_shell { t.accent_success } else { t.accent_primary })
+                    .bg(t.bg_secondary)
+                    .add_modifier(Modifier::BOLD);
+                let body_bg = Style::default().bg(t.bg_secondary);
+
+                // Precise box: margin "  " + full-width panel of W = inner cols.
+                // top:    ┌─ LABEL ───…──┐
+                // rows:   │ NN content…  │   (padded so the glass surface is solid)
+                // bottom: └──────────────┘
+                let w = inner.max(16);
+                let label_w = UnicodeWidthStr::width(label.as_str());
+                let fill_top = w.saturating_sub(4 + label_w); // "┌─" + "─┐"
                 lines.push(Line::from(vec![
                     Span::styled("  ", t.text()),
                     Span::styled("┌─", border),
-                    Span::styled(format!(" {} ", lang_label), header_style),
-                    Span::styled(bar, border),
+                    Span::styled(label, label_style),
+                    Span::styled(format!("{:─<width$}", "", width = fill_top), border),
                     Span::styled("┐", border),
                 ]));
+
+                let code_area = w.saturating_sub(8); // │ + space + NNN + space … content … space │
                 for (i, raw) in body.trim_end_matches('\n').lines().enumerate() {
-                    for (j, l) in wrap(raw, inner - CODE_GUTTER - 3).into_iter().enumerate() {
-                        let gutter = if j == 0 {
-                            format!("{:>3} │ ", i + 1)
-                        } else {
-                            "      │ ".to_owned()
-                        };
-                        // subtle syntax tint: keywords vs rest
-                        let fg = if l.trim_start().starts_with("//") || l.trim_start().starts_with('#') {
-                            t.syntax_comment
-                        } else if lang.map(|l| l.contains("java") || l.contains("rs") || l.contains("py")).unwrap_or(false) {
-                            t.syntax_type
-                        } else {
-                            t.text_primary
-                        };
-                        lines.push(Line::from(vec![
+                    for (j, l) in wrap(raw, code_area).into_iter().enumerate() {
+                        let num = if j == 0 { format!("{i:>3} ") } else { "    ".to_owned() };
+                        let text_w = UnicodeWidthStr::width(l.as_str());
+                        let pad = code_area.saturating_sub(4 + text_w);
+
+                        // Terminal command detection: "$ cmd", "> cmd", "PS>" prompts.
+                        let trimmed = l.trim_start();
+                        let is_cmd = trimmed.starts_with("$ ")
+                            || trimmed.starts_with("> ")
+                            || trimmed.starts_with("PS>");
+                        let mut spans = vec![
                             Span::styled("  ", t.text()),
-                            Span::styled(gutter, Style::default().fg(t.text_muted).bg(t.bg_secondary)),
-                            Span::styled(l, Style::default().fg(fg).bg(t.bg_secondary)),
-                        ]));
+                            Span::styled("│ ", border),
+                            Span::styled(num, Style::default().fg(t.text_muted).bg(t.bg_secondary)),
+                        ];
+                        if is_cmd {
+                            // split prompt symbol from the command text
+                            let sym_end = trimmed
+                                .find(' ')
+                                .map_or(trimmed.len(), |p| p + 1);
+                            let (sym, rest_all) = trimmed.split_at(sym_end.min(trimmed.len()));
+                            let indent_ws = l.len() - trimmed.len();
+                            if indent_ws > 0 {
+                                spans.push(Span::styled(" ".repeat(indent_ws), body_bg));
+                            }
+                            spans.push(Span::styled(
+                                sym.to_owned(),
+                                Style::default().fg(t.accent_success).bg(t.bg_secondary).add_modifier(Modifier::BOLD),
+                            ));
+                            spans.push(Span::styled(
+                                format!("{rest_all}{:width$}", "", width = pad),
+                                Style::default().fg(t.text_primary).bg(t.bg_secondary),
+                            ));
+                        } else {
+                            let fg = if l.trim_start().starts_with("//") || l.trim_start().starts_with('#') {
+                                t.syntax_comment
+                            } else {
+                                t.text_primary
+                            };
+                            spans.push(Span::styled(
+                                format!("{l}{:width$}", "", width = pad),
+                                Style::default().fg(fg).bg(t.bg_secondary),
+                            ));
+                        }
+                        spans.push(Span::styled(" │", border));
+                        lines.push(Line::from(spans));
                     }
                 }
+
                 lines.push(Line::from(vec![
                     Span::styled("  ", t.text()),
-                    Span::styled(format!("└{}", "─".repeat(inner.min(60) + 2)), border),
+                    Span::styled(format!("└{:─<width$}┘", "", width = w.saturating_sub(2)), border),
                 ]));
                 lines.push(Line::default());
             }
@@ -904,9 +954,9 @@ fn tool_lines(name: &str, args: &str, ok: Option<bool>) -> Vec<Line<'static>> {
         s
     };
     let (icon, status_style) = match ok {
-        None => ("⏳", t.warning()),
-        Some(true) => ("✓", t.success()),
-        Some(false) => ("✗", t.error()),
+        None => (icons::PENDING, t.warning()),
+        Some(true) => (icons::CHECK, t.success()),
+        Some(false) => (icons::CROSS, t.error()),
     };
     vec![
         Line::from(vec![
@@ -939,7 +989,7 @@ fn checklist_lines(title: &str, steps: &[(String, bool)], width: u16) -> Vec<Lin
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
-                " PLAN ",
+                format!(" {} PLAN ", icons::MODE_PLAN),
                 Style::default()
                     .fg(t.text_inverse)
                     .bg(t.accent_primary)
@@ -967,7 +1017,7 @@ fn checklist_lines(title: &str, steps: &[(String, bool)], width: u16) -> Vec<Lin
     let inner = width.saturating_sub(6) as usize;
     for (i, (step, is_done)) in steps.iter().enumerate() {
         let (box_char, style) = if *is_done {
-            ("✓", t.success())
+            (icons::CHECK, t.success())
         } else {
             ("·", t.text_dim())
         };
@@ -986,12 +1036,14 @@ fn checklist_lines(title: &str, steps: &[(String, bool)], width: u16) -> Vec<Lin
 
 fn notice_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let t = theme::active();
-    wrap(text, width.saturating_sub(2) as usize)
+    wrap(text, width.saturating_sub(6) as usize)
         .into_iter()
-        .map(|l| Line::styled(
-            format!("  · {l}"),
-            Style::default().fg(t.text_muted),
-        ))
+        .map(|l| {
+            Line::from(vec![
+                Span::styled(format!("  {} ", icons::INFO), Style::default().fg(t.accent_primary)),
+                Span::styled(l, Style::default().fg(t.text_muted)),
+            ])
+        })
         .chain(std::iter::once(Line::default()))
         .collect()
 }
@@ -1025,7 +1077,7 @@ pub fn build_lines(
                     .map_or(0usize, |d| (d.subsec_millis() / 100 % 10) as usize)];
             lines.push(Line::from(vec![
                 Span::styled(
-                    " GOVINDA ",
+                    format!(" {} GOVINDA ", icons::ASSISTANT),
                     Style::default()
                         .fg(t.text_inverse)
                         .bg(t.accent_primary)
@@ -1050,7 +1102,7 @@ pub fn build_lines(
             let t = theme::active();
             lines.push(Line::from(vec![
                 Span::styled(
-                    " GOVINDA ",
+                    format!(" {} GOVINDA ", icons::ASSISTANT),
                     Style::default()
                         .fg(t.text_inverse)
                         .bg(t.accent_primary)

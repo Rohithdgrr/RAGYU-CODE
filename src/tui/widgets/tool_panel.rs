@@ -5,7 +5,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::super::theme;
+use super::super::{icons, theme};
 use crate::tui::widgets::chat_pane::ChatEntry;
 
 /// One registry row.
@@ -50,12 +50,12 @@ pub fn build_lines(
     for tool in tools {
         let (icon, icon_style) = if tool.enabled {
             if tool.gated {
-                ("🔒", t.accent_warning)
+                (icons::LOCKED, t.accent_warning)
             } else {
-                ("●", t.accent_success)
+                (icons::SUCCESS, t.accent_success)
             }
         } else {
-            ("○", t.text_muted)
+            (icons::CHECK, t.text_muted)
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -99,14 +99,14 @@ pub fn build_lines(
         let mut summary = Vec::new();
         if done > 0 {
             summary.push(Span::styled(
-                format!("✓ {done}"),
+                format!("{} {done}", icons::CHECK),
                 t.success(),
             ));
         }
         if failed > 0 {
             summary.push(Span::raw(" "));
             summary.push(Span::styled(
-                format!("✗ {failed}"),
+                format!("{} {failed}", icons::CROSS),
                 t.error(),
             ));
         }
@@ -122,9 +122,9 @@ pub fn build_lines(
         // Recent calls
         for a in activity.iter().rev().take(8) {
             let (icon, style) = match a.ok {
-                None => ("⏳", t.warning()),
-                Some(true) => ("✓", t.success()),
-                Some(false) => ("✗", t.error()),
+                None => (icons::PENDING, t.warning()),
+                Some(true) => (icons::CHECK, t.success()),
+                Some(false) => (icons::CROSS, t.error()),
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {icon}"), style),
@@ -145,9 +145,9 @@ pub fn build_lines(
     lines.push(Line::styled("─".repeat(20), Style::default().fg(t.border_default)));
 
     for (icon, label, value) in [
-        ("⟳", "Turns", turns.to_string()),
+        (icons::TURNS, "Turns", turns.to_string()),
         ("!", "Errors", errors.to_string()),
-        ("⚡", "Avg", format!("{avg_latency_ms}ms")),
+        (icons::LATENCY, "Avg", format!("{avg_latency_ms}ms")),
     ] {
         lines.push(Line::from(vec![
             Span::styled(
