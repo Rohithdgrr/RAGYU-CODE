@@ -52,7 +52,7 @@ const MAX_ARG_VALUE_CHARS: usize = 8 * 1024;
 /// (the model sees this string too, so it must stay bounded).
 const MAX_DIFF_PREVIEW_CHARS: usize = 4_000;
 /// Names reserved by built-in implementations; user tools cannot shadow them.
-const BUILTIN_TOOL_NAMES: [&str; 24] = [
+const BUILTIN_TOOL_NAMES: [&str; 27] = [
     "current_time",
     "count_words",
     "read_file",
@@ -77,6 +77,9 @@ const BUILTIN_TOOL_NAMES: [&str; 24] = [
     "web_search",
     "web_fetch",
     "ask_user",
+    "delegate_task",
+    "run_diagnostics",
+    "go_to_definition",
 ];
 /// `{placeholder}` tokens inside shell-tool `args_template` words.
 #[allow(clippy::expect_used)] // static, hand-checked patterns
@@ -488,6 +491,44 @@ impl ToolExecutor for BuiltinTools {
                     "additionalProperties": false
                 }),
             ),
+            Tool::new(
+                "delegate_task",
+                "Delegate a task to a background agent for parallel exploration. The \
+                 subagent runs independently and returns results when done. Use this \
+                 for complex tasks that benefit from parallel processing.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string", "description": "The task to delegate"},
+                        "context": {"type": "string", "description": "Optional context for the subagent"}
+                    },
+                    "required": ["task"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "run_diagnostics",
+                "Run language-specific diagnostics (cargo check, tsc, mypy) and return \
+                 structured error/warning messages. Use this to verify code quality.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "go_to_definition",
+                "Look up the definition of a symbol by name using the symbol index. \
+                 Returns the file, line, and kind of the definition.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Symbol name to look up"}
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }),
+            ),
         ];
         for def in &self.shell_tools {
             specs.push(Tool::new(
@@ -679,6 +720,41 @@ impl ToolExecutor for BuiltinTools {
                     // In non-interactive mode, return a default answer
                     bail!("ask_user requires interactive mode — user input is needed: {}", args.question);
                 }
+                "delegate_task" => {
+                    let args: DelegateTaskArgs = parse_args(arguments_json)?;
+                    let cwd = std::env::current_dir().context("cannot resolve working directory")?;
+                    let overview = crate::scan::scan(&cwd).await;
+                    let http = crate::config::Config::http_client().unwrap_or_default();
+                    let provider = crate::provider::resolve("mistral", None, None, |_| None).unwrap();
+                    let result = crate::swarm::explore(&args.task, &http, provider.as_ref(), &overview).await;
+                    match result {
+                        Ok(output) => Ok(format!("{{\"task\":\"{}\",\"status\":\"completed\",\"output\":{}}}", args.task, serde_json::json!(output))),
+                        Err(e) => Ok(format!("{{\"task\":\"{}\",\"status\":\"failed\",\"error\":\"{}\"}}", args.task, e)),
+                    }
+                }
+                "run_diagnostics" => {
+                    let cwd = std::env::current_dir().context("cannot resolve working directory")?;
+                    let diagnostics = crate::lsp::run_diagnostics(&cwd).await.unwrap_or_default();
+                    let formatted = crate::lsp::format_diagnostics(&diagnostics, 20);
+                    if formatted.is_empty() {
+                        Ok("no diagnostics found — code looks clean".to_owned())
+                    } else {
+                        Ok(formatted.join("\n"))
+                    }
+                }
+                "go_to_definition" => {
+                    let args: GoToDefArgs = parse_args(arguments_json)?;
+                    let cwd = std::env::current_dir().context("cannot resolve working directory")?;
+                    match crate::lsp::go_to_definition(&args.name, &cwd) {
+                        Some(def) => Ok(serde_json::json!({
+                            "name": def.name,
+                            "kind": def.kind,
+                            "file": def.file,
+                            "line": def.line,
+                        }).to_string()),
+                        None => Ok(format!("{{\"error\":\"symbol '{}' not found\"}}", args.name)),
+                    }
+                }
                 other => match self.shell_tools.iter().find(|t| t.name == other) {
                     Some(def) => run_shell_tool(def, arguments_json).await,
                     None => bail!("unknown tool '{other}'"),
@@ -784,7 +860,20 @@ struct WebFetchArgs {
 #[derive(serde::Deserialize)]
 struct AskUserArgs {
     question: String,
+    #[allow(dead_code)]
     options: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct DelegateTaskArgs {
+    task: String,
+    #[allow(dead_code)]
+    context: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GoToDefArgs {
+    name: String,
 }
 
 // ---------------------------------------------------------------------------

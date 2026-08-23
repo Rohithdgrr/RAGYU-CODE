@@ -2,7 +2,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
@@ -63,6 +63,11 @@ pub fn draw(f: &mut Frame<'_>, tui: &Tui, info: &StatusInfo) {
     // Centered dialog for slash command args (after clicking palette)
     if let Some(dialog) = &tui.slash_dialog {
         render_slash_dialog(f, f.area(), dialog);
+    }
+
+    // Cost dashboard modal (Ctrl+I)
+    if tui.show_cost_dashboard {
+        render_cost_dashboard(f, f.area(), info);
     }
 }
 
@@ -267,6 +272,72 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
                 f.render_widget(Paragraph::new(slice).style(Style::default().bg(t.bg_tertiary)), pal_inner);
             }
         }
+    }
+
+    // — @-mention file picker dropdown —
+    if tui.at_picker_active && !tui.at_picker_files.is_empty() {
+        let files = &tui.at_picker_files;
+        let sel = tui.at_picker_selected;
+        let total = files.len();
+        let max_show = 8.min(total);
+        let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
+        let end = (start + max_show).min(total);
+
+        let mut picker_lines: Vec<Line<'static>> = Vec::new();
+        // Header
+        picker_lines.push(Line::styled(
+            format!(" {} file(s) matching '@{}' ", total, tui.at_picker_query),
+            Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
+        ));
+        // Files
+        for idx in start..end {
+            let is_sel = idx == sel;
+            let file = &files[idx];
+            let marker = if is_sel { "▸" } else { " " };
+            let bg = if is_sel { t.bg_hover } else { t.bg_tertiary };
+            let fg = if is_sel { t.accent_primary } else { t.text_secondary };
+            let mut style = Style::default().fg(fg).bg(bg);
+            if is_sel {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            picker_lines.push(Line::from(vec![
+                ratatui::text::Span::styled(format!("{marker} "), Style::default().fg(t.accent_primary).bg(bg)),
+                ratatui::text::Span::styled(format!(" {} ", super::icons::FILE_CODE), Style::default().fg(t.text_muted).bg(bg)),
+                ratatui::text::Span::styled(file.clone(), style),
+            ]));
+        }
+        if end < total {
+            picker_lines.push(Line::styled(
+                format!("  {} more", total - end),
+                Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+            ));
+        }
+        // Render
+        let picker_h = (picker_lines.len() as u16 + 2).min(12);
+        let picker_w = area.width.saturating_sub(2).min(50);
+        let picker_x = area.x;
+        let picker_y = area.y.saturating_sub(picker_h);
+        let picker_rect = Rect {
+            x: picker_x,
+            y: picker_y.max(1),
+            width: picker_w,
+            height: picker_h,
+        };
+        let picker_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.accent_secondary).bg(t.bg_tertiary))
+            .title(format!(" {} FILES ", super::icons::FILES_TITLE))
+            .title_style(
+                Style::default()
+                    .fg(t.accent_secondary)
+                    .bg(t.bg_tertiary)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .style(Style::default().bg(t.bg_tertiary));
+        let picker_inner = picker_block.inner(picker_rect);
+        f.render_widget(picker_block, picker_rect);
+        let slice: Vec<Line<'static>> = picker_lines.into_iter().take(picker_inner.height as usize).collect();
+        f.render_widget(Paragraph::new(slice).style(Style::default().bg(t.bg_tertiary)), picker_inner);
     }
 }
 
@@ -488,6 +559,94 @@ fn place_cursor(f: &mut Frame<'_>, x: u16, y: u16, input: &str, cursor_chars: us
     let before: String = input.chars().take(cursor_chars).collect();
     let col = x.saturating_add(before.width().min(200) as u16);
     f.set_cursor_position((col, y));
+}
+
+/// Renders the usage/cost dashboard modal (Ctrl+I).
+fn render_cost_dashboard(f: &mut Frame<'_>, area: Rect, info: &StatusInfo) {
+    let t = theme::active();
+    let w: u16 = 56;
+    let h: u16 = 18;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect::new(x, y, w.min(area.width.saturating_sub(2)), h.min(area.height.saturating_sub(2)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border_focus).bg(t.bg_tertiary))
+        .title(format!(" {} USAGE & COST ", super::icons::INFO))
+        .title_style(Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(t.bg_tertiary));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let muted = Style::default().fg(t.text_muted).bg(t.bg_tertiary);
+    let label = Style::default().fg(t.text_secondary).bg(t.bg_tertiary);
+    let value = Style::default().fg(t.text_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD);
+    let accent = Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD);
+
+    // Token usage
+    lines.push(Line::from(vec![
+        Span::styled(" Token Usage", accent),
+    ]));
+    lines.push(Line::default());
+
+    let used_s = format!("{:.1}k", info.tokens as f64 / 1000.0);
+    let total_s = format!("{:.1}k", info.budget as f64 / 1000.0);
+    let pct = if info.budget > 0 { info.tokens * 100 / info.budget } else { 0 };
+
+    lines.push(Line::from(vec![
+        Span::styled("  Used:     ", label),
+        Span::styled(used_s, value.clone()),
+        Span::styled(" / ", muted.clone()),
+        Span::styled(total_s, value.clone()),
+        Span::styled(format!(" ({pct}%)"), if pct > 80 { Style::default().fg(t.accent_error).bg(t.bg_tertiary).add_modifier(Modifier::BOLD) } else { value.clone() }),
+    ]));
+
+    // Progress bar
+    let bar_len = 30;
+    let filled = ((pct as usize).min(100) * bar_len) / 100;
+    let bar = "█".repeat(filled) + &"░".repeat(bar_len - filled);
+    let bar_fg = if pct > 80 { t.accent_error } else if pct > 60 { t.accent_warning } else { t.accent_success };
+    lines.push(Line::from(vec![
+        Span::styled("             ", label),
+        Span::styled(bar, Style::default().fg(bar_fg).bg(t.bg_tertiary)),
+    ]));
+
+    lines.push(Line::default());
+
+    // Session stats
+    lines.push(Line::from(vec![
+        Span::styled(" Session Stats", accent),
+    ]));
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("  Turns:     ", label),
+        Span::styled(format!("{}", info.turns), value.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Errors:    ", label),
+        Span::styled(format!("{}", info.errors), if info.errors > 0 { Style::default().fg(t.accent_error).bg(t.bg_tertiary) } else { value.clone() }),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Avg Latency: ", label),
+        Span::styled(format!("{}ms", info.avg_latency_ms), value.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Provider:  ", label),
+        Span::styled(info.provider.clone(), value.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Model:     ", label),
+        Span::styled(info.model.clone(), value),
+    ]));
+
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("  Esc ", Style::default().fg(t.text_secondary).bg(t.bg_secondary).add_modifier(Modifier::BOLD)),
+        Span::styled(" close", muted),
+    ]));
+
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)), inner);
 }
 
 /// Frame counter for subtle animations — driven by the 250ms event-loop tick.

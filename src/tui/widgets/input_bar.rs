@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Padding};
 use super::super::app::AppMode;
 use super::super::{icons, theme};
 use crate::commands;
+use std::path::PathBuf;
 
 /// Returns the slash command that `input` is a prefix of, if any.
 pub fn completion(input: &str) -> Option<&'static str> {
@@ -41,6 +42,85 @@ pub fn filtered(input: &str) -> Vec<&'static str> {
         .copied()
         .filter(|c| c.starts_with(token.as_str()))
         .collect()
+}
+
+/// Checks if the input has an active @-mention (cursor is after @).
+/// Returns the query string after @.
+pub fn at_mention_query(input: &str, cursor: usize) -> Option<String> {
+    let text: String = input.chars().take(cursor).collect();
+    // Find the last @ that isn't inside a word (preceded by space or at start)
+    let chars: Vec<char> = text.chars().collect();
+    let mut last_at = None;
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '@' {
+            // Check if it's at start or preceded by whitespace
+            if i == 0 || chars[i - 1].is_whitespace() {
+                last_at = Some(i);
+            }
+        }
+    }
+    if let Some(at_pos) = last_at {
+        let query: String = chars[at_pos + 1..].iter().collect();
+        // Don't show picker if query contains space (user moved past the mention)
+        if !query.contains(' ') {
+            return Some(query);
+        }
+    }
+    None
+}
+
+/// Searches workspace files matching the @-mention query.
+/// Returns file paths relative to the workspace root.
+pub fn at_mention_files(query: &str) -> Vec<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let ignore = crate::ignore::IgnoreRules::load(&cwd);
+    let mut results = Vec::new();
+    let max_results = 12;
+
+    fn walk_for_at(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        ignore: &crate::ignore::IgnoreRules,
+        query: &str,
+        results: &mut Vec<String>,
+        max: usize,
+        depth: usize,
+    ) {
+        if results.len() >= max || depth > 8 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if results.len() >= max {
+                break;
+            }
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = path.is_dir();
+            // Skip hidden and common ignore dirs
+            if name.starts_with('.') || name == "target" || name == "node_modules" || name == ".git" {
+                continue;
+            }
+            let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            if ignore.matches(&rel, is_dir) {
+                continue;
+            }
+            if !is_dir && (query.is_empty() || name.to_ascii_lowercase().contains(&query.to_ascii_lowercase())) {
+                results.push(rel);
+            }
+            if is_dir {
+                walk_for_at(&path, base, ignore, query, results, max, depth + 1);
+            }
+        }
+    }
+
+    walk_for_at(&cwd, &cwd, &ignore, query, &mut results, max_results, 0);
+    results.sort();
+    results
 }
 
 /// Builds rich palette lines for dropdown — scrollable, shows all matches.

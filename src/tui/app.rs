@@ -174,6 +174,13 @@ pub struct Tui {
     /// Set when `/model` is selected from palette — triggers async model fetch
     /// in the event loop before opening the dialog.
     pending_model_fetch: bool,
+    /// @-mention file picker state
+    pub at_picker_active: bool,
+    pub at_picker_query: String,
+    pub at_picker_files: Vec<String>,
+    pub at_picker_selected: usize,
+    /// Usage/cost dashboard modal state
+    pub show_cost_dashboard: bool,
 }
 
 impl Default for Tui {
@@ -221,6 +228,11 @@ impl Tui {
             slash_dialog: None,
             models_cache: Vec::new(),
             pending_model_fetch: false,
+            at_picker_active: false,
+            at_picker_query: String::new(),
+            at_picker_files: Vec::new(),
+            at_picker_selected: 0,
+            show_cost_dashboard: false,
         };
         // Eagerly open explorer so "No files yet" never shows on startup when
         // the right pane is visible by default (width≥100). Fail silently in tests.
@@ -917,6 +929,26 @@ impl Tui {
                         self.toggle_explorer();
                         return;
                     }
+                    'i' => {
+                        self.show_cost_dashboard = !self.show_cost_dashboard;
+                        return;
+                    }
+                    'o' => {
+                        // Ctrl+O: zen mode (toggle sidebars)
+                        if self.show_tree || self.show_tools {
+                            self.show_tree = false;
+                            self.show_tools = false;
+                        } else {
+                            self.show_tree = true;
+                            self.show_tools = true;
+                        }
+                        return;
+                    }
+                    'f' => {
+                        // Ctrl+F: find in chat (placeholder)
+                        self.notice("find in chat: use /search <text>");
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -1120,12 +1152,20 @@ impl Tui {
 
     fn handle_input_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => self.submit(),
+            KeyCode::Enter => {
+                // If @-picker is active, insert selected file
+                if self.at_picker_active && !self.at_picker_files.is_empty() {
+                    self.insert_at_mention();
+                    return;
+                }
+                self.submit();
+            }
             KeyCode::Char(c) => {
                 let byte = self.cursor_byte();
                 self.input.insert(byte, c);
                 self.input_cursor += 1;
                 self.slash_selected = 0;
+                self.update_at_picker();
             }
             KeyCode::Backspace if self.input_cursor > 0 => {
                 let byte = self.cursor_byte();
@@ -1136,6 +1176,7 @@ impl Tui {
                 self.input.replace_range(prev..byte, "");
                 self.input_cursor -= 1;
                 self.slash_selected = 0;
+                self.update_at_picker();
             }
             KeyCode::Delete if self.input_cursor < self.input.chars().count() => {
                 let byte = self.cursor_byte();
@@ -1152,10 +1193,73 @@ impl Tui {
             }
             KeyCode::Home => self.input_cursor = 0,
             KeyCode::End => self.input_cursor = self.input.chars().count(),
-            KeyCode::Up => self.history_prev(),
-            KeyCode::Down => self.history_next(),
+            KeyCode::Up => {
+                if self.at_picker_active && !self.at_picker_files.is_empty() {
+                    self.at_picker_selected = if self.at_picker_selected == 0 {
+                        self.at_picker_files.len() - 1
+                    } else {
+                        self.at_picker_selected - 1
+                    };
+                } else {
+                    self.history_prev();
+                }
+            }
+            KeyCode::Down => {
+                if self.at_picker_active && !self.at_picker_files.is_empty() {
+                    self.at_picker_selected = (self.at_picker_selected + 1) % self.at_picker_files.len();
+                } else {
+                    self.history_next();
+                }
+            }
+            KeyCode::Esc => {
+                if self.show_cost_dashboard {
+                    self.show_cost_dashboard = false;
+                } else if self.at_picker_active {
+                    self.at_picker_active = false;
+                    self.at_picker_files.clear();
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Updates the @-mention picker based on current input and cursor position.
+    fn update_at_picker(&mut self) {
+        if let Some(query) = crate::tui::widgets::input_bar::at_mention_query(&self.input, self.input_cursor) {
+            self.at_picker_active = true;
+            self.at_picker_query = query.clone();
+            self.at_picker_files = crate::tui::widgets::input_bar::at_mention_files(&query);
+            self.at_picker_selected = 0;
+        } else {
+            self.at_picker_active = false;
+            self.at_picker_files.clear();
+        }
+    }
+
+    /// Inserts the selected @-mention file into the input.
+    fn insert_at_mention(&mut self) {
+        if !self.at_picker_active || self.at_picker_files.is_empty() {
+            return;
+        }
+        let file = self.at_picker_files[self.at_picker_selected].clone();
+        // Find the @ position and replace query with file path
+        let text: String = self.input.chars().take(self.input_cursor).collect();
+        let chars: Vec<char> = text.chars().collect();
+        let mut last_at = None;
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '@' && (i == 0 || chars[i - 1].is_whitespace()) {
+                last_at = Some(i);
+            }
+        }
+        if let Some(at_pos) = last_at {
+            // Replace from @ to cursor with @file_path
+            let before: String = chars[..at_pos].iter().collect();
+            let after: String = self.input.chars().skip(self.input_cursor).collect();
+            self.input = format!("{before}@{file} {after}");
+            self.input_cursor = before.chars().count() + 1 + file.chars().count() + 1;
+        }
+        self.at_picker_active = false;
+        self.at_picker_files.clear();
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent) {
