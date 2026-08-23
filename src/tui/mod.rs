@@ -1,4 +1,4 @@
-//! Rich terminal UI (`--tui`): a lightweight IDE layout around the same
+//! Rich terminal UI: a lightweight IDE layout around the same
 //! agent core the REPL drives.
 //!
 //! - status bar, chat pane with code blocks, input bar with slash completion

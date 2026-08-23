@@ -11,7 +11,7 @@ use reedline::{
     FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal, Span,
 };
 use std::borrow::Cow;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 /// Completes slash commands as the user types `/mod` → `/models`, `/model`.
@@ -254,7 +254,8 @@ fn parse_args() -> Result<Args> {
     let mut resume = None;
     let mut query = None;
     let mut completion = None;
-    let mut tui = false;
+    let mut force_repl = false;
+    let mut force_tui = false;
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--resume" | "-r" => {
@@ -277,7 +278,8 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("--completion needs a shell name"))?;
                 completion = Some(shell);
             }
-            "--tui" => tui = true,
+            "--tui" => force_tui = true,
+            "--repl" => force_repl = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -285,6 +287,14 @@ fn parse_args() -> Result<Args> {
             other => anyhow::bail!("unknown argument '{other}' — try --help"),
         }
     }
+    // TUI is the default for interactive sessions; --repl forces the legacy
+    // REPL, --query/-q implies non-interactive and skips TUI, and piped
+    // stdout always falls back to the plain REPL.
+    let tui = if force_repl || query.is_some() || !std::io::stdout().is_terminal() {
+        false
+    } else {
+        force_tui || true
+    };
     Ok(Args {
         resume,
         query,
@@ -295,7 +305,7 @@ fn parse_args() -> Result<Args> {
 
 fn print_usage() {
     println!(
-        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --query, -q <prompt> one-shot mode: answer and exit; piped stdin is appended\n                       to the prompt, e.g. cat file.rs | govinda -q \"review\"\n  --tui                launch the rich terminal UI (panes, light theme)\n  --completion <shell> print a completion script (bash, zsh, fish, powershell)\n  --help, -h           show this help",
+        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --query, -q <prompt> one-shot mode: answer and exit; piped stdin is appended\n                       to the prompt, e.g. cat file.rs | govinda -q \"review\"\n  --repl               use the legacy plain-text REPL instead of the rich TUI\n  --completion <shell> print a completion script (bash, zsh, fish, powershell)\n  --help, -h           show this help\n\nthe rich TUI launches by default in interactive terminals.",
         paint(
             format!("govinda-cli v{}", env!("CARGO_PKG_VERSION")),
             accent()

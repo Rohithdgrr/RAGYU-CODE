@@ -295,7 +295,7 @@ impl Tui {
             }
             other => {
                 self.notice(format!(
-                    "'{other}' is not wired into the TUI yet — run without --tui for the full \
+                    "'{other}' is not wired into the TUI yet — run with --repl for the full \
                      REPL command set"
                 ));
             }
