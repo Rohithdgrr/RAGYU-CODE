@@ -196,6 +196,9 @@ pub fn describe(cmd: &str) -> &'static str {
         "/help" => "show help",
         "/exit" | "/quit" => "quit",
         "/clear" | "/reset" => "clear chat",
+        "/agent" => "agent mode on/off",
+        "/provider" => "switch provider",
+        "/pin" => "pin file to context",
         "/models" => "list models",
         "/model" => "switch model",
         "/temp" => "temperature",
@@ -234,7 +237,6 @@ pub fn describe(cmd: &str) -> &'static str {
         "/skills" => "custom skills",
         "/commit" => "git commit",
         "/pr" => "branch/PR workflow",
-        "/pty" => "PTY panel",
         "/auto-compact" => "auto-compact session",
         _ => "",
     }
@@ -459,6 +461,18 @@ pub fn block(focus_input: bool, mode: AppMode) -> Block<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_registered_command_has_a_palette_description() {
+        for cmd in crate::commands::SLASH_COMMANDS {
+            assert!(
+                !describe(cmd).is_empty(),
+                "palette description missing for {cmd} — it would render blank in the COMMANDS panel"
+            );
+        }
+        // And no stale entries: describe() must not know erased commands.
+        assert_eq!(describe("/pty"), "", "/pty was removed from the registry");
+    }
 
     #[test]
     fn completes_slash_prefixes() {
