@@ -296,4 +296,55 @@ mod tests {
         assert_eq!(ctx.first().map(|m| m.role.as_str()), Some("system"));
         assert_eq!(ctx.len(), history.len() + 2);
     }
+
+    /// Functional `/compact` test: the API summarizes the whole history and
+    /// the session folds down to that summary — no naive truncation, no data
+    /// loss beyond what the summary preserves.
+    #[tokio::test]
+    async fn compact_folds_history_into_api_summary() {
+        let server = wiremock::MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"BRIEF: user asked x; answer was y.\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut app = super::super::tests::smoke_app();
+        app.config.provider = crate::provider::resolve(
+            "custom",
+            Some(&format!("{}/v1", server.uri())),
+            None,
+            |_| None,
+        )
+        .expect("custom provider");
+
+        for i in 0..5 {
+            app.session.push_user(format!("question {i}"));
+            app.session.push_assistant(format!("answer {i}"));
+        }
+        let before = app.session.messages().len();
+        assert_eq!(before, 10);
+
+        compact(&mut app).await;
+
+        let after = app.session.messages().len();
+        assert!(after < before, "history must shrink: {before} -> {after}");
+        assert!(after >= 1);
+        let last = &app.session.messages()[after - 1];
+        assert_eq!(last.role, "assistant");
+        assert!(
+            last.content.contains("BRIEF"),
+            "summary must come from the API reply, got: {}",
+            last.content
+        );
+    }
 }
