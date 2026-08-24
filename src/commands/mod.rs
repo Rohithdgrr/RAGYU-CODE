@@ -33,13 +33,14 @@ pub use plan::{Phase, PipelineStep, generate_pipeline, parse_pipeline_steps};
 
 /// Every slash command the REPL accepts. Drives the reedline completer and
 /// shell-completion scripts; keep in sync with `dispatch()` / `help()`.
-pub const SLASH_COMMANDS: [&str; 46] = [
+pub const SLASH_COMMANDS: [&str; 47] = [
     "/help",
     "/exit",
     "/quit",
     "/clear",
     "/reset",
     "/agent",
+    "/provider",
     "/pin",
     "/models",
     "/model",
@@ -297,6 +298,54 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
         }
         "/models" => {
             models(app).await;
+            Outcome::Handled
+        }
+        "/provider" => {
+            let arg = rest.trim();
+            if arg.is_empty() {
+                // List presets and show the active provider.
+                info(format!(
+                    "current provider: {} ({}){}",
+                    app.config.provider.id(),
+                    app.config.provider.base_url(),
+                    if app.config.provider.auth().token().is_some() {
+                        " · API key loaded"
+                    } else {
+                        " · no API key (local/custom)"
+                    },
+                ));
+                info(format!(
+                    "available: {}",
+                    crate::provider::preset_names().collect::<Vec<_>>().join(", ")
+                ));
+                dim("switch with /provider <name>, or a custom endpoint with /provider <name> <base-url>");
+                return Outcome::Handled;
+            }
+            let (name, base_url) = match arg.split_once(char::is_whitespace) {
+                Some((n, u)) => (n.trim(), Some(u.trim())),
+                None => (arg, None),
+            };
+            // Keys resolve from the environment (.env included at startup).
+            let key_env_lookup = |var: &str| std::env::var(var).ok();
+            match crate::provider::resolve(name, base_url, None, key_env_lookup) {
+                Ok(new_provider) => {
+                    app.config.provider = new_provider;
+                    // Cached model ids belong to the old backend.
+                    app.models_cache = None;
+                    ok(format!(
+                        "provider switched to {} ({}){}",
+                        app.config.provider.id(),
+                        app.config.provider.chat_url(),
+                        if app.config.provider.auth().token().is_some() {
+                            " · API key loaded"
+                        } else {
+                            ""
+                        },
+                    ));
+                    dim("pick a model for this provider with /model <name> (or /models to list). Persist the switch with /config save.");
+                }
+                Err(e) => err(&format!("{e:#}")),
+            }
             Outcome::Handled
         }
         "/model" => {
@@ -804,7 +853,7 @@ pub async fn dispatch_structured(line: &str, app: &mut App) -> CommandOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Outcome, dispatch, split_command};
+    use super::{App, Outcome, dispatch, dispatch_structured, split_command};
     use crate::commands::display::parse_temperature;
     use crate::commands::persistence::safe_session_path;
     use crate::config::Config;
@@ -814,6 +863,68 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use zeroize::Zeroizing;
+
+    /// `/provider` lists presets, switches between them, and accepts custom
+    /// OpenAI-compatible endpoints. Switching invalidates the model cache.
+    #[tokio::test]
+    async fn provider_command_lists_and_switches_presets() {
+        let mut app = smoke_app();
+        assert_eq!(app.config.provider.id(), "ollama");
+
+        // Bare command lists presets + current provider.
+        let out = dispatch_structured("/provider", &mut app).await;
+        let text = out
+            .msgs
+            .iter()
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("groq"), "{text}");
+        assert!(text.contains("current provider: ollama"), "{text}");
+
+        // Switch to a preset with a custom endpoint override.
+        let out =
+            dispatch_structured("/provider ollama http://10.0.0.5:11434/v1", &mut app).await;
+        assert!(
+            out.msgs.iter().any(|m| m.text.contains("switched to ollama")),
+            "{out:?}"
+        );
+        assert_eq!(app.config.provider.id(), "ollama");
+        assert_eq!(
+            app.config.provider.chat_url(),
+            "http://10.0.0.5:11434/v1/chat/completions"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_custom_endpoint_and_missing_key_error() {
+        let mut app = smoke_app();
+
+        // Unknown name + base URL = custom OpenAI-compatible endpoint.
+        let out =
+            dispatch_structured("/provider custom https://llm.corp.internal/v1", &mut app).await;
+        assert!(
+            out.msgs.iter().any(|m| m.text.contains("switched to custom")),
+            "{out:?}"
+        );
+        assert_eq!(app.config.provider.id(), "custom");
+        assert_eq!(
+            app.config.provider.base_url(),
+            "https://llm.corp.internal/v1"
+        );
+
+        // Cloud preset without its key in the environment must be rejected
+        // with the variable name — provider stays unchanged.
+        if std::env::var_os("GROQ_API_KEY").is_none() {
+            let out = dispatch_structured("/provider groq", &mut app).await;
+            assert!(
+                out.msgs.iter().any(|m| m.role == super::output::Role::Err
+                    && m.text.contains("GROQ_API_KEY")),
+                "{out:?}"
+            );
+            assert_ne!(app.config.provider.id(), "groq");
+        }
+    }
 
     pub(crate) fn smoke_app() -> App {
         let provider = provider::resolve("ollama", None, None, |_| None).expect("ollama preset");

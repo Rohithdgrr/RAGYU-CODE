@@ -235,10 +235,15 @@ pub(super) struct RuntimeSnapshot {
     pub theme: String,
     pub timeout_secs: u64,
     pub limit_mb: u64,
+    /// Active provider preset id (`"custom"` for ad-hoc endpoints).
+    pub provider: String,
+    /// Set when the provider points at a non-preset endpoint.
+    pub base_url: Option<String>,
 }
 
 impl RuntimeSnapshot {
     pub fn from_app(app: &App) -> Self {
+        let is_custom = app.config.provider.id() == "custom";
         Self {
             model: app.config.model.clone(),
             temperature: app.config.temperature,
@@ -247,6 +252,8 @@ impl RuntimeSnapshot {
             theme: crate::render::active_theme().name.to_owned(),
             timeout_secs: app.read_timeout.as_secs(),
             limit_mb: (app.max_response_bytes / (1024 * 1024)) as u64,
+            provider: app.config.provider.id().to_owned(),
+            base_url: is_custom.then(|| app.config.provider.base_url().to_owned()),
         }
     }
 }
@@ -270,6 +277,16 @@ fn merge_snapshot(table: &mut toml::Table, s: &RuntimeSnapshot) {
         toml::Value::from(s.timeout_secs as i64),
     );
     table.insert("limit_mb".into(), toml::Value::from(s.limit_mb as i64));
+    table.insert("provider".into(), toml::Value::from(s.provider.clone()));
+    match &s.base_url {
+        Some(url) => {
+            table.insert("base_url".into(), toml::Value::from(url.clone()));
+        }
+        None => {
+            // A preset provider must not inherit a stale custom endpoint.
+            table.remove("base_url");
+        }
+    }
 }
 
 /// Resolves where `/config save` writes: `GOVINDA_CONFIG` > the file that was
@@ -330,6 +347,8 @@ args_template = ["pr", "list"]
             theme: "dracula".into(),
             timeout_secs: 45,
             limit_mb: 8,
+            provider: "mistral".into(),
+            base_url: None,
         };
         merge_snapshot(&mut table, &snapshot);
         let out = toml::to_string_pretty(&table).unwrap();
@@ -356,6 +375,8 @@ args_template = ["pr", "list"]
             theme: "default".into(),
             timeout_secs: 30,
             limit_mb: 16,
+            provider: "mistral".into(),
+            base_url: None,
         };
         merge_snapshot(&mut table, &snapshot);
         let out = toml::to_string_pretty(&table).unwrap();

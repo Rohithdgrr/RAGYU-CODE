@@ -5,6 +5,7 @@ A minimal, pure-Rust CLI chatbot with streaming responses, conversation memory, 
 ## Features
 
 - **Multi-provider** — one binary for any OpenAI-compatible backend (`provider = "ollama"` in the config and you're talking to localhost)
+- **Runtime provider switching** — `/provider groq` or `/provider custom https://your-server/v1` swaps backends mid-session; the model cache resets and `/config save` persists the choice
 - **11 provider presets** — Mistral, OpenAI, OpenRouter, NVIDIA, DeepSeek, Kimi (Moonshot), GLM (Zhipu), MiniMax, Groq, ByteZ, Ollama
 - **Coding agent** — the model can read, grep, scan, stage surgical edits (`edit_file`/`insert_after`/`insert_before` reviewed via `/diff`, applied atomically with `/apply`), run shell commands/tests/compile checks, and use git tools — all sandboxed to the working directory with confirmation gates on anything destructive
 - **Web tools** — `web_search` (DuckDuckGo) and `web_fetch` (URL content extraction) for internet access
@@ -149,6 +150,9 @@ diffs, and result previews in both.
 | `/exit`, `/quit` | Quit (Ctrl+D also exits) |
 | `/clear`, `/reset` | Wipe conversation history |
 | `/models` | List models available to your key |
+| `/provider` | List provider presets and show the active one |
+| `/provider <name>` | Switch provider at runtime: `mistral` `openai` `openrouter` `nvidia` `deepseek` `kimi` `glm` `minimax` `groq` `bytez` `ollama` (key resolves from its env var) |
+| `/provider <name> <base-url>` | Switch with a custom endpoint override (any OpenAI-compatible server; unknown name = keyless custom provider). Persist with `/config save` |
 | `/model <name>` | Switch model; `next`/`prev` cycle, partial ids match (validated against the API) |
 | `/temp <0.0-1.0>` | Set sampling temperature |
 | `/system [text]` | View or set the system prompt |

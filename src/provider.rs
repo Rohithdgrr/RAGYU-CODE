@@ -47,6 +47,8 @@ impl Auth {
 pub trait Provider: Send + Sync {
     fn id(&self) -> &'static str;
     fn chat_url(&self) -> String;
+    /// The configured API root (for display and config persistence).
+    fn base_url(&self) -> &str;
     /// `None` for backends without a model-listing endpoint.
     fn models_url(&self) -> Option<String>;
     fn auth(&self) -> Auth;
@@ -135,6 +137,10 @@ impl Provider for ResolvedProvider {
 
     fn chat_url(&self) -> String {
         format!("{}/chat/completions", trim_base(&self.base_url))
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn models_url(&self) -> Option<String> {
