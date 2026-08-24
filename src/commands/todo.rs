@@ -1,7 +1,6 @@
-//! `/todo` — a small persistent task list for the REPL session.
+//! `/todo` — a small persistent task list shared by the REPL and TUI.
 
-use super::{App, err, ok, paint};
-use crossterm::style::{Color, Stylize};
+use super::{App, dim, err, info, ok};
 use serde::{Deserialize, Serialize};
 
 const TODO_FILE: &str = ".govinda_todo.json";
@@ -31,7 +30,7 @@ pub(super) fn save(app: &App) {
     if let Ok(json) = serde_json::to_string_pretty(&app.todos)
         && let Err(e) = std::fs::write(todo_path(), json)
     {
-        err(&format!("could not save todos: {e}"));
+        err(format!("could not save todos: {e}"));
     }
 }
 
@@ -48,7 +47,7 @@ pub(super) fn handle(arg: &str, app: &mut App) {
         "undo" | "reopen" => toggle_done(rest, app, false),
         "rm" | "remove" | "del" => remove(rest, app),
         "clear" => clear(app),
-        other => err(&format!(
+        other => err(format!(
             "unknown /todo subcommand '{other}' — use add | list | done | undo | rm | clear"
         )),
     }
@@ -56,47 +55,27 @@ pub(super) fn handle(arg: &str, app: &mut App) {
 
 fn list(app: &App) {
     if app.todos.is_empty() {
-        println!("{}", "(no todos — '/todo add <text>' to create one)".dim());
+        dim("(no todos — '/todo add <text>' to create one)");
         return;
     }
     for (i, t) in app.todos.iter().enumerate() {
-        let marker = if t.done {
-            paint("[x]", Color::Green)
-        } else {
-            paint("[ ]", Color::Yellow)
-        };
-        let text = if t.done {
-            paint(t.text.clone(), Color::DarkGrey)
-        } else {
-            t.text.clone()
-        };
-        println!(
-            "{} {} {}",
-            marker,
-            paint(format!("{:>2}.", i + 1), Color::DarkGrey),
-            text
-        );
+        let marker = if t.done { "[x]" } else { "[ ]" };
+        info(format!("{marker} {:>2}. {}", i + 1, t.text));
     }
     let open = app.todos.iter().filter(|t| !t.done).count();
-    println!(
-        "{}",
-        paint(
-            format!("{} open / {} total", open, app.todos.len()),
-            Color::DarkGrey
-        )
-    );
+    dim(format!("{} open / {} total", open, app.todos.len()));
 }
 
 fn add(text: &str, app: &mut App) {
     if text.is_empty() {
-        println!("usage: /todo add <text>");
+        info("usage: /todo add <text>");
         return;
     }
     app.todos.push(Todo {
         text: text.to_owned(),
         done: false,
     });
-    ok(&format!("added #{}: {text}", app.todos.len()));
+    ok(format!("added #{}: {text}", app.todos.len()));
     save(app);
 }
 
@@ -105,14 +84,14 @@ fn toggle_done(arg: &str, app: &mut App, done: bool) {
         Some(i) => {
             app.todos[i].done = done;
             let verb = if done { "done" } else { "reopened" };
-            ok(&format!("#{} {}: {}", i + 1, verb, app.todos[i].text));
+            ok(format!("#{} {}: {}", i + 1, verb, app.todos[i].text));
             save(app);
         }
-        None => println!(
+        None => info(format!(
             "usage: /todo {} <1-{}>",
             if done { "done" } else { "undo" },
             app.todos.len().max(1)
-        ),
+        )),
     }
 }
 
@@ -120,10 +99,10 @@ fn remove(arg: &str, app: &mut App) {
     match parse_index(arg, app.todos.len()) {
         Some(i) => {
             let removed = app.todos.remove(i);
-            ok(&format!("removed #{}: {}", i + 1, removed.text));
+            ok(format!("removed #{}: {}", i + 1, removed.text));
             save(app);
         }
-        None => println!("usage: /todo rm <1-{}>", app.todos.len().max(1)),
+        None => info(format!("usage: /todo rm <1-{}>", app.todos.len().max(1))),
     }
 }
 
@@ -132,9 +111,9 @@ fn clear(app: &mut App) {
     app.todos.clear();
     save(app);
     if n == 0 {
-        println!("{}", "(nothing to clear)".dim());
+        dim("(nothing to clear)");
     } else {
-        ok(&format!("cleared {n} todo(s)."));
+        ok(format!("cleared {n} todo(s)."));
     }
 }
 

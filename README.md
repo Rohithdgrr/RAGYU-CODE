@@ -18,6 +18,7 @@ A minimal, pure-Rust CLI chatbot with streaming responses, conversation memory, 
 - **Context-aware window** — files your prompt mentions ride along in the context window (plus manifest + same-dir siblings) even if they only appeared in old messages
 - **Self-correction loop** — failed verifications (non-zero exit codes, compile errors) grant up to 3 extra agent rounds so the model can fix its own mistakes
 - **Plan mode** — `/plan <task>` decomposes a task into steps, confirms with y/N, then executes them autonomously
+- **Build pipeline** — `govinda -b "<prompt>"` runs docs → code → deps → run → preview → verify from a single prompt, with a guaranteed verify phase, fix retries, and an exit code that reflects verification
 - **Function calling** — multi-round tool loops with parallel calls, streamed fragment reassembly, and hard caps on call count, argument size, and result size
 - **Token-aware context** — history is trimmed with a real BPE tokenizer against a configurable token budget
 - **Streaming + rendered output** — spinner while generating, then the answer is rendered as terminal markdown (or `/raw` for live token-by-token plain text)
@@ -87,9 +88,28 @@ Precedence: defaults < config.toml < environment variables. Unknown keys are rej
 ## Run
 
 ```
-cargo run --release                 # start a new conversation
-cargo run --release -- --resume work   # continue a saved session
+cargo run --release                      # rich TUI (default in a terminal)
+cargo run --release -- --repl            # legacy plain-text REPL
+cargo run --release -- --resume work     # continue a saved session
+cargo run --release -- -q "explain this" # one-shot: answer and exit
+cargo run --release -- -b "make a todo REST API with tests"
+                                         # one-prompt build pipeline (see below)
 ```
+
+### Build pipeline (`--build` / `-b`)
+
+One prompt runs the whole loop — docs, code, dependencies, run, preview, verify:
+
+```
+prompt ──► PLAN ──► [DOCS] → [CODE] → [DEPS] → [RUN] → [PREVIEW] → [VERIFY]
+                        ▲                                       │
+                        └────────── fix attempts ◄──────────────┘
+```
+
+1. One model call decomposes your prompt into phase-tagged steps (`[DOCS]`, `[CODE]`, `[DEPS]`, `[RUN]`, `[PREVIEW]`, `[VERIFY]`), each with per-phase tool guidance.
+2. You confirm **once**; every step then executes autonomously with writes, installs, and runs auto-approved, staged edits committed per step.
+3. The pipeline always ends in a `[VERIFY]` phase (tests/project checks). Failures grant up to 3 extra fix turns before giving up.
+4. A ✓/✗ report prints at the end; the exit code reflects verification.
 
 ## TUI design (glassmorphism)
 
@@ -108,8 +128,18 @@ pane. For the intended look install:
 
   Terminals render with the configured font, so set these in your terminal
   profile — headings are uppercase + bold, numerals land in the mono face.
-- Light ("Frosted Daylight") and dark ("Midnight Glass") palettes ship
-  built-in; `/theme` toggles.
+- Light ("Frosted Daylight") and dark ("Midnight Glass") glass bases ship
+  built-in, and all 10 named themes (`/theme <name>`) map onto them with
+  matching accent sets.
+
+### One command engine, two frontends
+
+The TUI and the REPL share the **same command dispatcher** and the **same
+agent loop** (`src/commands/`, `src/agent_loop.rs`). Every slash command
+behaves identically in both — output is captured into structured messages in
+the TUI (never printed over the alternate screen) and streamed to stdout in
+the REPL. Tool rounds run concurrently with self-correction rounds, inline
+diffs, and result previews in both.
 
 ## Commands
 

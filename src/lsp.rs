@@ -46,11 +46,16 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn display(&self) -> String {
-        let code = self.code.as_deref().unwrap_or("");
-        format!(
-            "{}:{}:{}: {} {}",
-            self.file, self.line, self.column, self.severity.icon(), self.message
-        )
+        match self.code.as_deref() {
+            Some(code) if !code.is_empty() => format!(
+                "{}:{}:{}: {} {} [{}]",
+                self.file, self.line, self.column, self.severity.icon(), self.message, code
+            ),
+            _ => format!(
+                "{}:{}:{}: {} {}",
+                self.file, self.line, self.column, self.severity.icon(), self.message
+            ),
+        }
     }
 }
 

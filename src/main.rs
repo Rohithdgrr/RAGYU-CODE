@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
-use govinda_cli::api::{self, ChatOptions};
 use govinda_cli::clock;
 use govinda_cli::commands::{self, App, Outcome};
 use govinda_cli::config::Config;
-use govinda_cli::render::{Renderer, Spinner, accent, paint};
+use govinda_cli::render::{Renderer, accent, paint};
 use govinda_cli::session::Session;
 use govinda_cli::sessions;
 use reedline::{
@@ -12,7 +10,7 @@ use reedline::{
 };
 use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
-use std::time::{Duration, Instant};
+
 
 /// Completes slash commands as the user types `/mod` → `/models`, `/model`.
 struct SlashCompleter;
@@ -95,41 +93,6 @@ impl Prompt for CliPrompt {
     }
 }
 
-/// Appended to the system prompt whenever function calling is available:
-/// steers the model toward the workspace tools instead of guessing.
-const AGENT_SYSTEM_ADDENDUM: &str = "\n\nYou are a coding agent working inside the user's project \
-workspace. You use edit_file/insert_after/insert_before for changes (staged for review via \
-view_diff), run_shell or check_project to verify compilation, find_symbol to locate definitions, \
-and never guess line numbers — read files or query the symbol index before editing. \
-You CAN run arbitrary shell commands: start dev servers, open files and URLs in the browser, \
-launch programs. When the user asks to run, preview, or open something, do it with run_shell \
-or open_preview instead of saying you cannot.";
-
-/// Extra rounds granted after a failed tool round (self-correction loop):
-/// a failing `cargo check` goes back to the model as-is so it can fix it.
-const MAX_FIX_ROUNDS: usize = 3;
-
-/// Applies agent specialization when tools are on; plain chat keeps the
-/// user's configured system prompt untouched.
-fn specialize_system(app: &mut App) {
-    if app.tools_enabled {
-        let mut specialized = format!("{}{AGENT_SYSTEM_ADDENDUM}", app.session.system());
-        // Inject project memory (AGENTS.md / CLAUDE.md / .govinda/memory.md)
-        if let Some(suffix) = app.project_memory.to_system_suffix() {
-            specialized.push_str(&format!("\n\n{suffix}"));
-        }
-        // Inject custom skills as available commands
-        if !app.skills.is_empty() {
-            specialized.push_str("\n\n## Custom Skills\n\nAvailable custom slash commands:\n");
-            for s in &app.skills {
-                let args_hint = if s.requires_args { " (requires args)" } else { "" };
-                specialized.push_str(&format!("- `{}` — {}{}\n", s.name, s.description, args_hint));
-            }
-        }
-        app.session.set_system(specialized);
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
@@ -170,7 +133,13 @@ async fn main() -> Result<()> {
     if let Some(name) = &args.resume {
         app.session_name = Some(name.clone());
     }
-    specialize_system(&mut app);
+    commands::specialize_system(&mut app);
+
+    // One-prompt build pipeline: plan phases, confirm once, execute
+    // autonomously, verify, report. Non-TUI by definition.
+    if let Some(prompt) = args.build {
+        return run_build(&mut app, &prompt).await;
+    }
 
     // Rich TUI mode: IDE-like panes around the same agent core. Session
     // autosave still applies on exit.
@@ -260,6 +229,7 @@ async fn main() -> Result<()> {
 struct Args {
     resume: Option<String>,
     query: Option<String>,
+    build: Option<String>,
     completion: Option<String>,
     tui: bool,
 }
@@ -268,6 +238,7 @@ fn parse_args() -> Result<Args> {
     let mut argv = std::env::args().skip(1);
     let mut resume = None;
     let mut query = None;
+    let mut build = None;
     let mut completion = None;
     let mut force_repl = false;
     let mut force_tui = false;
@@ -287,6 +258,13 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("-q needs a prompt (quote it)"))?;
                 query = Some(prompt);
             }
+            "--build" | "-b" => {
+                let prompt = argv
+                    .next()
+                    .filter(|p| !p.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("--build needs a prompt (quote it)"))?;
+                build = Some(prompt);
+            }
             "--completion" => {
                 let shell = argv
                     .next()
@@ -303,9 +281,10 @@ fn parse_args() -> Result<Args> {
         }
     }
     // TUI is the default for interactive sessions; --repl forces the legacy
-    // REPL, --query/-q implies non-interactive and skips TUI, and piped
-    // stdout always falls back to the plain REPL.
-    let tui = if force_repl || query.is_some() || !std::io::stdout().is_terminal() {
+    // REPL, --query/-q and --build/-b imply non-TUI, and piped stdout always
+    // falls back to the plain REPL.
+    let tui = if force_repl || query.is_some() || build.is_some() || !std::io::stdout().is_terminal()
+    {
         false
     } else {
         force_tui || true
@@ -313,6 +292,7 @@ fn parse_args() -> Result<Args> {
     Ok(Args {
         resume,
         query,
+        build,
         completion,
         tui,
     })
@@ -320,7 +300,7 @@ fn parse_args() -> Result<Args> {
 
 fn print_usage() {
     println!(
-        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --query, -q <prompt> one-shot mode: answer and exit; piped stdin is appended\n                       to the prompt, e.g. cat file.rs | govinda -q \"review\"\n  --repl               use the legacy plain-text REPL instead of the rich TUI\n  --completion <shell> print a completion script (bash, zsh, fish, powershell)\n  --help, -h           show this help\n\nthe rich TUI launches by default in interactive terminals.",
+        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --query, -q <prompt> one-shot mode: answer and exit; piped stdin is appended\n                       to the prompt, e.g. cat file.rs | govinda -q \"review\"\n  --build, -b <prompt> one-prompt pipeline: plan phases (docs → code → deps →\n                       run → preview → verify), confirm once, then execute\n                       autonomously; exit code reflects verification\n  --repl               use the legacy plain-text REPL instead of the rich TUI\n  --completion <shell> print a completion script (bash, zsh, fish, powershell)\n  --help, -h           show this help\n\nthe rich TUI launches by default in interactive terminals.",
         paint(
             format!("govinda-cli v{}", env!("CARGO_PKG_VERSION")),
             accent()
@@ -374,7 +354,7 @@ async fn handle_line(line: &str, app: &mut App) -> Result<bool> {
     if line.starts_with('/') {
         match commands::dispatch(line, app).await {
             Outcome::Exit => return Ok(true),
-            Outcome::Handled => {}
+            Outcome::Handled | Outcome::Undo | Outcome::Reloaded => {}
             Outcome::Resend(text) => run_turn(app, &text).await,
             Outcome::Plan(steps) => execute_plan(app, steps).await,
         }
@@ -436,6 +416,152 @@ async fn execute_plan(app: &mut App, steps: Vec<String>) {
     );
 }
 
+/// Extra fix turns granted when the pipeline's VERIFY phase keeps failing.
+const MAX_BUILD_FIX_TURNS: usize = 3;
+
+/// `--build <prompt>` one-prompt pipeline:
+///
+/// plan (phase-tagged steps) → single confirmation → autonomous execution
+/// with all tool gates auto-approved → staged edits applied per step →
+/// guaranteed VERIFY phase → fix loop on persistent failure → report.
+/// Exit status reflects the final verification result.
+async fn run_build(app: &mut App, prompt: &str) -> Result<()> {
+    println!(
+        "{}",
+        paint(format!("build pipeline: {prompt}"), accent())
+    );
+
+    let steps = match commands::generate_pipeline(app, prompt).await {
+        Ok(steps) if !steps.is_empty() => steps,
+        Ok(_) => anyhow::bail!("the model returned no parseable pipeline steps"),
+        Err(e) => anyhow::bail!("pipeline planning failed ({e:#})"),
+    };
+
+    // The todo list doubles as the pipeline progress tracker.
+    app.todos = steps
+        .iter()
+        .map(|(_, text)| govinda_cli::commands::todo::Todo {
+            text: text.clone(),
+            done: false,
+        })
+        .collect();
+    commands::persist_todos(app);
+
+    println!();
+    println!("{}", paint("proposed pipeline:", accent()));
+    for (i, (phase, step)) in steps.iter().enumerate() {
+        println!(
+            "  {} [{}] {}",
+            paint(format!("{:>2}.", i + 1), crossterm::style::Color::DarkGrey),
+            phase.tag(),
+            step
+        );
+    }
+    print!(
+        "{}",
+        paint(
+            format!(
+                "execute {} step(s) autonomously — writes, installs, and runs will be auto-approved? [y/N] ",
+                steps.len()
+            ),
+            crossterm::style::Color::Yellow
+        )
+    );
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    let confirmed = std::io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if !confirmed {
+        println!(
+            "{}",
+            paint(
+                "pipeline cancelled — plan kept in /todo, nothing executed.",
+                govinda_cli::render::dim_color()
+            )
+        );
+        return Ok(());
+    }
+
+    app.auto_approve = true;
+    let total = steps.len();
+    // Per-step report rows: (phase tag, description, succeeded).
+    let mut report: Vec<(String, String, bool)> = Vec::new();
+
+    for (i, (phase, step)) in steps.into_iter().enumerate() {
+        println!();
+        println!(
+            "{}",
+            paint(
+                format!("── [{}] step {}/{}: {}", phase.tag(), i + 1, total, step),
+                accent()
+            )
+        );
+        run_turn_auto(
+            app,
+            &format!("[{} step {}/{}] {}\n\nPhase guidance: {}", phase.tag(), i + 1, total, step, phase.hint()),
+        )
+        .await;
+        // Headless mode has no one to type /apply: commit staged edits now,
+        // so RUN/VERIFY operate on the code the model just wrote.
+        commands::apply_pending_edits(app);
+        report.push((phase.tag().to_owned(), step, !app.last_turn_had_failure));
+        if let Some(todo) = app.todos.get_mut(i) {
+            todo.done = true;
+        }
+        commands::persist_todos(app);
+    }
+
+    // The verify phase failed? Grant explicit fix attempts before giving up.
+    let mut fixes = 0usize;
+    while app.last_turn_had_failure && fixes < MAX_BUILD_FIX_TURNS {
+        fixes += 1;
+        println!();
+        println!(
+            "{}",
+            paint(
+                format!("── verification failed — fix attempt {fixes}/{MAX_BUILD_FIX_TURNS}"),
+                crossterm::style::Color::Yellow
+            )
+        );
+        run_turn_auto(
+            app,
+            "[VERIFY] The previous step reported failures (errors, non-zero exits, or failing \
+             tests). Diagnose the root cause, fix it, and re-run the relevant tests/checks.",
+        )
+        .await;
+        commands::apply_pending_edits(app);
+        report.push((
+            "VERIFY".to_owned(),
+            format!("fix attempt {fixes}/{MAX_BUILD_FIX_TURNS}"),
+            !app.last_turn_had_failure,
+        ));
+    }
+
+    // Final report; exit code mirrors verification.
+    let success = !app.last_turn_had_failure;
+    println!();
+    println!("{}", paint("── build report ─────────────────────", accent()));
+    let width = report.iter().map(|(t, _, _)| t.len()).max().unwrap_or(0);
+    for (tag, text, ok) in &report {
+        let glyph = if *ok {
+            paint("✓", govinda_cli::render::ok_color())
+        } else {
+            paint("✗", govinda_cli::render::err_color())
+        };
+        let pad = " ".repeat(width - tag.chars().count());
+        println!("  {glyph} [{tag}{pad}] {text}");
+    }
+    if success {
+        println!(
+            "{}",
+            paint("pipeline complete.", govinda_cli::render::dim_color())
+        );
+        Ok(())
+    } else {
+        anyhow::bail!("pipeline finished with failures after {MAX_BUILD_FIX_TURNS} fix attempt(s)")
+    }
+}
+
 /// One-shot `-q` mode: streams the answer to stdout as plain text, runs
 /// tool rounds with confirmation-gated calls auto-declined (no user is
 /// watching), and never autosaves. Errors go to stderr with a non-zero exit.
@@ -456,509 +582,206 @@ async fn run_query(app: &mut App, prompt: &str) -> Result<()> {
         }
     }
 
-    // Context-aware windowing works in one-shot mode too.
-    let injection = {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let files = govinda_cli::context::relevant_files(&full, &cwd);
-        govinda_cli::context::build_injection(&files, &cwd)
-    };
-
-    // The prompt itself must reach the model — one-shot mode previously sent
-    // only the system prompt, so the model answered a question it never saw.
-    app.session.push_user(full);
-
-    for _round in 0..MAX_TOOL_ROUNDS {
-        let history = app
-            .session
-            .window_with(app.config.context_tokens, injection.as_deref());
-        let auth = app.config.provider.auth();
-        let opts = chat_options(app, &auth);
-        let mut out = String::new();
-        let mut tool_calls = Vec::new();
-        let result = {
-            let http = &app.http;
-            let provider = app.config.provider.clone();
-            let mut sink = api::StreamSink::new(&mut out, &mut tool_calls);
-            tokio::select! {
-                res = api::stream_chat(http, provider.as_ref(), &opts, &history, &mut sink, |delta| {
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
-                }) => res,
-                _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("interrupted")),
-            }
-        };
-        result?;
-        println!();
-
-        if tool_calls.is_empty() || !app.tools_enabled {
-            app.record_turn(Duration::ZERO);
-            return Ok(());
-        }
-        run_tool_round(app, &out, &tool_calls).await;
-    }
-    anyhow::bail!("stopped after {MAX_TOOL_ROUNDS} tool rounds without a final answer")
-}
-
-/// Upper bound on model↔tool round trips per user turn, so a confused model
-/// can never loop forever.
-const MAX_TOOL_ROUNDS: usize = 5;
-/// Cap on a single tool result stored in history (display truncation is
-/// separate); a huge result would otherwise wreck the context budget.
-const MAX_TOOL_RESULT_CHARS: usize = 8 * 1024;
-/// Characters of a tool result shown on screen.
-const TOOL_RESULT_DISPLAY_CHARS: usize = 200;
-
-async fn run_turn(app: &mut App, input: &str) {
-    app.session.push_user(input);
-    let raw = !app.renderer.markdown_enabled();
-    let mut rounds_elapsed = std::time::Duration::ZERO;
-
-    // Context-aware windowing: files the prompt mentions (plus their
-    // manifest and same-dir siblings) ride along even if they only appeared
-    // in old messages — computed once from this turn's input. The first
-    // mentioned file becomes the prompt's breadcrumb focus.
+    let ui = CliUi::one_shot();
+    match govinda_cli::agent_loop::run_turn(
+        app,
+        &ui,
+        govinda_cli::agent_loop::GatePolicy::DeclineAll,
+        &full,
+    )
+    .await
     {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        if let Some(first) = govinda_cli::context::mentioned_files(input, &cwd).first() {
-            app.focus_file = Some(
-                first
-                    .strip_prefix(&cwd)
-                    .unwrap_or(first)
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
-        }
-    }
-    let injection = {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let files = govinda_cli::context::relevant_files(input, &cwd);
-        govinda_cli::context::build_injection(&files, &cwd)
-    };
-
-    // Self-correction budget: rounds are capped at MAX_TOOL_ROUNDS, but a
-    // failed tool round (compile error, declined check…) grants extra turns
-    // — up to MAX_FIX_ROUNDS — so the model can react to its own failures.
-    let mut fixes_granted = 0usize;
-    let mut round_no = 0usize;
-
-    loop {
-        round_no += 1;
-        if round_no > MAX_TOOL_ROUNDS + fixes_granted {
-            app.record_turn(rounds_elapsed);
-            show_timeline(app, rounds_elapsed);
-            println!(
-                "{}",
-                paint(
-                    format!(
-                        "stopped after {} tool rounds{} — ask again to continue.",
-                        MAX_TOOL_ROUNDS + fixes_granted,
-                        if fixes_granted > 0 {
-                            format!(" (+{fixes_granted} self-correction)")
-                        } else {
-                            String::new()
-                        }
-                    ),
-                    govinda_cli::render::dim_color()
-                )
-            );
-            return;
-        }
-
-        let history = app
-            .session
-            .window_with(app.config.context_tokens, injection.as_deref());
-        let auth = app.config.provider.auth();
-        let opts = chat_options(app, &auth);
-        let started = Instant::now();
-        // Everything the session held before this stream attempt; an error
-        // with nothing emitted rolls back to exactly this state.
-        let resume_len = app.session.messages().len();
-        let (result, out, tool_calls) = stream_round(app, &history, &opts).await;
-        rounds_elapsed += started.elapsed();
-
-        match result {
-            Ok(()) if !tool_calls.is_empty() && app.tools_enabled => {
-                show_round_prose(app, raw, &out);
-                let had_failure = run_tool_round(app, &out, &tool_calls).await;
-                if had_failure && fixes_granted < MAX_FIX_ROUNDS {
-                    fixes_granted += 1;
-                    println!(
-                        "{}",
-                        paint(
-                            format!(
-                                "↻ failure detected — granting self-correction round ({}/{} max)",
-                                fixes_granted, MAX_FIX_ROUNDS
-                            ),
-                            govinda_cli::render::dim_color()
-                        )
-                    );
-                }
-                continue; // stream again so the model sees the results
-            }
-            Ok(()) => {
-                finish_text_answer(app, raw, out);
-                show_timeline(app, rounds_elapsed);
-                app.record_turn(rounds_elapsed);
-            }
-            Err(e) => handle_round_error(app, raw, out, resume_len, e),
-        }
-        return;
+        Ok(govinda_cli::agent_loop::TurnResult::Answered) => Ok(()),
+        _ => anyhow::bail!(
+            "stopped after {} tool rounds without a final answer",
+            govinda_cli::agent_loop::MAX_TOOL_ROUNDS
+        ),
     }
 }
 
-/// Per-request options from current settings; tool schemas come from the
-/// specs cached at startup.
-fn chat_options<'a>(app: &'a App, auth: &'a govinda_cli::provider::Auth) -> ChatOptions<'a> {
-    ChatOptions {
-        max_response_bytes: app.max_response_bytes,
-        read_timeout: app.read_timeout,
-        tools: if app.tools_enabled {
-            app.tool_specs
-                .iter()
-                .filter(|t| !app.disabled_tools.contains(&t.name))
-                .cloned()
-                .collect()
+// ---------------------------------------------------------------------------
+// CLI frontend adapter for the shared agent loop (src/agent_loop.rs).
+// ---------------------------------------------------------------------------
+
+/// REPL presentation: live raw streaming, markdown rendering for answers,
+/// stdin-based confirmation gates. One implementation of `AgentUi` serves
+/// the interactive REPL, `--build`, and `-q`.
+struct CliUi {
+    /// Snapshot of `renderer.markdown_enabled()` taken at turn start.
+    markdown: bool,
+    /// `-q` mode: stream deltas always, decline gated calls, fail fast.
+    one_shot: bool,
+}
+
+impl CliUi {
+    fn interactive(markdown: bool) -> Self {
+        Self {
+            markdown,
+            one_shot: false,
+        }
+    }
+
+    fn one_shot() -> Self {
+        Self {
+            markdown: false,
+            one_shot: true,
+        }
+    }
+
+    fn raw(&self) -> bool {
+        self.one_shot || !self.markdown
+    }
+}
+
+impl govinda_cli::agent_loop::AgentUi for CliUi {
+    fn raw_stream(&self) -> bool {
+        self.raw()
+    }
+
+    fn stream_delta(&self, delta: &str) {
+        print!("{delta}");
+        let _ = std::io::stdout().flush();
+    }
+
+    fn prose(&self, text: &str) {
+        println!();
+        if !self.raw() {
+            govinda_cli::render::Renderer::new(self.markdown).render_answer(text);
+        }
+    }
+
+    fn answer(&self, text: &str) {
+        if self.raw() {
+            println!("\n");
         } else {
-            Vec::new()
-        },
-        ..ChatOptions::new(
-            auth.token(),
-            app.config.model.as_str(),
-            app.config.temperature,
-        )
-    }
-}
-
-/// One stream attempt (spinner + Ctrl+C race included). Nothing is committed
-/// here; the caller decides what survives.
-async fn stream_round(
-    app: &App,
-    history: &[api::Message],
-    opts: &ChatOptions<'_>,
-) -> (anyhow::Result<()>, String, Vec<api::ToolCall>) {
-    let raw = !app.renderer.markdown_enabled();
-    let mut out = String::new();
-    let mut tool_calls = Vec::new();
-
-    let spinner = Spinner::start("thinking…", !raw);
-    let result = {
-        let http = &app.http;
-        let provider = app.config.provider.clone();
-        let mut sink = api::StreamSink::new(&mut out, &mut tool_calls);
-        tokio::select! {
-            res = api::stream_chat(http, provider.as_ref(), opts, history, &mut sink, |delta| {
-                if raw {
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
-                }
-            }) => res,
-            _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("interrupted")),
+            println!();
+            govinda_cli::render::Renderer::new(self.markdown).render_answer(text);
         }
-    };
-    spinner.stop().await;
-    (result, out, tool_calls)
-}
-
-/// Shows prose the model streamed before requesting tool calls. Raw mode has
-/// already printed it live — only the separator is added there.
-fn show_round_prose(app: &App, raw: bool, text: &str) {
-    if text.trim().is_empty() {
-        return;
     }
-    println!();
-    if !raw {
-        app.renderer.render_answer(text);
-    }
-}
 
-/// Error policy for one failed round: keep any partially generated answer
-/// (marked interrupted), or roll the session back to the pre-round state.
-fn handle_round_error(app: &mut App, raw: bool, out: String, resume_len: usize, e: anyhow::Error) {
-    app.record_error();
-    println!();
-    let err_paint = || paint(format!("error: {e:#}"), govinda_cli::render::err_color());
-    if !out.is_empty() {
-        // Keep what was already generated; mark it clearly. Raw mode has
-        // already streamed the text live, so only markdown re-renders.
-        let kept = format!("{out}\n\n*(interrupted)*");
-        app.session.push_assistant(kept.clone());
-        if !raw {
-            app.renderer.render_answer(&kept);
-        }
-        eprintln!("{}", err_paint());
-    } else {
-        // Roll back, then drop the trailing user prompt (only present
-        // before any tool rounds ran).
-        app.session.truncate_messages(resume_len);
-        app.session.pop_user();
-        eprintln!("{}", err_paint());
-    }
-}
-
-/// Executes each requested call locally and commits the assistant turn
-/// (prose included) plus one `tool` result per call to the session.
-///
-/// Confirmation-gated tools (workspace writes, shell commands) are approved
-/// sequentially first so prompts never interleave. When more than one call is
-/// gated, a batch offer ("approve all?") precedes the per-call gates, and any
-/// `a` answer approves all remaining gated calls — a 10-prompt refactor must
-/// not take 10 keystrokes. In `-q` mode nobody can approve, so gated calls
-/// are auto-declined.
-///
-/// Approved calls execute concurrently via `FuturesUnordered`; results are
-/// printed the moment each settles (completion order) but stored in call
-/// order for the session commit. Declined calls report a sanitized decline
-/// line back to the model.
-///
-/// The model only ever sees a sanitized failure line; the detailed error
-/// chain is printed locally so it never leaks file paths or internals.
-///
-/// Returns `true` when any result in the round signals failure — an errored
-/// call, a declined gate, or a command that exited non-zero — which feeds
-/// the self-correction loop.
-async fn run_tool_round(app: &mut App, prose: &str, calls: &[api::ToolCall]) -> bool {
-    for call in calls {
+    fn tool_start(&self, name: &str, args: &str) {
         println!(
             "{}",
             paint(
-                format!("→ {}({})", call.function.name, call.function.arguments),
+                format!("→ {name}({args})"),
                 govinda_cli::render::dim_color()
             )
         );
     }
 
-    // Approval pass — user prompts must not interleave.
-    let gated: Vec<bool> = calls
-        .iter()
-        .map(|call| {
-            app.tool_executor
-                .as_ref()
-                .is_some_and(|e| e.requires_confirmation(&call.function.name))
-        })
-        .collect();
-    let gated_count = gated.iter().filter(|g| **g).count();
-
-    let mut approve_rest = false;
-    if gated_count > 1 && !app.non_interactive {
-        approve_rest = confirm_batch(calls, &gated);
-    }
-
-    let mut allowed = Vec::with_capacity(calls.len());
-    for (i, call) in calls.iter().enumerate() {
-        let approved = if !gated[i] {
-            true
-        } else if app.non_interactive || approve_rest {
-            !app.non_interactive
-        } else {
-            // "approve all" is offered while later gated calls remain.
-            let more_gated_after = gated[i + 1..].iter().filter(|g| **g).count() > 0;
-            match confirm_tool_call(
-                &call.function.name,
-                &call.function.arguments,
-                more_gated_after,
-            ) {
-                Confirmation::ApprovedAll => {
-                    approve_rest = true;
-                    true
-                }
-                Confirmation::Approved => true,
-                Confirmation::Declined => false,
-            }
-        };
-        allowed.push(approved);
-    }
-
-    // Concurrent execution pass. The executor Arc is cloned out up front so
-    // `app` stays free to mutate while futures are being polled and results
-    // stream to the terminal as they complete (not batched behind join_all).
-    let executor: Option<std::sync::Arc<dyn govinda_cli::tools::ToolExecutor>> =
-        app.tool_executor.clone();
-    let mut futures: futures_util::stream::FuturesUnordered<_> = calls
-        .iter()
-        .enumerate()
-        .map(|(i, call)| {
-            let approved = allowed[i];
-            let name = call.function.name.clone();
-            let args = call.function.arguments.clone();
-            let executor = executor.clone();
-            async move {
-                let outcome = match (approved, executor) {
-                    (false, _) => Err(anyhow::anyhow!("declined")),
-                    (true, Some(executor)) => executor.execute(&name, &args).await,
-                    (true, None) => Err(anyhow::anyhow!("no tool executor configured")),
-                };
-                (i, outcome)
-            }
-        })
-        .collect();
-
-    let mut outcomes: Vec<Option<anyhow::Result<String>>> =
-        (0..calls.len()).map(|_| None).collect();
-    let mut had_failure = false;
-    while let Some((i, outcome)) = futures.next().await {
-        match &outcome {
-            Ok(value) => println!(
-                "{}",
-                paint(
-                    format!("← {}", truncate_line(value, TOOL_RESULT_DISPLAY_CHARS)),
-                    govinda_cli::render::dim_color()
-                )
-            ),
-            Err(e) if e.to_string() == "declined" => {
-                println!("{}", paint("✗ declined", govinda_cli::render::err_color()))
-            }
-            Err(e) => eprintln!(
-                "{}",
-                paint(
-                    format!("tool '{}' failed: {e:#}", calls[i].function.name),
-                    govinda_cli::render::err_color()
-                )
-            ),
+    fn tool_end(&self, _name: &str, _args: &str, ok: bool, snippet: &str) {
+        if !ok && snippet.is_empty() {
+            return;
         }
-        if outcome.is_err() || outcome.as_deref().is_ok_and(result_signals_failure) {
-            had_failure = true;
-        }
-        outcomes[i] = Some(outcome);
+        println!(
+            "{}",
+            paint(
+                format!("← {snippet}"),
+                govinda_cli::render::dim_color()
+            )
+        );
     }
 
-    // Session commit stays in call order regardless of completion order.
-    let mut results = Vec::with_capacity(calls.len());
-    for (call, outcome) in calls.iter().zip(outcomes) {
-        let Some(outcome) = outcome else {
-            results.push((
-                call.id.clone(),
-                format!("error: tool '{}' produced no result", call.function.name),
-            ));
-            had_failure = true;
-            continue;
-        };
-        match outcome {
+    fn diff(&self, diff: &str) {
+        govinda_cli::render::render_diff(diff);
+    }
+
+    fn notice(&self, text: &str) {
+        println!(
+            "{}",
+            paint(
+                text.to_owned(),
+                govinda_cli::render::dim_color()
+            )
+        );
+    }
+
+    fn error(&self, text: &str) {
+        eprintln!(
+            "{}",
+            paint(format!("error: {text}"), govinda_cli::render::err_color())
+        );
+    }
+
+    fn timeline(&self, model: &str, elapsed: std::time::Duration) {
+        println!(
+            "{}",
+            paint(
+                format!("── {model} · {:.1}s", elapsed.as_secs_f32()),
+                govinda_cli::render::dim_color()
+            )
+        );
+    }
+
+    fn confirm_batch(&self, gated_count: usize) -> bool {
+        // The call list preview is printed by the loop via tool_start lines
+        // already; here we only ask once for all of them.
+        println!();
+        println!(
+            "{}",
+            paint(
+                format!("⚠ {gated_count} tools modify your workspace:"),
+                crossterm::style::Color::Yellow
+            )
+        );
+        print!(
+            "{}",
+            paint("approve all? [y/N] ", crossterm::style::Color::Yellow)
+        );
+        read_confirmation_answer()
+    }
+
+    fn confirm(&self, name: &str, arguments_json: &str, allow_all: bool) -> govinda_cli::agent_loop::Confirm {
+        use govinda_cli::agent_loop::Confirm;
+        println!();
+        println!(
+            "{}",
+            paint(
+                format!("⚠ tool '{name}' modifies your workspace:"),
+                crossterm::style::Color::Yellow
+            )
+        );
+        match serde_json::from_str::<serde_json::Value>(arguments_json) {
             Ok(value) => {
-                // Phase 6.1: staged edits stream their unified diff to the
-                // terminal immediately, in color; also track the focus file.
-                if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&value) {
-                    if let Some(path) = payload.get("path").and_then(|p| p.as_str()) {
-                        app.focus_file = Some(path.to_owned());
-                    }
-                    if let Some(diff) = payload.get("diff").and_then(|d| d.as_str())
-                        && !diff.trim().is_empty()
-                    {
-                        govinda_cli::render::render_diff(diff);
-                    }
+                let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
+                let preview = truncate_chars(&pretty, 2000);
+                for line in preview.lines().take(40) {
+                    println!("  {line}");
                 }
-                results.push((call.id.clone(), truncate_result(&value)));
             }
-            Err(e) if e.to_string() == "declined" => {
-                results.push((
-                    call.id.clone(),
-                    "error: user declined this operation — ask how to proceed before retrying"
-                        .to_owned(),
-                ));
-            }
-            Err(_) => {
-                results.push((
-                    call.id.clone(),
-                    format!("error: tool '{}' failed", call.function.name),
-                ));
-            }
+            Err(_) => println!("  {}", truncate_chars(arguments_json, 2000)),
+        }
+        let hint = if allow_all { "[y/N/a(ll)]" } else { "[y/N]" };
+        print!(
+            "{}",
+            paint(format!("proceed? {hint} "), crossterm::style::Color::Yellow)
+        );
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        match std::io::stdin().read_line(&mut answer) {
+            Ok(0) | Err(_) => return Confirm::Declined,
+            Ok(_) => {}
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => Confirm::Approved,
+            "a" | "all" if allow_all => Confirm::ApprovedAll,
+            _ => Confirm::Declined,
         }
     }
-    app.session.commit_tool_round(prose, calls, &results);
-    had_failure
-}
 
-/// One-shot offer covering every gated call in the round: list them compactly,
-/// then ask once instead of prompting per call.
-fn confirm_batch(calls: &[api::ToolCall], gated: &[bool]) -> bool {
-    println!();
-    println!(
-        "{}",
-        paint(
-            format!(
-                "⚠ {} tools modify your workspace:",
-                gated.iter().filter(|g| **g).count()
-            ),
-            crossterm::style::Color::Yellow
-        )
-    );
-    for (call, _) in calls.iter().zip(gated).filter(|(_, g)| **g) {
-        let args = truncate_chars(&call.function.arguments.replace('\n', " "), 120);
-        println!("  • {}({args})", call.function.name);
-    }
-    print!(
-        "{}",
-        paint("approve all? [y/N] ", crossterm::style::Color::Yellow)
-    );
-    read_confirmation_answer()
-}
-
-enum Confirmation {
-    Approved,
-    ApprovedAll,
-    Declined,
-}
-
-/// Interactive y/N gate for workspace-mutating tools. Shows a truncated
-/// pretty-print of the arguments so the user can see exactly what would run.
-/// When more gated calls follow this one, `a` approves all of them too.
-fn confirm_tool_call(name: &str, arguments_json: &str, allow_all: bool) -> Confirmation {
-    println!();
-    println!(
-        "{}",
-        paint(
-            format!("⚠ tool '{name}' modifies your workspace:"),
-            crossterm::style::Color::Yellow
-        )
-    );
-    match serde_json::from_str::<serde_json::Value>(arguments_json) {
-        Ok(value) => {
-            let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
-            let preview = truncate_chars(&pretty, 2000);
-            for line in preview.lines().take(40) {
-                println!("  {line}");
-            }
-        }
-        Err(_) => println!("  {}", truncate_chars(arguments_json, 2000)),
-    }
-    let hint = if allow_all { "[y/N/a(ll)]" } else { "[y/N]" };
-    print!(
-        "{}",
-        paint(format!("proceed? {hint} "), crossterm::style::Color::Yellow)
-    );
-    let _ = std::io::stdout().flush();
-    let mut answer = String::new();
-    match std::io::stdin().read_line(&mut answer) {
-        Ok(0) | Err(_) => return Confirmation::Declined,
-        Ok(_) => {}
-    }
-    match answer.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Confirmation::Approved,
-        "a" | "all" if allow_all => Confirmation::ApprovedAll,
-        _ => Confirmation::Declined,
+    fn fail_fast(&self) -> bool {
+        self.one_shot
     }
 }
 
-/// Reads one stdin line for the confirmation prompts (`Ok(0)`/EOF declines).
 fn read_confirmation_answer() -> bool {
+    use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
     match std::io::stdin().read_line(&mut answer) {
         Ok(0) | Err(_) => false,
         Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
     }
-}
-
-/// Heuristic over a committed tool-result string: `error:` prefixes from
-/// the executor, or a structured JSON payload with a non-zero exit code
-/// (`run_shell`, `check_project`…) count as failures.
-fn result_signals_failure(value: &str) -> bool {
-    if value.starts_with("error:") {
-        return true;
-    }
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()
-        .and_then(|v| v.get("exit_code").and_then(serde_json::Value::as_i64))
-        .is_some_and(|code| code != 0)
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -970,72 +793,29 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Dimmed footer printed after every completed answer: model, wall time,
-/// and how many agent rounds it took — a mini timeline for the turn.
-fn show_timeline(app: &App, elapsed: std::time::Duration) {
-    println!(
-        "{}",
-        paint(
-            format!("── {} · {:.1}s", app.config.model, elapsed.as_secs_f32()),
-            govinda_cli::render::dim_color()
-        )
-    );
-}
-
-fn finish_text_answer(app: &mut App, raw: bool, out: String) {
-    if out.trim().is_empty() {
-        println!(
+/// Interactive REPL turn through the shared loop.
+async fn run_turn(app: &mut App, input: &str) {
+    let ui = CliUi::interactive(app.renderer.markdown_enabled());
+    match govinda_cli::agent_loop::run_turn(app, &ui, govinda_cli::agent_loop::GatePolicy::Interactive, input)
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => eprintln!(
             "{}",
-            paint("(empty response)", govinda_cli::render::dim_color())
-        );
-        return;
-    }
-    if raw {
-        println!("\n");
-    } else {
-        println!();
-        app.renderer.render_answer(&out);
-    }
-    app.session.push_assistant(out);
-}
-
-fn truncate_line(s: &str, max_chars: usize) -> String {
-    let first = s.lines().next().unwrap_or("");
-    if first.chars().count() <= max_chars {
-        first.to_owned()
-    } else {
-        let cut: String = first.chars().take(max_chars).collect();
-        format!("{cut}…")
+            paint(format!("error: {e:#}"), govinda_cli::render::err_color())
+        ),
     }
 }
 
-/// Cap applied *before* a tool result enters the session history.
-fn truncate_result(s: &str) -> String {
-    if s.chars().count() <= MAX_TOOL_RESULT_CHARS {
-        s.to_owned()
-    } else {
-        let cut: String = s.chars().take(MAX_TOOL_RESULT_CHARS).collect();
-        format!("{cut}\n…(truncated)")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn failure_detection_covers_errors_and_exit_codes() {
-        assert!(result_signals_failure(
-            "error: user declined this operation"
-        ));
-        assert!(result_signals_failure(
-            r#"{"exit_code":101,"stdout":"compile error"}"#
-        ));
-        assert!(!result_signals_failure(r#"{"exit_code":0,"stdout":"ok"}"#));
-        // Plain text results (read_file output…) are never failures.
-        assert!(!result_signals_failure("[outline]\n    1| fn main()"));
-        assert!(!result_signals_failure(""));
-        // Malformed JSON without an error prefix: not a failure signal.
-        assert!(!result_signals_failure("{not json"));
-    }
+/// Auto-run turn used by the `--build` pipeline: gated tools execute
+/// without per-call prompts (the pipeline was confirmed once up front).
+async fn run_turn_auto(app: &mut App, input: &str) {
+    let ui = CliUi::interactive(app.renderer.markdown_enabled());
+    let _ = govinda_cli::agent_loop::run_turn(
+        app,
+        &ui,
+        govinda_cli::agent_loop::GatePolicy::AutoRun,
+        input,
+    )
+    .await;
 }

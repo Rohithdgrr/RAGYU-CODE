@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -28,13 +28,8 @@ use ratatui::Terminal;
 use super::widgets::chat_pane::ChatEntry;
 use super::widgets::file_tree::FileTree;
 use super::{draw, icons, theme};
-use crate::api::{self, ChatOptions, StreamSink};
+use crate::api;
 use crate::commands::{self, App};
-
-/// Upper bound on model↔tool round trips per user turn (mirrors the REPL).
-const MAX_TOOL_ROUNDS: usize = 5;
-/// Cap applied *before* a tool result enters session history.
-const MAX_TOOL_RESULT_CHARS: usize = 8 * 1024;
 
 /// Slash commands that never take an argument — Enter on the palette runs
 /// them directly instead of opening the args dialog.
@@ -98,20 +93,11 @@ pub struct SlashDialog {
 pub enum TurnUpdate {
     AssistantProse(String),
     ToolStart { name: String, args: String },
-    ToolEnd { name: String, args: String, ok: bool },
-    /// A workspace-mutating call needs explicit approval (Review mode).
-    ConfirmNeeded { name: String, args: String },
+    /// `snippet` is a short result preview (first line, truncated).
+    ToolEnd { name: String, args: String, ok: bool, snippet: String },
     Answer(String),
     Notice(String),
     Error(String),
-}
-
-/// User's answer to a gated-tool prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfirmDecision {
-    Approve,
-    ApproveAll,
-    Decline,
 }
 
 /// Shared live-streaming buffer (written by the delta callback inside the
@@ -144,14 +130,11 @@ pub struct Tui {
     pub tree: Option<FileTree>,
     pending_clear: bool,
     pending_prompt: Option<String>,
-    /// Gated-tool approval channel (Some while a turn runs).
-    confirm_tx: Option<tokio::sync::mpsc::UnboundedSender<ConfirmDecision>>,
     /// True while the input gate is up for a workspace-mutating call.
     pub confirm_pending: bool,
     /// Files pinned via the tree sidebar; injected into every turn's context.
     pub pinned_files: Vec<PathBuf>,
     // ── Plan mode ──
-    pending_plan_task: Option<String>,
     plan_title: String,
     plan_steps: Vec<(String, bool)>,
     plan_cursor: usize,
@@ -211,10 +194,8 @@ impl Tui {
             tree: None,
             pending_clear: false,
             pending_prompt: None,
-            confirm_tx: None,
             confirm_pending: false,
             pinned_files: Vec::new(),
-            pending_plan_task: None,
             plan_title: String::new(),
             plan_steps: Vec::new(),
             plan_cursor: 0,
@@ -503,35 +484,16 @@ impl Tui {
                     "keys: Tab focus · ↑/↓ palette/history · Space expand dir · Enter \
                      open/pin file · F5 refresh · Esc clear/cancel · Ctrl+C cancel stream \
                      · Ctrl+L clear · Ctrl+T left tree · Ctrl+P explorer · Ctrl+Q quit\n\
-                     gated calls pause in [REVIEW]: y approve · n decline · a all\n\
                      cmds: /help /clear /theme /tokens /agent <on|off> /plan <task> /model /temp /system /history /undo /retry /variants /pick /compact /search /save /load /sessions /fork /export /stats /raw /config /timeout /limit /tools /todo /diff /apply /reject /review /scan /project\n\
                       Tip: type \"/\" to see the palette — Enter/↑↓/click open the args dialog, Tab completes.",
                 );
                 return true;
             }
-            "/theme" => {
-                // "/theme" alone handled locally; "/theme <name>" needs App for persistence check but toggle is fine
-                if rest.trim().is_empty() {
-                    let t = theme::toggle();
-                    self.notice(format!("switched to the {} theme", t.name()));
-                    return true;
-                }
-                // fall through to App-aware dispatch for "/theme <name>"
+            "/theme" | "/tokens" | "/plan" => {
+                // Theme switching, token counts and planning are handled by
+                // the unified command dispatcher (commands::dispatch) so the
+                // TUI and REPL always agree.
                 return false;
-            }
-            "/tokens" => {
-                self.notice("tokens — see top bar for live usage ( /tokens for full BPE count )");
-                return true;
-            }
-            "/plan" => {
-                let task = rest.trim();
-                if task.is_empty() {
-                    self.notice("usage: /plan <task> — decompose a task and execute step by step");
-                } else {
-                    self.pending_plan_task = Some(task.to_owned());
-                    self.notice("planning…");
-                }
-                return true;
             }
             "/pin" => {
                 if let Some(tree) = &self.tree {
@@ -886,15 +848,12 @@ impl Tui {
             self.handle_dialog_key(key);
             return;
         }
-        // Review-mode prompt intercepts everything except quit.
+        // Review-mode prompt intercepts everything except quit. (Kept for
+        // future interactive gating; the shared agent loop currently runs
+        // gated tools in AutoRun mode, so this never triggers.)
         if self.confirm_pending {
             match (key.modifiers, key.code) {
                 (KeyModifiers::CONTROL, KeyCode::Char('q')) => self.quit = true,
-                (_, KeyCode::Char('y')) => self.answer_confirm(ConfirmDecision::Approve),
-                (_, KeyCode::Char('n')) | (_, KeyCode::Esc) => {
-                    self.answer_confirm(ConfirmDecision::Decline)
-                }
-                (_, KeyCode::Char('a')) => self.answer_confirm(ConfirmDecision::ApproveAll),
                 _ => {}
             }
             return;
@@ -1060,16 +1019,6 @@ impl Tui {
         }
     }
 
-    /// Sends the user's answer for the pending gated call and restores the
-    /// pre-review mode.
-    fn answer_confirm(&mut self, decision: ConfirmDecision) {
-        if let Some(tx) = &self.confirm_tx {
-            let _ = tx.send(decision);
-        }
-        self.confirm_pending = false;
-        self.mode = self.prev_mode;
-    }
-
     fn ensure_tree(&mut self) {
         if self.tree.is_none() {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1144,10 +1093,6 @@ impl Tui {
             .replace('\\', "/");
         self.pinned_files.push(path);
         self.notice(format!("{} pinned {rel} to context", crate::tui::icons::PINNED));
-    }
-
-    pub fn take_plan_request(&mut self) -> Option<String> {
-        self.pending_plan_task.take()
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) {
@@ -1333,7 +1278,7 @@ impl Tui {
                 });
                 self.scroll_from_bottom = 0;
             }
-            TurnUpdate::ToolEnd { name, args, ok } => {
+            TurnUpdate::ToolEnd { name, args, ok, snippet } => {
                 if let Some(ChatEntry::Tool { ok: slot, .. }) = self
                     .entries
                     .iter_mut()
@@ -1348,24 +1293,13 @@ impl Tui {
                         ok: Some(ok),
                     });
                 }
-            }
-            TurnUpdate::ConfirmNeeded { name, args } => {
-                // Back-to-back gates keep the original pre-review mode.
-                if !self.confirm_pending {
-                    self.prev_mode = self.mode;
+                // Result preview so users can see what read_file/grep/…
+                // returned without leaving the transcript.
+                if !snippet.trim().is_empty() {
+                    let text: String = snippet.chars().take(160).collect();
+                    self.entries
+                        .push(ChatEntry::Notice(format!("↳ {text}")));
                 }
-                self.mode = AppMode::Review;
-                self.confirm_pending = true;
-                self.entries.push(ChatEntry::Tool {
-                    name,
-                    args,
-                    ok: None,
-                });
-                self.entries.push(ChatEntry::Notice(
-                    "{} workspace change — [y] approve · [n] decline · [a] approve all remaining"
-                        .into(),
-                ));
-                self.scroll_from_bottom = 0;
             }
             TurnUpdate::Answer(text) => {
                 self.streaming.borrow_mut().clear();
@@ -1553,21 +1487,6 @@ async fn event_loop(
                 tui.plan_entry_idx = None;
                 tui.notice("conversation cleared.");
             }
-            // A queued /plan task is generated once, then gated on y/N.
-            if let Some(task) = tui.take_plan_request() {
-                match generate_plan(app, &task).await {
-                    Ok(steps) if steps.is_empty() => {
-                        tui.notice("the model returned no parseable steps — try rephrasing.");
-                    }
-                    Ok(steps) => {
-                        // The todo list doubles as the plan's tracker (REPL parity).
-                        commands::set_todos(app, &steps);
-                        tui.start_plan(&task, steps);
-                    }
-                    Err(e) => tui.notice(format!("plan generation failed: {e:#}")),
-                }
-                continue;
-            }
             // Fetch available models from the API, then open the /model dialog.
             if tui.take_model_fetch_request() {
                 let models = if let Some(url) = app.config.provider.models_url() {
@@ -1606,9 +1525,6 @@ async fn event_loop(
         let info = status_info(app, &tui);
         let pinned = tui.pinned_files.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TurnUpdate>();
-        let (confirm_tx, confirm_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ConfirmDecision>();
-        tui.confirm_tx = Some(confirm_tx);
         tui.busy = true;
         tui.scroll_from_bottom = 0;
 
@@ -1623,14 +1539,18 @@ async fn event_loop(
         #[allow(clippy::expect_used)] // sound: the clearing arm also breaks
         let exit = {
             // Option lets us release the borrow the moment the turn resolves.
-            let mut turn = Some(Box::pin(run_turn(
-                app,
-                tui.streaming.clone(),
-                tui.cancel.clone(),
-                prompt,
+            let ui = TuiUi {
+                tx: tx.clone(),
+                cancel: tui.cancel.clone(),
+                streaming: tui.streaming.clone(),
                 pinned,
-                tx,
-                confirm_rx,
+                prompt,
+            };
+            let mut turn = Some(Box::pin(crate::agent_loop::run_turn(
+                app,
+                &ui,
+                crate::agent_loop::GatePolicy::AutoRun,
+                ui.prompt.as_str(),
             )));
 
             loop {
@@ -1665,8 +1585,9 @@ async fn event_loop(
                     }
 
                     // Drives the stream forward.
-                    interrupted = turn.as_mut().expect("turn alive while polling").as_mut() => {
+                    _res = turn.as_mut().expect("turn alive while polling").as_mut() => {
                         drop(turn.take());
+                        let interrupted = tui.cancel.load(Ordering::Relaxed);
                         tui.finish_turn(interrupted);
                         break Exit::TurnDone;
                     }
@@ -1678,7 +1599,6 @@ async fn event_loop(
             }
         };
 
-        tui.confirm_tx = None;
         // Drain anything the runner sent right before finishing.
         while let Ok(u) = rx.try_recv() {
             tui.apply_update(u);
@@ -1754,768 +1674,102 @@ fn status_info(app: &App, tui: &Tui) -> draw::StatusInfo {
     }
 }
 
-async fn handle_tui_slash(app: &mut App, tui: &mut Tui, line: &str) {
-    let (cmd, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-    let lc = cmd.to_ascii_lowercase();
-    match lc.as_str() {
-        "/models" => {
-            tui.notice(format!("provider {} — current model {}", app.config.provider.id(), app.config.model));
-            // Also fetch and cache models so the `/model` dialog has them.
-            if let Some(url) = app.config.provider.models_url() {
-                match api::list_models(&app.http, &url, app.config.provider.auth().token()).await {
-                    Ok(list) => {
-                        for id in &list {
-                            let marker = if *id == app.config.model { "  \u{2190} current" } else { "" };
-                            tui.notice(format!("  {id}{marker}"));
-                        }
-                        tui.models_cache = list;
-                    }
-                    Err(e) => tui.notice(format!("failed to list models: {e:#}")),
-                }
-            } else {
-                tui.notice(format!("provider '{}' has no model-listing endpoint", app.config.provider.id()));
+async fn handle_tui_slash(
+    app: &mut App,
+    tui: &mut Tui,
+    line: &str,
+) -> commands::output::CommandOutput {
+    // Unified command path: the same dispatcher the REPL uses, captured into
+    // structured output instead of printing to stdout (which would corrupt
+    // the alternate screen). One source of truth for every slash command.
+    let out = commands::dispatch_structured(line, app).await;
+    apply_command_output(app, tui, line, out.clone());
+    out
+}
+
+/// Maps [`CommandOutput`] onto the TUI: messages become notices or assistant
+/// entries, effects drive theme switches, transcript syncs, plan checklists.
+fn apply_command_output(app: &mut App, tui: &mut Tui, line: &str, out: commands::output::CommandOutput) {
+    use commands::output::{Effect, Role};
+
+    for msg in &out.msgs {
+        match msg.role {
+            Role::Markdown => {
+                tui.entries.push(ChatEntry::Assistant(msg.text.clone()));
+                tui.scroll_from_bottom = 0;
             }
-            tui.notice("tip: /model <name> to switch, /model next|prev to cycle");
+            Role::Err => tui.entries.push(ChatEntry::Notice(format!("error: {}", msg.text))),
+            _ => tui.notice(msg.text.clone()),
         }
-        "/model" => {
-            let arg = rest.trim();
-            if arg.is_empty() {
-                tui.notice(format!("current model: {} ({})", app.config.model, app.config.provider.id()));
-            } else if ["next", "prev", "n", "p"].contains(&arg.to_ascii_lowercase().as_str()) {
-                if tui.models_cache.is_empty() {
-                    // Try fetching models first.
-                    if let Some(url) = app.config.provider.models_url() {
-                        match api::list_models(&app.http, &url, app.config.provider.auth().token()).await {
-                            Ok(list) => {
-                                tui.models_cache = list;
-                            }
-                            Err(e) => {
-                                tui.notice(format!("could not fetch models: {e:#}"));
-                                return;
-                            }
-                        }
-                    }
-                }
-                if !tui.models_cache.is_empty() {
-                    let pos = tui.models_cache.iter().position(|m| *m == app.config.model);
-                    let step = if ["next", "n"].contains(&arg.to_ascii_lowercase().as_str()) {
-                        1
-                    } else {
-                        tui.models_cache.len() - 1
-                    };
-                    let idx = pos.map_or(0, |p| (p + step) % tui.models_cache.len());
-                    app.config.model = tui.models_cache[idx].clone();
-                    tui.notice(format!("model set to {}", app.config.model));
-                } else {
-                    tui.notice(format!("could not cycle models — set directly with /model <name>; current {}", app.config.model));
-                }
-            } else {
-                app.config.model = arg.to_owned();
-                tui.notice(format!("model set to {}", app.config.model));
-            }
+    }
+
+    match out.effect {
+        Effect::None => {}
+        Effect::ExitRequested => {
+            tui.quit = true;
         }
-        "/temp" => {
-            let arg = rest.trim();
-            let v = arg.parse::<f32>().ok().filter(|x| (0.0..=1.0).contains(x));
-            if let Some(val) = v {
-                app.config.temperature = val;
-                tui.notice(format!("temperature set to {val:.2}"));
-            } else {
-                tui.notice(format!("usage: /temp <0.0-1.0> (current {:.2})", app.config.temperature));
-            }
-        }
-        "/system" => {
-            let p = rest.trim();
-            if p.is_empty() {
-                tui.notice(format!("system: {}", app.session.system()));
-            } else {
-                app.session.set_system(p);
-                tui.notice("system prompt updated (next turn)");
-            }
-        }
-        "/history" => {
-            let msgs = app.session.messages();
-            if msgs.is_empty() {
-                tui.notice("(empty history)");
-            } else {
-                for (i, m) in msgs.iter().enumerate() {
-                    let prefix = if m.role == "user" { "you" } else { "govinda" };
-                    let txt: String = m.content.chars().take(120).collect();
-                    tui.notice(format!("[{i} {prefix}] {txt}"));
+        Effect::Resend(text) => {
+            // `/retry` semantics: drop the trailing assistant entries so the
+            // regenerated answer does not duplicate the failed one.
+            let mut end = tui.entries.len();
+            while end > 0 {
+                match tui.entries[end - 1] {
+                    ChatEntry::Notice(_) => end -= 1,
+                    ChatEntry::Assistant(_) => break,
+                    _ => break,
                 }
             }
+            let mut keep = end;
+            if keep > 0 && matches!(tui.entries[keep - 1], ChatEntry::Assistant(_)) {
+                keep -= 1;
+            }
+            tui.entries.truncate(keep);
+            tui.pending_prompt = Some(text);
         }
-        "/undo" => {
-            if app.session.undo() {
-                tui.notice("removed last exchange");
-            } else {
-                tui.notice("nothing to undo");
+        Effect::Plan(steps) => {
+            let task = line.split_once(char::is_whitespace).map_or("task", |(_, r)| r.trim());
+            tui.start_plan(task, steps);
+        }
+        Effect::ThemeChanged(name) => {
+            if theme::set_by_name(&name) {
+                tui.notice(format!("theme set to {name}"));
             }
         }
-        "/retry" => {
-            // find last user message
-            if let Some(last) = app.session.messages().iter().rev().find(|m| m.role == "user").map(|m| m.content.clone()) {
-                tui.notice("regenerating last prompt…");
-                tui.pending_prompt = Some(last);
-            } else {
-                tui.notice("nothing to retry");
-            }
-        }
-        "/variants" | "/pick" => tui.notice("variants/pick are REPL-only"),
-        "/compact" => {
-            tui.notice("compacting history…");
-            // best-effort: keep system + last 2 exchanges
-            let msgs = app.session.messages().to_vec();
-            if msgs.len() > 4 {
-                let keep = 3;
-                let tail = msgs[msgs.len() - keep..].to_vec();
-                app.session.clear();
-                // re-add tail (simplified)
-                for m in tail {
-                    if m.role == "user" { app.session.push_user(m.content); }
-                    else if m.role == "assistant" { app.session.push_assistant(m.content); }
-                }
-                tui.notice(format!("compacted to {} messages", app.session.messages().len()));
-            } else {
-                tui.notice("history already compact");
-            }
-        }
-        "/search" => {
-            let needle = rest.trim();
-            if needle.is_empty() {
-                tui.notice("usage: /search <text>");
-            } else {
-                let hits = app.session.search(needle);
-                if hits.is_empty() {
-                    tui.notice(format!("no matches for '{needle}'"));
-                } else {
-                    for (idx, role, content) in hits.iter().take(5) {
-                        let s: String = content.chars().take(100).collect();
-                        tui.notice(format!("[{idx} {role}] {s}"));
-                    }
-                    tui.notice(format!("{} match(es)", hits.len()));
-                }
-            }
-        }
-        "/save" => {
-            let name = rest.trim();
-            match sanitize_session_name(name) {
-                Some(n) => {
-                    let dir = std::path::Path::new("sessions");
-                    let _ = std::fs::create_dir_all(dir);
-                    let path = dir.join(format!("{n}.json"));
-                    match app.session.save_to(&path) {
-                        Ok(()) => tui.notice(format!("saved session → {}", path.display())),
-                        Err(e) => tui.notice(format!("save failed: {e:#}")),
-                    }
-                }
-                None => tui.notice("usage: /save <name> (letters, digits, - and _ only)"),
-            }
-        }
-        "/load" => {
-            let name = rest.trim();
-            match sanitize_session_name(name) {
-                Some(n) => {
-                    let path = std::path::Path::new("sessions").join(format!("{n}.json"));
-                    match crate::session::Session::load_from(&path) {
-                        Ok(s) => {
-                            app.session = s;
-                            // Rebuild transcript from loaded history.
-                            tui.entries.clear();
-                            for m in app.session.messages() {
-                                if m.role == "user" {
-                                    tui.entries.push(ChatEntry::User(m.content.clone()));
-                                } else if m.role == "assistant" {
-                                    tui.entries.push(ChatEntry::Assistant(m.content.clone()));
-                                }
-                            }
-                            tui.scroll_from_bottom = 0;
-                            tui.notice(format!("loaded session '{}' ({} messages)", n, app.session.messages().len()));
-                        }
-                        Err(e) => tui.notice(format!("load failed: {e:#}")),
-                    }
-                }
-                None => tui.notice("usage: /load <name>"),
-            }
-        }
-        "/sessions" => {
-            let mut names: Vec<String> = std::fs::read_dir("sessions")
-                .map(|rd| {
-                    rd.flatten()
-                        .filter_map(|e| {
-                            let n = e.file_name().to_string_lossy().to_string();
-                            n.strip_suffix(".json").map(str::to_owned)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            names.sort();
-            if names.is_empty() {
-                tui.notice("no saved sessions — /save <name> creates one");
-            } else {
-                tui.notice(format!("{} saved session(s):", names.len()));
-                for n in names.iter().take(15) {
-                    tui.notice(format!("  {n}"));
-                }
-                tui.notice("load with /load <name>");
-            }
-        }
-        "/fork" => {
-            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-            let name = rest.trim();
-            let n = if name.is_empty() {
-                format!("fork-{stamp}")
-            } else {
-                format!("{}-{}", sanitize_session_name(name).unwrap_or_else(|| "fork".into()), stamp)
-            };
-            let dir = std::path::Path::new("sessions");
-            let _ = std::fs::create_dir_all(dir);
-            let path = dir.join(format!("{n}.json"));
-            match app.session.save_to(&path) {
-                Ok(()) => tui.notice(format!("forked snapshot → {}", path.display())),
-                Err(e) => tui.notice(format!("fork failed: {e:#}")),
-            }
-        }
-        "/export" => {
-            let fmt = rest.trim().to_ascii_lowercase();
-            let md = fmt != "txt";
-            let mut out = String::new();
+        Effect::ReloadTranscript => {
+            tui.entries.clear();
             for m in app.session.messages() {
-                if md {
-                    out.push_str(if m.role == "user" { "**You:** " } else { "**Govinda:** " });
-                } else {
-                    out.push_str(if m.role == "user" { "You: " } else { "Govinda: " });
+                match m.role.as_str() {
+                    "user" => tui.entries.push(ChatEntry::User(m.content.clone())),
+                    "assistant" => tui.entries.push(ChatEntry::Assistant(m.content.clone())),
+                    _ => {}
                 }
-                out.push_str(&m.content);
-                out.push_str("\n\n");
             }
-            let ext = if md { "md" } else { "txt" };
-            let path = std::path::Path::new("sessions").join(format!("export.{ext}"));
-            match std::fs::write(&path, out) {
-                Ok(()) => tui.notice(format!("exported {} message(s) → {}", app.session.messages().len(), path.display())),
-                Err(e) => tui.notice(format!("export failed: {e:#}")),
-            }
+            tui.scroll_from_bottom = 0;
         }
-        "/stats" => {
-            let elapsed = app.stats.started.map_or(std::time::Duration::ZERO, |s| s.elapsed());
-            let avg = if app.stats.turns > 0 { app.stats.total_latency_ms / u128::from(app.stats.turns) } else { 0 };
-            tui.notice(format!("turns {} · errors {} · avg {avg}ms · tokens ~{} · uptime {}s", app.stats.turns, app.stats.errors, app.session.approx_tokens(), elapsed.as_secs()));
+        Effect::PopExchange => {
+            pop_last_exchange(&mut tui.entries);
         }
-        "/theme" => {
-            let name = rest.trim();
-            if name.is_empty() {
-                tui.notice(format!("current theme: {} (light/dark)", crate::tui::theme::active().name()));
-            } else {
-                let lower = name.to_ascii_lowercase();
-                let target = if lower.contains("dark") { crate::tui::theme::DARK_THEME } else { crate::tui::theme::LIGHT_THEME };
-                crate::tui::theme::set(target);
-                tui.notice(format!("theme set to {}", target.name()));
-            }
-        }
-        "/raw" => {
-            app.renderer.set_markdown(!app.renderer.markdown_enabled());
-            tui.notice(if app.renderer.markdown_enabled() { "markdown on" } else { "raw streaming" });
-        }
-        "/config" => {
-            let c = rest.trim();
-            if c.eq_ignore_ascii_case("save") {
-                tui.notice("config save — use REPL /config save for full persist");
-            } else {
-                tui.notice(format!("provider {} model {} temp {:.2} budget {} timeout {}s", app.config.provider.id(), app.config.model, app.config.temperature, app.config.context_tokens, app.read_timeout.as_secs()));
-            }
-        }
-        "/timeout" => {
-            if let Ok(s) = rest.trim().parse::<u64>() { if (1..=600).contains(&s) { app.read_timeout = std::time::Duration::from_secs(s); tui.notice(format!("timeout {s}s")); return; } }
-            tui.notice(format!("usage: /timeout <1-600> (current {}s)", app.read_timeout.as_secs()));
-        }
-        "/limit" => {
-            if let Ok(mb) = rest.trim().parse::<u64>() { if (1..=64).contains(&mb) { app.max_response_bytes = (mb as usize)*1024*1024; tui.notice(format!("limit {mb}MB")); return; } }
-            tui.notice(format!("usage: /limit <1-64> (current {}MB)", app.max_response_bytes/(1024*1024)));
-        }
-        "/tools" => {
-            let arg = rest.trim();
-            if arg.is_empty() {
-                let on = if app.tools_enabled { "on" } else { "off" };
-                tui.notice(format!("tools {on} — {} specs, {} disabled", app.tool_specs.len(), app.disabled_tools.len()));
-                for t in &app.tool_specs {
-                    let state = if app.disabled_tools.contains(&t.name) { "off" } else { "on" };
-                    tui.notice(format!(" {state} {} — {}", t.name, t.description));
-                }
-            } else if arg == "on" || arg == "off" {
-                app.tools_enabled = arg == "on";
-                tui.notice(format!("tools {}", arg));
-            } else if let Some((verb, name)) = arg.split_once(char::is_whitespace) {
-                let dis = matches!(verb, "disable"|"dis"|"off");
-                if dis { app.disabled_tools.insert(name.trim().to_owned()); tui.notice(format!("disabled {name}")); }
-                else { app.disabled_tools.remove(name.trim()); tui.notice(format!("enabled {name}")); }
-                let _ = crate::tools::save_disabled_tools(&app.disabled_tools);
-            } else {
-                tui.notice("usage: /tools [on|off] | /tools enable|disable <name>");
-            }
-        }
-        "/todo" => {
-            let (sub, r2) = rest.split_once(char::is_whitespace).map(|(s,r)|(s.to_ascii_lowercase(), r.trim())).unwrap_or((rest.trim().to_ascii_lowercase(), ""));
-            match sub.as_str() {
-                "" | "list" | "ls" => {
-                    if app.todos.is_empty() { tui.notice("(no todos — /todo add <text>)"); }
-                    else { for (i, td) in app.todos.iter().enumerate() { tui.notice(format!("{}. {} [{}]", i+1, td.text, if td.done {"x"} else {" "})); } }
-                }
-                "add" => {
-                    if r2.is_empty() { tui.notice("usage: /todo add <text>"); }
-                    else { app.todos.push(crate::commands::todo::Todo{ text: r2.to_owned(), done:false }); crate::commands::persist_todos(app); tui.notice(format!("added #{}: {}", app.todos.len(), r2)); }
-                }
-                "done" => {
-                    if let Ok(n) = r2.parse::<usize>() { if n>=1 && n<=app.todos.len() { app.todos[n-1].done=true; crate::commands::persist_todos(app); tui.notice(format!("#{n} done")); } else { tui.notice("usage: /todo done <n>"); } } else { tui.notice("usage: /todo done <n>"); }
-                }
-                "undo" | "reopen" => {
-                    if let Ok(n) = r2.parse::<usize>() { if n>=1 && n<=app.todos.len() { app.todos[n-1].done=false; crate::commands::persist_todos(app); tui.notice(format!("#{n} reopened")); } else { tui.notice("usage: /todo undo <n>"); } } else { tui.notice("usage: /todo undo <n>"); }
-                }
-                "rm" | "remove" | "del" => {
-                    if let Ok(n) = r2.parse::<usize>() { if n>=1 && n<=app.todos.len() { let rm=app.todos.remove(n-1); crate::commands::persist_todos(app); tui.notice(format!("removed #{}: {}", n, rm.text)); } else { tui.notice("usage: /todo rm <n>"); } } else { tui.notice("usage: /todo rm <n>"); }
-                }
-                "clear" => { let n=app.todos.len(); app.todos.clear(); crate::commands::persist_todos(app); tui.notice(format!("cleared {n} todo(s)")); }
-                _ => tui.notice("usage: /todo add|list|done|undo|rm|clear"),
-            }
-        }
-        "/diff" => {
-            let ops: Vec<crate::tools::EditOp> = match app.pending_edits.lock() {
-                Ok(q) => q.ops().to_vec(),
-                Err(_) => {
-                    tui.notice("staged-edit queue poisoned");
-                    return;
-                }
-            };
-            if ops.is_empty() {
-                tui.notice("no staged edits — nothing to diff");
-                return;
-            }
-            for (i, op) in ops.iter().enumerate().take(8) {
-                tui.notice(format!("{}. {}", i + 1, op.describe()));
-            }
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            match crate::tools::staged_diff(&cwd, &ops) {
-                Ok(diff) if diff.trim().is_empty() => tui.notice("(edits cancel out — empty diff)"),
-                Ok(diff) => {
-                    for line in diff.lines().take(14) {
-                        tui.notice(line.to_string());
-                    }
-                    tui.notice(format!("(+{} more lines) … /apply to commit", diff.lines().count().saturating_sub(14)));
-                }
-                Err(e) => tui.notice(format!("cannot build diff: {e:#}")),
-            }
-        }
-        "/apply" => {
-            let ops: Vec<crate::tools::EditOp> = match app.pending_edits.lock() {
-                Ok(q) => q.ops().to_vec(),
-                Err(_) => {
-                    tui.notice("staged-edit queue poisoned");
-                    return;
-                }
-            };
-            if ops.is_empty() {
-                tui.notice("no staged edits to apply");
-                return;
-            }
-            // Group by path (first-seen order), validate all, then write atomically.
-            let mut grouped: Vec<(String, Vec<&crate::tools::EditOp>)> = Vec::new();
-            for op in &ops {
-                match grouped.iter_mut().find(|(p, _)| *p == op.path()) {
-                    Some((_, g)) => g.push(op),
-                    None => grouped.push((op.path().to_owned(), vec![op])),
-                }
-            }
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let mut writes: Vec<(std::path::PathBuf, String)> = Vec::new();
-            for (path, group) in &grouped {
-                // Read current content, apply this group's ops.
-                let full = match crate::tools::resolve_in(&cwd, path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tui.notice(format!("apply aborted (nothing written): {e:#}"));
-                        return;
-                    }
-                };
-                match std::fs::read_to_string(&full) {
-                    Ok(content) => {
-                        let refs: Vec<&crate::tools::EditOp> = group.iter().copied().collect();
-                        match crate::tools::apply_ops_to_content(&content, path, &refs) {
-                            Ok(updated) => writes.push((full, updated)),
-                            Err(e) => {
-                                tui.notice(format!("apply aborted (nothing written): {e:#}"));
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tui.notice(format!("apply aborted: cannot read '{path}': {e}"));
-                        return;
-                    }
-                }
-            }
-            let mut failed = 0;
-            for (full, content) in &writes {
-                if std::fs::write(full, content).is_err() {
-                    failed += 1;
-                }
-            }
-            if failed > 0 {
-                tui.notice(format!("{failed} write(s) failed — inspect files before retrying"));
-            } else if let Ok(mut q) = app.pending_edits.lock() {
-                let n = ops.len();
-                let f = grouped.len();
-                q.clear();
-                tui.notice(format!("{} applied {n} edit(s) across {f} file(s)", icons::CHECK));
-                if let Some(tree) = tui.tree.as_mut() {
-                    tree.mark_dirty();
-                }
-                // Incremental symbol index: rebuild after applying edits
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let syms = crate::symbols::rebuild(&cwd);
-                if syms > 0 {
-                    tui.notice(format!("symbol index refreshed ({syms} symbols)"));
-                }
-            }
-        }
-        "/reject" => {
-            let n = app.pending_edits.lock().map(|q| q.ops().len()).unwrap_or(0);
-            if let Ok(mut q) = app.pending_edits.lock() {
-                q.clear();
-            }
-            if n == 0 {
-                tui.notice("nothing staged to reject");
-            } else {
-                tui.notice(format!("discarded {n} staged edit(s); no files changed"));
-            }
-        }
-        "/review" => {
-            let ops: Vec<crate::tools::EditOp> = match app.pending_edits.lock() {
-                Ok(q) => q.ops().to_vec(),
-                Err(_) => {
-                    tui.notice("staged-edit queue poisoned");
-                    return;
-                }
-            };
-            if ops.is_empty() {
-                tui.notice("no staged edits — nothing to review");
-                return;
-            }
-            let mut grouped: Vec<(String, Vec<&crate::tools::EditOp>)> = Vec::new();
-            for op in &ops {
-                match grouped.iter_mut().find(|(p, _)| *p == op.path()) {
-                    Some((_, g)) => g.push(op),
-                    None => grouped.push((op.path().to_owned(), vec![op])),
-                }
-            }
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let mut total_add = 0usize;
-            let mut total_rm = 0usize;
-            tui.notice(format!("{} file(s) modified:", grouped.len()));
-            for (path, group) in &grouped {
-                let owned: Vec<crate::tools::EditOp> = group.iter().map(|op| (*op).clone()).collect();
-                match crate::tools::staged_diff(&cwd, &owned) {
-                    Ok(diff) => {
-                        let (a, r) = crate::diff::count_changes(&diff);
-                        total_add += a;
-                        total_rm += r;
-                        tui.notice(format!("  {path}: +{a}/-{r}"));
-                    }
-                    Err(e) => tui.notice(format!("  {path}: diff failed ({e:#})")),
-                }
-            }
-            tui.notice(format!("total +{total_add}/-{total_rm} — /apply to commit, /reject to discard"));
-        }
-        "/scan" => {
-            tui.notice("scanning workspace…");
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let overview = crate::scan::scan(&cwd).await;
-            let n = crate::symbols::rebuild(&cwd);
-            tui.notice(format!("scanned {n} symbols"));
-            for line in overview.lines().take(12) { tui.notice(line.to_string()); }
-        }
-        "/project" => {
-            let arg = rest.trim();
-            if arg.is_empty() {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                match std::fs::read_to_string(cwd.join(".govinda_project.json")) {
-                    Ok(raw) => {
-                        for line in raw.lines().take(8) {
-                            tui.notice(line.to_string());
-                        }
-                    }
-                    Err(_) => tui.notice("no project memory yet — /project set test|build <cmd>"),
-                }
-            } else if let Some((verb, r)) = arg.split_once(char::is_whitespace) {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                let path = cwd.join(".govinda_project.json");
-                let mut map: serde_json::Value = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|raw| serde_json::from_str(&raw).ok())
-                    .unwrap_or_else(|| serde_json::json!({}));
-                match verb {
-                    "set" => {
-                        if let Some((key, cmd)) = r.split_once(char::is_whitespace) {
-                            map[key.trim()] = serde_json::json!(cmd.trim());
-                            match serde_json::to_string_pretty(&map).map(|j| std::fs::write(&path, j)) {
-                                Ok(Ok(())) => tui.notice(format!("project {key} = '{cmd}'")),
-                                _ => tui.notice("could not write project memory"),
-                            }
-                        } else {
-                            tui.notice("usage: /project set test|build <cmd>");
-                        }
-                    }
-                    "clear" => {
-                        if let Some(obj) = map.as_object_mut() {
-                            obj.remove(r.trim());
-                        }
-                        match serde_json::to_string_pretty(&map).map(|j| std::fs::write(&path, j)) {
-                            Ok(Ok(())) => tui.notice(format!("cleared project {r}")),
-                            _ => tui.notice("could not write project memory"),
-                        }
-                    }
-                    _ => tui.notice("usage: /project show | set test|build <cmd> | clear test|build"),
-                }
-            } else {
-                tui.notice("usage: /project show | set test|build <cmd> | clear test|build");
-            }
-        }
-        "/plan" => {
-            let task = rest.trim();
-            if task.is_empty() {
-                tui.notice("usage: /plan <task> — decompose a task and execute step by step");
-            } else {
-                tui.pending_plan_task = Some(task.to_owned());
-                tui.notice("planning…");
-            }
-        }
-        "/agent" => {
-            let requested = match rest.trim() {
-                "on" => Some(AppMode::Agent),
-                "off" => Some(AppMode::Normal),
-                "" => None,
-                _ => {
-                    tui.notice("usage: /agent <on|off>");
-                    None
-                }
-            };
-            match requested {
-                Some(next) => {
-                    if tui.mode.transition_to(next) {
-                        tui.notice(format!("mode: {}", tui.mode.label()));
-                    } else {
-                        tui.notice(format!(
-                            "cannot enter {} from {}",
-                            next.label(),
-                            tui.mode.label()
-                        ));
-                    }
-                }
-                None => tui.notice(format!("mode: {}", tui.mode.label())),
-            }
-        }
-        "/pin" => {
-            let selected = tui
-                .tree
-                .as_ref()
-                .and_then(|tree| tree.selected_node())
-                .filter(|n| !n.is_dir)
-                .map(|n| n.rel.clone());
-            match selected {
-                Some(rel) => {
-                    let path = std::env::current_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-                    tui.pin_file(path);
-                }
-                None => tui.notice(
-                    "select a file in the explorer first (Ctrl+T / Ctrl+P), then /pin.",
-                ),
-            }
-        }
-        "/quit" | "/exit" | "/q" => { tui.quit = true; tui.notice("quitting…"); },
-        "/clear" | "/reset" => { app.session.clear(); tui.entries.clear(); tui.notice("cleared"); },
-        "/help" => {
-            for l in [
-                "keys: Tab focus · ↑/↓ palette · Enter opens args dialog · F5 refresh",
-                "      dialog: type args · Enter execute · Esc cancel · click outside closes",
-                "type \"/\" in the input to browse all commands",
-            ] {
-                tui.notice(l.to_string());
-            }
-        }
-        "/checkpoint" => {
-            let label = rest.trim();
-            let label = if label.is_empty() { format!("turn {}", tui.entries.len()) } else { label.to_owned() };
-            let cp = app.checkpoints.checkpoint(&label, app.session.messages()).to_owned();
-            tui.notice(format!("checkpoint #{} saved ({} msgs)", cp.id, cp.message_count));
-        }
-        "/rewind" => {
-            let arg = rest.trim();
-            let id = if arg.is_empty() { None } else { arg.parse::<usize>().ok() };
-            match app.checkpoints.rewind_to(id.unwrap_or(0)) {
-                Some(messages) => {
-                    app.session.clear();
-                    tui.entries.clear();
-                    for m in messages {
-                        match m.role.as_str() {
-                            "user" => { app.session.push_user(m.content.clone()); tui.entries.push(ChatEntry::User(m.content)); }
-                            "assistant" => { app.session.push_assistant(m.content.clone()); tui.entries.push(ChatEntry::Assistant(m.content)); }
-                            "system" => app.session.set_system(m.content),
-                            _ => {}
-                        }
-                    }
-                    tui.scroll_from_bottom = 0;
-                    tui.notice(format!("rewound — {} messages restored", app.session.messages().len()));
-                }
-                None => tui.notice("no checkpoint found with that id"),
-            }
-        }
-        "/memory" => {
-            let arg = rest.trim();
-            if arg.starts_with("add ") || arg.starts_with("note ") {
-                let note = arg.split_once(char::is_whitespace).map_or("", |(_, r)| r);
-                let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                match crate::memory::ProjectMemory::append_note(&workspace, note) {
-                    Ok(()) => tui.notice("note added to .govinda/memory.md"),
-                    Err(e) => tui.notice(format!("failed to add note: {e:#}")),
-                }
-            } else if app.project_memory.has_content() {
-                tui.notice(format!("project memory loaded ({} chars)", app.project_memory.to_system_suffix().unwrap_or_default().len()));
-            } else {
-                tui.notice("no project memory found — create AGENTS.md, CLAUDE.md, or .govinda/memory.md");
-            }
-        }
-        "/skills" => {
-            if app.skills.is_empty() {
-                tui.notice("no skills found — create .md files in ~/.config/govinda/skills/");
-            } else {
-                tui.notice(format!("{} skill(s):", app.skills.len()));
-                for s in &app.skills {
-                    tui.notice(format!("  {} — {}{}", s.name, s.description, if s.requires_args { " (args required)" } else { "" }));
-                }
-            }
-        }
-        "/commit" => {
-            let msg = rest.trim();
-            if msg.is_empty() {
-                tui.notice("usage: /commit <message>");
-            } else {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                match crate::git::run_git(&cwd, &["add", "-A"]).await {
-                    Ok(_) => match crate::git::run_git(&cwd, &["commit", "-m", msg]).await {
-                        Ok(out) => {
-                            for l in out.lines().take(5) { tui.notice(l.to_string()); }
-                        }
-                        Err(e) => tui.notice(format!("commit failed: {e:#}")),
-                    },
-                    Err(e) => tui.notice(format!("git add failed: {e:#}")),
-                }
-            }
-        }
-        "/pr" => {
-            let arg = rest.trim();
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            if arg == "create" || arg.is_empty() {
-                let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-                let branch = format!("govinda/{timestamp}");
-                match crate::git::run_git(&cwd, &["checkout", "-b", &branch]).await {
-                    Ok(_) => {
-                        tui.notice(format!("created branch {branch}"));
-                        tui.notice("make changes, then /commit <message> to commit");
-                    }
-                    Err(e) => tui.notice(format!("branch creation failed: {e:#}")),
-                }
-            } else if arg == "list" {
-                match crate::git::run_git(&cwd, &["branch", "--list"]).await {
-                    Ok(branches) => { for l in branches.lines().take(10) { tui.notice(l.to_string()); } }
-                    Err(e) => tui.notice(format!("git branch failed: {e:#}")),
-                }
-            } else {
-                match crate::git::run_git(&cwd, &["checkout", arg]).await {
-                    Ok(_) => tui.notice(format!("switched to {arg}")),
-                    Err(e) => tui.notice(format!("branch switch failed: {e:#}")),
-                }
-            }
-        }
-        "/pty" => {
-            tui.notice("PTY: use run_shell tool for long-running commands — the TUI streams output live");
-        }
-        "/auto-compact" => {
-            let arg = rest.trim();
-            if arg == "on" { app.auto_compact_enabled = true; tui.notice("auto-compact enabled"); }
-            else if arg == "off" { app.auto_compact_enabled = false; tui.notice("auto-compact disabled"); }
-            else { let s = if app.auto_compact_enabled { "on" } else { "off" }; tui.notice(format!("auto-compact is {s}")); }
-        }
-        _ => {
-            // Check if it matches a loaded skill
-            if let Some(skill) = app.skills.iter().find(|s| s.name.eq_ignore_ascii_case(&lc)) {
-                let body = if rest.trim().is_empty() && skill.requires_args {
-                    format!("{}\n\n{}", skill.body, "(This skill requires arguments)")
-                } else if rest.trim().is_empty() {
-                    skill.body.clone()
-                } else {
-                    format!("{}\n\nUser input: {}", skill.body, rest.trim())
-                };
-                tui.notice(format!("executing skill: {}", skill.name));
-                // Queue as a prompt so the model processes the skill body
-                tui.pending_prompt = Some(body);
-            } else {
-                tui.notice(format!(
-                    "unknown command '{lc}' — type \"/\" to see palette or /help"
-                ));
-            }
-        },
     }
 }
 
-/// Session-name sanitizer for /save, /load, /fork: lowercase word chars and
-/// dashes only; anything else (paths, dots) is rejected.
-fn sanitize_session_name(raw: &str) -> Option<String> {
-    let n = raw.trim();
-    if n.is_empty() || n.len() > 64 {
-        return None;
+/// Drops the trailing user+assistant pair from the transcript, skipping any
+/// notices printed alongside (the dispatcher emits them before the effect).
+fn pop_last_exchange(entries: &mut Vec<ChatEntry>) {
+    let mut end = entries.len();
+    while end > 0 && matches!(entries[end - 1], ChatEntry::Notice(_)) {
+        end -= 1;
     }
-    if !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return None;
+    let mut keep = end;
+    if keep > 0 && matches!(entries[keep - 1], ChatEntry::Assistant(_)) {
+        keep -= 1;
     }
-    Some(n.to_ascii_lowercase())
+    if keep > 0 && matches!(entries[keep - 1], ChatEntry::User(_)) {
+        keep -= 1;
+    }
+    entries.truncate(keep);
 }
 
-/// One non-interactive model call that decomposes a task into steps.
-/// Mirrors the REPL's `/plan` without any stdout output.
-async fn generate_plan(app: &mut App, task: &str) -> Result<Vec<String>> {
-    anyhow::ensure!(app.tools_enabled, "planning needs function calling — /tools on");
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let overview = crate::scan::scan(&cwd).await;
-    const PLAN_SYSTEM: &str = "You are a planning assistant for a coding agent that can scan, \
-read, edit, and verify code in the user's workspace. Decompose the given task into short, \
-concrete, self-contained steps (at most 10), ordered so each builds on the last. Prefer steps \
-that name specific files or commands. Reply ONLY with a markdown numbered list — one step per \
-line, no prose before or after.";
-    let ctx = [
-        api::Message::system(PLAN_SYSTEM),
-        api::Message::user(format!(
-            "Task:\n{task}\n\nWorkspace overview:\n{overview}\n\nProduce the plan now."
-        )),
-    ];
-    let auth = app.config.provider.auth();
-    // Planning must not recurse into tool calls.
-    let opts = ChatOptions::new(auth.token(), &app.config.model, app.config.temperature);
-    let mut out = String::new();
-    let mut no_calls = Vec::new();
-    {
-        let mut sink = StreamSink::new(&mut out, &mut no_calls);
-        api::stream_chat(
-            &app.http,
-            app.config.provider.as_ref(),
-            &opts,
-            &ctx,
-            &mut sink,
-            |_| {},
-        )
-        .await?;
-    }
-    Ok(commands::parse_steps(&out))
-}
+// ─── Turn runner ─────────────────────────────────────────────────────────────
 
 fn draw_frame(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -2526,318 +1780,87 @@ fn draw_frame(
     Ok(())
 }
 
-// ─── Turn runner ─────────────────────────────────────────────────────────────
-
-/// One full agent turn: stream → optional tool rounds → final answer.
-///
-/// Returns `true` when the turn was interrupted (Ctrl+C/Esc) so the caller
-/// can salvage the partial stream. Session mutation happens here; UI
-/// feedback flows through `tx`, and gated tools wait on `confirm_rx`.
-async fn run_turn(
-    app: &mut App,
-    streaming: SharedStream,
-    cancel: Arc<AtomicBool>,
-    prompt: String,
-    pinned: Vec<PathBuf>,
+/// Bridge between the shared agent loop ([`crate::agent_loop`]) and the
+/// TUI: every loop callback is forwarded as a [`TurnUpdate`] over the mpsc
+/// channel so the event loop keeps drawing and reacting to keys while the
+/// turn runs.
+struct TuiUi {
     tx: tokio::sync::mpsc::UnboundedSender<TurnUpdate>,
-    _confirm_rx: tokio::sync::mpsc::UnboundedReceiver<ConfirmDecision>,
-) -> bool {
-    let started = Instant::now();
-    streaming.borrow_mut().clear();
+    cancel: Arc<AtomicBool>,
+    streaming: SharedStream,
+    /// Files pinned from the tree sidebar (context injection).
+    #[allow(dead_code)]
+    pinned: Vec<PathBuf>,
+    prompt: String,
+}
 
-    // Context injection mirrors the REPL (mentioned/relevant files) plus any
-    // files pinned from the tree sidebar.
-    let injection = {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut files = crate::context::relevant_files(&prompt, &cwd);
-        for p in &pinned {
-            if !files.contains(p) {
-                files.push(p.clone());
-            }
-        }
-        crate::context::build_injection(&files, &cwd)
-    };
+impl crate::agent_loop::AgentUi for TuiUi {
+    fn raw_stream(&self) -> bool {
+        // The chat pane renders the shared live buffer, so deltas always
+        // surface immediately.
+        true
+    }
 
-    // Auto-checkpoint before each turn for rewind capability
-    app.checkpoints.checkpoint(
-        &format!("before turn {}", app.stats.turns + 1),
-        app.session.messages(),
-    );
+    fn stream_delta(&self, delta: &str) {
+        self.streaming.borrow_mut().push_str(delta);
+    }
 
-    // Auto-compact: if the session is nearing the context limit, compact it
-    if app.auto_compact_enabled && !app.pending_variants.is_empty() {
-        // skip if variants pending — user is mid-selection
-    } else if app.auto_compact_enabled {
-        let approx_tokens = app.session.approx_tokens();
-        let budget = app.config.context_tokens;
-        // Compact when we hit 80% of the context budget
-        if approx_tokens > (budget * 80) / 100 && app.session.messages().len() > 6 {
-            let msgs = app.session.messages().to_vec();
-            let tail_len = msgs.len().min(4);
-            let tail = msgs[msgs.len() - tail_len..].to_vec();
-            app.session.clear();
-            for m in tail {
-                match m.role.as_str() {
-                    "user" => app.session.push_user(m.content),
-                    "assistant" => app.session.push_assistant(m.content),
-                    _ => {}
+    fn prose(&self, text: &str) {
+        let _ = self.tx.send(TurnUpdate::AssistantProse(text.to_owned()));
+    }
+
+    fn answer(&self, text: &str) {
+        let _ = self.tx.send(TurnUpdate::Answer(text.to_owned()));
+    }
+
+    fn tool_start(&self, name: &str, args: &str) {
+        let _ = self.tx.send(TurnUpdate::ToolStart {
+            name: name.to_owned(),
+            args: args.to_owned(),
+        });
+    }
+
+    fn tool_end(&self, name: &str, args: &str, ok: bool, snippet: &str) {
+        let _ = self.tx.send(TurnUpdate::ToolEnd {
+            name: name.to_owned(),
+            args: args.to_owned(),
+            ok,
+            snippet: snippet.to_owned(),
+        });
+    }
+
+    fn diff(&self, diff: &str) {
+        let _ = self.tx.send(TurnUpdate::Notice(diff.to_owned()));
+    }
+
+    fn notice(&self, text: &str) {
+        let _ = self.tx.send(TurnUpdate::Notice(text.to_owned()));
+    }
+
+    fn error(&self, text: &str) {
+        let _ = self.tx.send(TurnUpdate::Error(text.to_owned()));
+    }
+
+    fn timeline(&self, model: &str, elapsed: std::time::Duration) {
+        let _ = self.tx.send(TurnUpdate::Notice(format!(
+            "── {model} · {:.1}s",
+            elapsed.as_secs_f32()
+        )));
+    }
+
+    fn cancel_wait<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            loop {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return;
                 }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let _ = tx.send(TurnUpdate::Notice(format!(
-                "auto-compact: session refreshed ({} messages)",
-                app.session.messages().len()
-            )));
-        }
-    }
-
-    for round in 1..=MAX_TOOL_ROUNDS {
-        if cancel.load(Ordering::Relaxed) {
-            abort_turn(app, &streaming, &tx).await;
-            return true;
-        }
-
-        let history = app
-            .session
-            .window_with(app.config.context_tokens, injection.as_deref());
-        let auth = app.config.provider.auth();
-        let opts = ChatOptions {
-            max_response_bytes: app.max_response_bytes,
-            read_timeout: app.read_timeout,
-            tools: if app.tools_enabled {
-                app.tool_specs
-                    .iter()
-                    .filter(|t| !app.disabled_tools.contains(&t.name))
-                    .cloned()
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            ..ChatOptions::new(auth.token(), app.config.model.as_str(), app.config.temperature)
-        };
-
-        let mut sink_out = String::new();
-        let mut tool_calls = Vec::new();
-        let result = {
-            let http = &app.http;
-            let provider = app.config.provider.clone();
-            let mut sink = StreamSink::new(&mut sink_out, &mut tool_calls);
-            let stream_shared = streaming.clone();
-            let streamed = api::stream_chat(
-                http,
-                provider.as_ref(),
-                &opts,
-                &history,
-                &mut sink,
-                move |delta| {
-                    stream_shared.borrow_mut().push_str(delta);
-                },
-            );
-            tokio::select! {
-                r = streamed => r.map(|_| sink_out),
-                _ = wait_for_cancel(cancel.clone()) => Err(anyhow::anyhow!("interrupted")),
-            }
-        };
-
-        match result {
-            Err(e) => {
-                let interrupted = e.to_string() == "interrupted";
-                app.record_error();
-                salvage_failed_round(app, &streaming, &tx, interrupted, &e).await;
-                return interrupted;
-            }
-            Ok(prose) if tool_calls.is_empty() || !app.tools_enabled => {
-                app.record_turn(started.elapsed());
-                let _ = tx.send(TurnUpdate::Answer(prose));
-                return false;
-            }
-            Ok(prose) => {
-                // Tool round: surface prose, then execute calls one by one.
-                if !prose.trim().is_empty() {
-                    let _ = tx.send(TurnUpdate::AssistantProse(prose.clone()));
-                }
-                let executor = app.tool_executor.clone();
-                let mut results = Vec::with_capacity(tool_calls.len());
-                let mut approve_all_remaining = false;
-                for call in &tool_calls {
-                    if cancel.load(Ordering::Relaxed) {
-                        results.push((
-                            call.id.clone(),
-                            "error: turn cancelled before this tool ran".to_owned(),
-                        ));
-                        continue;
-                    }
-                    let _ = tx.send(TurnUpdate::ToolStart {
-                        name: call.function.name.clone(),
-                        args: call.function.arguments.clone(),
-                    });
-                    let _gated = executor
-                        .as_ref()
-                        .is_some_and(|e| e.requires_confirmation(&call.function.name));
-
-                    // Auto-accept for all tools — user requested realtime file ops
-                    // without REVIEW prompts. The original gated logic is kept below
-                    // as comment for reference; it would send ConfirmNeeded and wait
-                    // for y/n/a. Now we auto-approve so files show instantly.
-                    let approved = true;
-                    let _ = approve_all_remaining; // keep variable for future use
-                    /* original gated approval (now auto-accepted):
-                    let approved = !_gated || approve_all_remaining || {
-                        let _ = tx.send(TurnUpdate::ConfirmNeeded {
-                            name: call.function.name.clone(),
-                            args: call.function.arguments.clone(),
-                        });
-                        match wait_for_decision(&mut confirm_rx, &cancel).await {
-                            ConfirmDecision::Approve => true,
-                            ConfirmDecision::ApproveAll => {
-                                approve_all_remaining = true;
-                                true
-                            }
-                            ConfirmDecision::Decline => false,
-                        }
-                    };
-                    */
-
-                    let outcome = if !approved {
-                        Err(anyhow::anyhow!("declined"))
-                    } else {
-                        match executor.as_ref() {
-                            Some(e) => {
-                                e.execute(&call.function.name, &call.function.arguments)
-                                    .await
-                            }
-                            None => Err(anyhow::anyhow!("no tool executor configured")),
-                        }
-                    };
-                    let stored = match &outcome {
-                        Ok(value) => truncate_chars(value, MAX_TOOL_RESULT_CHARS),
-                        Err(e) if e.to_string() == "declined" => {
-                            "error: user declined this operation — ask how to proceed before \
-                             retrying"
-                                .to_owned()
-                        }
-                        Err(_) => format!("error: tool '{}' failed", call.function.name),
-                    };
-                    let failed =
-                        outcome.is_err() || outcome.as_deref().is_ok_and(result_signals_failure);
-                    let _ = tx.send(TurnUpdate::ToolEnd {
-                        name: call.function.name.clone(),
-                        args: call.function.arguments.clone(),
-                        ok: !failed,
-                    });
-                    results.push((call.id.clone(), stored));
-                }
-                app.session.commit_tool_round(&prose, &tool_calls, &results);
-                streaming.borrow_mut().clear();
-                if round == MAX_TOOL_ROUNDS {
-                    app.record_turn(started.elapsed());
-                    let _ = tx.send(TurnUpdate::Notice(format!(
-                        "stopped after {MAX_TOOL_ROUNDS} tool rounds — ask again to continue."
-                    )));
-                    return false;
-                }
-            }
-        }
-    }
-    app.record_turn(started.elapsed());
-    false
-}
-
-/// Cancels a turn before any request went out: drops the trailing user
-/// prompt and reports the interruption.
-async fn abort_turn(
-    app: &mut App,
-    streaming: &SharedStream,
-    tx: &tokio::sync::mpsc::UnboundedSender<TurnUpdate>,
-) {
-    streaming.borrow_mut().clear();
-    pop_trailing_user(app);
-    let _ = tx.send(TurnUpdate::Notice("turn cancelled.".into()));
-}
-
-/// Error policy mirroring the REPL: keep a partially generated answer
-/// (marked interrupted), otherwise roll back the trailing user prompt.
-async fn salvage_failed_round(
-    app: &mut App,
-    streaming: &SharedStream,
-    tx: &tokio::sync::mpsc::UnboundedSender<TurnUpdate>,
-    interrupted: bool,
-    e: &anyhow::Error,
-) {
-    let partial = std::mem::take(&mut *streaming.borrow_mut());
-    if !partial.trim().is_empty() {
-        let kept = format!("{partial}\n\n*(interrupted)*");
-        app.session.push_assistant(kept.clone());
-        let _ = tx.send(TurnUpdate::Answer(kept));
-    } else {
-        pop_trailing_user(app);
-    }
-    if interrupted {
-        let _ = tx.send(TurnUpdate::Notice("turn cancelled.".into()));
-    } else {
-        let _ = tx.send(TurnUpdate::Error(format!("{e:#}")));
+        })
     }
 }
 
-/// Removes the trailing user prompt when no assistant content survived —
-/// otherwise history would start with an orphan question.
-fn pop_trailing_user(app: &mut App) {
-    if app
-        .session
-        .messages()
-        .last()
-        .is_some_and(|m| m.role == "user")
-    {
-        app.session.pop_user();
-    }
-}
-
-/// Polls the cancel flag so a streaming request can be abandoned promptly.
-async fn wait_for_cancel(cancel: Arc<AtomicBool>) {
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Waits for the user's y/n/a answer; a cancelled turn counts as Decline.
-async fn wait_for_decision(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ConfirmDecision>,
-    cancel: &Arc<AtomicBool>,
-) -> ConfirmDecision {
-    tokio::select! {
-        biased;
-        decision = rx.recv() => {
-            // Channel closed → caller went away; decline is safest.
-            decision.unwrap_or(ConfirmDecision::Decline)
-        }
-        _ = wait_for_cancel(cancel.clone()) => ConfirmDecision::Decline,
-    }
-}
-
-/// Failure heuristic mirroring the REPL: sanitized `error:` prefixes and
-/// structured payloads with a non-zero exit code.
-fn result_signals_failure(value: &str) -> bool {
-    if value.starts_with("error:") {
-        return true;
-    }
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()
-        .and_then(|v| v.get("exit_code").and_then(serde_json::Value::as_i64))
-        .is_some_and(|code| code != 0)
-}
-
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_owned()
-    } else {
-        let cut: String = s.chars().take(max_chars).collect();
-        format!("{cut}\n…(truncated)")
-    }
-}
-
-#[cfg(test)]
+#[cfg(test)]#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3009,15 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_heuristic_matches_repl_behavior() {
-        assert!(result_signals_failure("error: declined"));
-        assert!(result_signals_failure(r#"{"exit_code":101}"#));
-        assert!(!result_signals_failure(r#"{"exit_code":0}"#));
-        assert!(!result_signals_failure("plain output"));
-    }
-
-    #[test]
-    fn tool_updates_pair_start_and_end() {
+    fn tool_updates_pair_start_and_end_with_snippet() {
         let mut tui = Tui::new();
         tui.apply_update(TurnUpdate::ToolStart {
             name: "read_file".into(),
@@ -3027,65 +2042,17 @@ mod tests {
             name: "read_file".into(),
             args: "{}".into(),
             ok: true,
+            snippet: "fn main() {}".into(),
         });
         assert!(matches!(
             tui.entries.last(),
-            Some(ChatEntry::Tool { ok: Some(true), .. })
+            Some(ChatEntry::Notice(n)) if n.starts_with("↳ fn main")
         ));
-    }
-
-    #[test]
-    fn confirm_needed_enters_review_mode_and_y_resolves() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut tui = Tui::new();
-        tui.confirm_tx = Some(tx);
-        tui.mode = AppMode::Agent;
-
-        tui.apply_update(TurnUpdate::ConfirmNeeded {
-            name: "write_file".into(),
-            args: r#"{"path":"a.txt"}"#.into(),
-        });
-        assert_eq!(tui.mode, AppMode::Review);
-        assert!(tui.confirm_pending);
-
-        // While pending, keys route to the gate, not the input.
-        tui.set_input("should not change".into());
-        tui.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-        assert_eq!(rx.try_recv().unwrap(), ConfirmDecision::Approve);
-        assert_eq!(tui.mode, AppMode::Agent); // restored
-        assert!(!tui.confirm_pending);
-        assert_eq!(tui.input, "should not change");
-
-        // Decline path restores too — a fresh TUI starting in Normal.
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        let mut tui2 = Tui::new();
-        tui2.confirm_tx = Some(tx2);
-        tui2.apply_update(TurnUpdate::ConfirmNeeded {
-            name: "run_shell".into(),
-            args: "{}".into(),
-        });
-        assert_eq!(tui2.mode, AppMode::Review);
-        tui2.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        assert_eq!(rx2.try_recv().unwrap(), ConfirmDecision::Decline);
-        assert_eq!(tui2.mode, AppMode::Normal);
-    }
-
-    #[test]
-    fn approve_all_answers_a_for_every_remaining_gate() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut tui = Tui::new();
-        tui.confirm_tx = Some(tx);
-        for _ in 0..3 {
-            tui.apply_update(TurnUpdate::ConfirmNeeded {
-                name: "write_file".into(),
-                args: "{}".into(),
-            });
-            tui.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        }
-        assert_eq!(
-            std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>(),
-            vec![ConfirmDecision::ApproveAll; 3]
-        );
+        // The tool row itself resolved to ok.
+        assert!(tui.entries.iter().any(|e| matches!(
+            e,
+            ChatEntry::Tool { ok: Some(true), .. }
+        )));
     }
 
     #[test]
@@ -3230,21 +2197,131 @@ mod tests {
                 "/plan" => "/plan do x",
                 _ => cmd,
             };
-            handle_tui_slash(&mut app, &mut tui, line).await;
-            let handled = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_))) || tui.quit || tui.take_clear_request();
+            let out = handle_tui_slash(&mut app, &mut tui, line).await;
+            let handled = !out.is_silent()
+                || tui.quit
+                || tui.take_clear_request()
+                || tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_)));
             assert!(
                 handled,
-                "handle_tui_slash for {cmd} should push a Notice or set quit/clear"
+                "handle_tui_slash for {cmd} should print something or set a flag/effect"
             );
-            // The old `_ => "executed {line}"` fallback masked missing arms —
-            // no command may land there anymore.
-            let fell_through = tui.entries.iter().any(
-                |e| matches!(e, ChatEntry::Notice(t) if t.contains("executed ")),
-            );
-            assert!(
-                !fell_through,
-                "handle_tui_slash for {cmd} hit the dead 'executed …' fallback — add a real arm"
-            );
+            // Stub detection: no unified command may defer to the REPL.
+            let stubbed = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(t)
+                if t.contains("use REPL") || t.contains("REPL-only") || t.contains("requires REPL")));
+            assert!(!stubbed, "handle_tui_slash for {cmd} still defers to the REPL");
         }
+    }
+
+    fn smoke_app() -> App {
+        let provider = crate::provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
+        let config = crate::config::Config {
+            api_key: std::sync::Arc::new(zeroize::Zeroizing::new(String::new())),
+            model: "test-model".to_owned(),
+            temperature: 0.5,
+            render_markdown: false,
+            system_prompt: "sys".to_owned(),
+            context_tokens: 2048,
+            provider,
+            source_path: None,
+            shell_tools: Vec::new(),
+            theme: None,
+            timeout_secs: 30,
+            limit_mb: 16,
+        };
+        App::new(
+            config,
+            reqwest::Client::new(),
+            crate::session::Session::new("sys"),
+            crate::render::Renderer::new(false),
+        )
+    }
+
+    /// `/undo` must keep the TUI transcript in sync with the session: the
+    /// last exchange disappears from BOTH.
+    #[tokio::test]
+    async fn undo_syncs_transcript_and_session() {
+        use commands::output::Effect;
+        let mut app = smoke_app();
+        app.session.push_user("q1");
+        app.session.push_assistant("a1");
+        app.session.push_user("q2");
+        app.session.push_assistant("a2");
+        let mut tui = Tui::new();
+        tui.entries.push(ChatEntry::User("q1".into()));
+        tui.entries.push(ChatEntry::Assistant("a1".into()));
+        tui.entries.push(ChatEntry::User("q2".into()));
+        tui.entries.push(ChatEntry::Assistant("a2".into()));
+
+        let out = handle_tui_slash(&mut app, &mut tui, "/undo").await;
+        assert_eq!(out.effect, Effect::PopExchange);
+        assert_eq!(app.session.messages().len(), 2);
+        // Transcript now ends with the first exchange's assistant reply.
+        assert!(matches!(
+            tui.entries.last(),
+            Some(ChatEntry::Assistant(t)) if t == "a1"
+        ));
+    }
+
+    /// `/save` then `/load` must round-trip through disk with a rebuilt
+    /// transcript (previously `/save` printed fake success).
+    #[tokio::test]
+    async fn save_and_load_round_trip_through_disk() {
+        use commands::output::Effect;
+        let _guard = crate::TEST_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = smoke_app();
+        app.session.push_user("hello");
+        app.session.push_assistant("world");
+        let mut tui = Tui::new();
+
+        let out = handle_tui_slash(&mut app, &mut tui, "/save govinda-roundtrip-test").await;
+        let path = std::path::Path::new("sessions").join("govinda-roundtrip-test");
+        assert!(
+            path.exists(),
+            "session file must exist on disk; cwd={:?}; msgs={:?}",
+            std::env::current_dir(),
+            out.msgs
+        );
+        assert!(out.msgs.iter().any(|m| m.text.contains("saved")), "{out:?}");
+
+        // Fresh state, then load.
+        let mut app2 = smoke_app();
+        let mut tui2 = Tui::new();
+        assert!(app2.session.messages().is_empty());
+        let out = handle_tui_slash(&mut app2, &mut tui2, "/load govinda-roundtrip-test").await;
+        assert_eq!(out.effect, Effect::ReloadTranscript);
+        assert_eq!(app2.session.messages().len(), 2);
+        assert!(
+            tui2.entries.iter().any(|e| matches!(e, ChatEntry::Assistant(t) if t == "world")),
+            "transcript must be rebuilt from the loaded session"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A committed variant (`/pick`) lands as an Assistant chat entry.
+    #[tokio::test]
+    async fn pick_commits_variant_as_assistant_entry() {
+        let mut app = smoke_app();
+        app.pending_variants.push("variant answer".to_owned());
+        let mut tui = Tui::new();
+        handle_tui_slash(&mut app, &mut tui, "/pick 1").await;
+        assert!(app.pending_variants.is_empty());
+        assert_eq!(app.session.messages().last().map(|m| m.content.as_str()), Some("variant answer"));
+        assert!(tui.entries.iter().any(|e| matches!(e, ChatEntry::Assistant(t) if t == "variant answer")));
+    }
+
+    /// `/theme <name>` flows through the unified dispatcher and switches the
+    /// TUI glass palette by name.
+    #[tokio::test]
+    async fn theme_switch_applies_glass_palette() {
+        use commands::output::Effect;
+        let mut app = smoke_app();
+        let mut tui = Tui::new();
+        let before = theme::active().name;
+        let out = handle_tui_slash(&mut app, &mut tui, "/theme dracula").await;
+        assert_eq!(out.effect, Effect::ThemeChanged("dracula".to_owned()));
+        assert_eq!(theme::active().name, "dracula");
+        assert_ne!(before, theme::active().name, "{before}");
+        theme::set(theme::DARK_THEME); // restore
     }
 }

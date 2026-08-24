@@ -1,24 +1,22 @@
-use super::{App, dim, err, ok};
+use super::{App, dim, err, info, markdown, ok};
 use crate::api;
-use crate::render::paint;
-use crossterm::style::Color;
 use futures_util::future::join_all;
 use std::sync::Arc;
 
 pub(super) async fn models(app: &mut App) {
     match ensure_models(app).await {
         Ok(list) => {
-            println!("available models:");
+            info("available models:");
             for id in list.iter() {
                 let marker = if **id == app.config.model {
                     "  ← current"
                 } else {
                     ""
                 };
-                println!("  {id}{marker}");
+                info(format!("  {id}{marker}"));
             }
         }
-        Err(e) => err(&format!("{e:#}")),
+        Err(e) => err(format!("{e:#}")),
     }
 }
 
@@ -56,7 +54,7 @@ async fn resolve_model(name: &str, app: &mut App) -> anyhow::Result<Option<Strin
         1 => Ok(Some(hits[0].clone())),
         0 => Ok(None),
         _ => {
-            err(&format!(
+            err(format!(
                 "'{name}' is ambiguous: {}",
                 hits.iter()
                     .map(|h| h.as_str())
@@ -70,28 +68,28 @@ async fn resolve_model(name: &str, app: &mut App) -> anyhow::Result<Option<Strin
 
 pub(super) async fn set_model(name: &str, app: &mut App) {
     if name.is_empty() {
-        println!(
+        info(format!(
             "usage: /model <name|next|prev>   (current: {})",
             app.config.model
-        );
+        ));
         return;
     }
     let requested = name.to_owned();
     match resolve_model(&requested, app).await {
         Ok(Some(full_name)) => {
             app.config.model = full_name.clone();
-            ok(&format!("model set to {full_name}"));
+            ok(format!("model set to {full_name}"));
         }
-        Ok(None) => err(&format!(
+        Ok(None) => err(format!(
             "unknown model '{requested}' — run /models to see valid ids"
         )),
         Err(e) => {
             // Offline / API hiccup: allow the switch, just don't pretend we checked.
-            dim(&format!(
+            dim(format!(
                 "could not verify against API ({e:#}) — setting anyway."
             ));
             app.config.model = requested.clone();
-            ok(&format!("model set to {requested}"));
+            ok(format!("model set to {requested}"));
         }
     }
 }
@@ -147,13 +145,13 @@ pub(super) async fn compact(app: &mut App) {
     {
         Ok(()) if !out.trim().is_empty() => {
             let removed = app.session.compact_with_summary(out.trim());
-            ok(&format!(
+            ok(format!(
                 "compacted: folded {removed} messages into one summary (~{} tokens now).",
                 app.session.approx_tokens()
             ));
         }
         Ok(()) => err("the API returned an empty summary — history left untouched."),
-        Err(e) => err(&format!("compact failed ({e:#}) — history left untouched.")),
+        Err(e) => err(format!("compact failed ({e:#}) — history left untouched.")),
     }
 }
 
@@ -167,7 +165,7 @@ pub(super) async fn generate_variants(arg: &str, app: &mut App) {
     let n = match n {
         Some(n) => n,
         None => {
-            println!("usage: /variants <1-5>");
+            info("usage: /variants <1-5>");
             return;
         }
     };
@@ -192,7 +190,7 @@ pub(super) async fn generate_variants(arg: &str, app: &mut App) {
 
     // Clone everything the parallel futures need so `app` is never borrowed
     // across an await point.
-    dim(&format!("generating {n} variants concurrently…"));
+    dim(format!("generating {n} variants concurrently…"));
     let model = app.config.model.clone();
     let temperature = (app.config.temperature + 0.2).min(1.0);
     let max_response_bytes = app.max_response_bytes;
@@ -225,15 +223,15 @@ pub(super) async fn generate_variants(arg: &str, app: &mut App) {
         match res {
             Ok(out) if !out.trim().is_empty() => {
                 let preview: String = out.trim().lines().next().unwrap_or("").to_owned();
-                println!(
-                    "{} {}",
-                    paint(format!("({})", i + 1), Color::Green),
+                ok(format!(
+                    "({}) {}",
+                    i + 1,
                     truncate_preview(&preview, 100)
-                );
+                ));
                 app.pending_variants.push(out.trim().to_owned());
             }
-            Ok(_) => err(&format!("variant {} came back empty.", i + 1)),
-            Err(e) => err(&format!("variant {} failed ({e:#}).", i + 1)),
+            Ok(_) => err(format!("variant {} came back empty.", i + 1)),
+            Err(e) => err(format!("variant {} failed ({e:#}).", i + 1)),
         }
     }
     dim("type /pick <n> to commit one of these, or just keep chatting to discard them.");
@@ -243,7 +241,10 @@ pub(super) fn pick_variant(arg: &str, app: &mut App) {
     let idx: usize = match arg.trim().parse::<usize>() {
         Ok(i) if i >= 1 && i <= app.pending_variants.len() => i - 1,
         _ => {
-            println!("usage: /pick <1-{}>", app.pending_variants.len().max(1));
+            info(format!(
+                "usage: /pick <1-{}>",
+                app.pending_variants.len().max(1)
+            ));
             return;
         }
     };
@@ -260,8 +261,7 @@ pub(super) fn pick_variant(arg: &str, app: &mut App) {
     }
     app.session.push_assistant(chosen.clone());
     app.pending_variants.clear();
-    println!();
-    app.renderer.render_answer(&chosen);
+    markdown(chosen);
     ok("variant committed.");
 }
 

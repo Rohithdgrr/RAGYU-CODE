@@ -1,19 +1,18 @@
-use super::{App, dim, err, ok};
-use crate::render::{self, paint, theme_names};
+use super::{App, dim, err, info, ok};
+use crate::render::{self, theme_names};
 use crate::tools::save_disabled_tools;
-use crossterm::style::Color;
 use std::time::Duration;
 
 pub(super) fn set_temperature(arg: &str, app: &mut App) {
     match parse_temperature(arg) {
         Some(t) => {
             app.config.temperature = t;
-            ok(&format!("temperature set to {t:.2}"));
+            ok(format!("temperature set to {t:.2}"));
         }
-        None => println!(
+        None => info(format!(
             "usage: /temp <0.0-1.0>   (current: {:.2})",
             app.config.temperature
-        ),
+        )),
     }
 }
 
@@ -26,26 +25,33 @@ pub(super) fn parse_temperature(arg: &str) -> Option<f32> {
 
 pub(super) fn set_or_show_system(prompt: &str, app: &mut App) {
     if prompt.is_empty() {
-        println!("system prompt: {}", app.session.system());
+        info(format!("system prompt: {}", app.session.system()));
         return;
     }
     app.session.set_system(prompt);
+    // Re-apply agent specialization so a custom prompt keeps the tool
+    // addendum + project memory + skills (REPL/TUI parity).
+    super::specialize_system(app);
     ok("system prompt updated (applies to the next turn).");
 }
 
-pub(super) fn set_or_show_theme(name: &str) {
+pub(super) fn set_or_show_theme(name: &str, app: &App) {
     if name.is_empty() {
-        println!(
+        info(format!(
             "theme: {} (available: {})",
             render::active_theme().name,
             theme_names().collect::<Vec<_>>().join(", ")
-        );
+        ));
         return;
     }
     if render::set_theme(name) {
-        ok(&format!("theme set to {name}"));
+        // Persist the choice when the config came from a real file.
+        if let Err(e) = super::persistence::save_runtime_config(app) {
+            dim(format!("(theme not persisted: {e:#})"));
+        }
+        ok(format!("theme set to {name}"));
     } else {
-        err(&format!(
+        err(format!(
             "unknown theme '{name}' — available: {}",
             theme_names().collect::<Vec<_>>().join(", ")
         ));
@@ -61,12 +67,12 @@ pub(super) fn set_timeout(arg: &str, app: &mut App) {
     {
         Some(secs) => {
             app.read_timeout = Duration::from_secs(secs);
-            ok(&format!("read timeout set to {secs}s"));
+            ok(format!("read timeout set to {secs}s"));
         }
-        None => println!(
+        None => info(format!(
             "usage: /timeout <1-600>   (current: {}s)",
             app.read_timeout.as_secs()
-        ),
+        )),
     }
 }
 
@@ -79,12 +85,12 @@ pub(super) fn set_limit(arg: &str, app: &mut App) {
     {
         Some(mb) => {
             app.max_response_bytes = (mb as usize) * 1024 * 1024;
-            ok(&format!("response cap set to {mb} MB"));
+            ok(format!("response cap set to {mb} MB"));
         }
-        None => println!(
+        None => info(format!(
             "usage: /limit <1-64>   (current: {} MB)",
             app.max_response_bytes / (1024 * 1024)
-        ),
+        )),
     }
 }
 
@@ -98,7 +104,7 @@ pub(super) fn show_tools(arg: &str, app: &mut App) {
                 return;
             }
             app.tools_enabled = next;
-            ok(&format!(
+            ok(format!(
                 "function calling {}.",
                 if next { "enabled" } else { "disabled" }
             ));
@@ -108,21 +114,16 @@ pub(super) fn show_tools(arg: &str, app: &mut App) {
                 err("function calling is off — '/tools on' to re-enable.");
                 return;
             }
-            println!("function calling: on");
+            info("function calling: on");
             match &app.tool_executor {
                 Some(_) => {
                     for tool in &app.tool_specs {
                         let state = if app.disabled_tools.contains(&tool.name) {
-                            paint("[disabled]", Color::Red)
+                            "[disabled]"
                         } else {
-                            paint("[on]", Color::Green)
+                            "[on]"
                         };
-                        println!(
-                            "  {} {} — {}",
-                            state,
-                            paint(&tool.name, Color::Green),
-                            tool.description
-                        );
+                        info(format!("  {state} {} — {}", tool.name, tool.description));
                     }
                     if !app.disabled_tools.is_empty() {
                         dim("re-enable with '/tools enable <name>'.");
@@ -134,7 +135,7 @@ pub(super) fn show_tools(arg: &str, app: &mut App) {
         _ => {
             // /tools enable|disable <name>
             let Some((verb, name)) = arg.split_once(char::is_whitespace) else {
-                println!("usage: /tools [on|off] | /tools enable|disable <name>");
+                info("usage: /tools [on|off] | /tools enable|disable <name>");
                 return;
             };
             let name = name.trim();
@@ -142,28 +143,26 @@ pub(super) fn show_tools(arg: &str, app: &mut App) {
                 "enable" | "en" => false,
                 "disable" | "dis" => true,
                 _ => {
-                    println!("usage: /tools [on|off] | /tools enable|disable <name>");
+                    info("usage: /tools [on|off] | /tools enable|disable <name>");
                     return;
                 }
             };
             if !app.tool_specs.iter().any(|t| t.name == name) {
-                err(&format!(
-                    "unknown tool '{name}' — run /tools to see the registry"
-                ));
+                err(format!("unknown tool '{name}' — run /tools to see the registry"));
                 return;
             }
             if disable {
                 app.disabled_tools.insert(name.to_owned());
-                ok(&format!(
+                ok(format!(
                     "'{name}' disabled — the model can no longer call it."
                 ));
             } else if app.disabled_tools.remove(name) {
-                ok(&format!("'{name}' re-enabled."));
+                ok(format!("'{name}' re-enabled."));
             } else {
-                ok(&format!("'{name}' was already enabled."));
+                ok(format!("'{name}' was already enabled."));
             }
             if let Err(e) = save_disabled_tools(&app.disabled_tools) {
-                err(&format!("{e:#}"));
+                err(format!("{e:#}"));
             }
         }
     }
@@ -176,24 +175,19 @@ pub(super) fn print_history(app: &App) {
         return;
     }
     for m in msgs {
-        let (label, color) = if m.role == "user" {
-            ("you", Color::Green)
+        let label = if m.role == "user" {
+            "you"
         } else if m.role == "tool" {
-            ("tool", render::dim_color())
+            "tool"
         } else if m.has_tool_calls() {
-            ("bot·tools", render::bot_color())
+            "bot·tools"
         } else {
-            ("bot", render::bot_color())
+            "bot"
         };
-        println!("{} {}", paint(format!("[{label}]"), color), m.content);
+        info(format!("[{label}] {}", m.content));
         if let Some(calls) = &m.tool_calls {
             for c in calls {
-                println!(
-                    "  {} {}({})",
-                    paint("→", color),
-                    c.function.name,
-                    c.function.arguments
-                );
+                info(format!("  → {}({})", c.function.name, c.function.arguments));
             }
         }
     }
@@ -201,20 +195,19 @@ pub(super) fn print_history(app: &App) {
 
 pub(super) fn search_history(needle: &str, app: &App) {
     if needle.is_empty() {
-        println!("usage: /search <text>");
+        info("usage: /search <text>");
         return;
     }
     let hits = app.session.search(needle);
     if hits.is_empty() {
-        dim(&format!("no matches for '{needle}'."));
+        dim(format!("no matches for '{needle}'."));
         return;
     }
     for (idx, role, content) in &hits {
         let label = if *role == "user" { "you" } else { "bot" };
-        println!("{}", paint(format!("[#{idx} {label}]"), Color::Green));
-        println!("{content}");
+        info(format!("[#{idx} {label}] {content}"));
     }
-    ok(&format!("{} match(es).", hits.len()));
+    ok(format!("{} match(es).", hits.len()));
 }
 
 pub(super) fn show_stats(app: &App) {
@@ -224,7 +217,7 @@ pub(super) fn show_stats(app: &App) {
     } else {
         0
     };
-    println!(
+    info(format!(
         "session        {}\nturns          {}\navg latency    {} ms\nerrors         {}\nhistory        {} messages (~{} tokens)",
         format_duration(elapsed),
         app.stats.turns,
@@ -232,7 +225,7 @@ pub(super) fn show_stats(app: &App) {
         app.stats.errors,
         app.session.messages().len(),
         app.session.approx_tokens(),
-    );
+    ));
 }
 
 fn format_duration(d: Duration) -> String {
@@ -253,7 +246,7 @@ pub(super) fn show_config(app: &App) {
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(none found — defaults)".to_owned());
-    println!(
+    info(format!(
         "config file    {}\nprovider       {} ({})\nmodel          {}\ntemperature    {:.2}\ncontext budget {} tokens (tokenizer-trimmed)\nrendering      {}\ntheme          {}\ntimeout        {}s\nresponse cap   {} MB\nhistory        {} messages (~{} tokens)",
         config_file,
         app.config.provider.id(),
@@ -271,5 +264,5 @@ pub(super) fn show_config(app: &App) {
         app.max_response_bytes / (1024 * 1024),
         app.session.messages().len(),
         app.session.approx_tokens(),
-    );
+    ));
 }

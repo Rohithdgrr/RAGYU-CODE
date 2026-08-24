@@ -1,7 +1,13 @@
 // Tests legitimately unwrap/expect to assert panics.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+/// Serializes tests that mutate the process working directory (cargo runs
+/// tests in parallel threads and cwd is process-global).
+#[cfg(test)]
+pub static TEST_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub mod api;
+pub mod agent_loop;
 pub mod clock;
 pub mod commands;
 pub mod completions;

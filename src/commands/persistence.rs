@@ -1,6 +1,5 @@
-use super::{App, dim, err, ok};
+use super::{App, dim, err, info, ok};
 use crate::clock;
-use crate::render::{accent, paint};
 use crate::session::Session;
 use crate::sessions;
 use anyhow::Context;
@@ -27,7 +26,7 @@ pub(super) fn save_session(arg: &str, app: &mut App) {
             Some(name) => match sessions::named_session_path(name) {
                 Ok(p) => p,
                 Err(e) => {
-                    err(&format!("{e:#}"));
+                    err(format!("{e:#}"));
                     return;
                 }
             },
@@ -36,7 +35,7 @@ pub(super) fn save_session(arg: &str, app: &mut App) {
         false => match safe_session_path(arg) {
             Ok(p) => p,
             Err(e) => {
-                err(&format!("{e:#}"));
+                err(format!("{e:#}"));
                 return;
             }
         },
@@ -46,13 +45,13 @@ pub(super) fn save_session(arg: &str, app: &mut App) {
             if let Some(name) = sessions::name_from_path(&path) {
                 app.session_name = Some(name);
             }
-            ok(&format!(
+            ok(format!(
                 "saved {} messages to {}",
                 app.session.messages().len(),
                 path.display()
             ));
         }
-        Err(e) => err(&format!("{e:#}")),
+        Err(e) => err(format!("{e:#}")),
     }
 }
 
@@ -64,16 +63,16 @@ fn default_session_path() -> PathBuf {
     ))
 }
 
-pub(super) fn load_session(arg: &str, app: &mut App) {
+pub(super) fn load_session(arg: &str, app: &mut App) -> bool {
     if arg.is_empty() {
-        println!("usage: /load <name>");
-        return;
+        info("usage: /load <name>");
+        return false;
     }
     let path = match safe_session_path(arg) {
         Ok(p) => p,
         Err(e) => {
-            err(&format!("{e:#}"));
-            return;
+            err(format!("{e:#}"));
+            return false;
         }
     };
     match Session::load_from(&path) {
@@ -82,15 +81,19 @@ pub(super) fn load_session(arg: &str, app: &mut App) {
             let saved_at = session.updated_at().map(str::to_owned);
             app.session_name = sessions::name_from_path(&path);
             app.session = session;
-            ok(&format!(
+            ok(format!(
                 "loaded {n} messages from {}{}",
                 path.display(),
                 saved_at
                     .map(|t| format!(" (last saved {t})"))
                     .unwrap_or_default()
             ));
+            true
         }
-        Err(e) => err(&format!("{e:#}")),
+        Err(e) => {
+            err(format!("{e:#}"));
+            false
+        }
     }
 }
 
@@ -101,16 +104,16 @@ pub(super) fn list_named_sessions(app: &App) {
         dim("no saved sessions yet — /save <name> creates one.");
         return;
     }
-    println!("saved sessions (newest first):");
+    info("saved sessions (newest first):");
     for e in entries {
         let current = app.session_name.as_deref() == Some(e.name.as_str());
         let ts = e.updated_at.clone().unwrap_or_else(|| "-".to_owned());
-        println!(
+        info(format!(
             "  {}{}  {} msgs  {ts}",
-            paint(&e.name, accent()),
+            e.name,
             if current { " ←" } else { "" },
             e.messages,
-        );
+        ));
     }
 }
 
@@ -125,18 +128,18 @@ pub(super) fn fork_session(arg: &str, app: &mut App) {
         false => match safe_session_path(arg) {
             Ok(p) => p,
             Err(e) => {
-                err(&format!("{e:#}"));
+                err(format!("{e:#}"));
                 return;
             }
         },
     };
     match app.session.save_to(&path) {
-        Ok(()) => ok(&format!(
+        Ok(()) => ok(format!(
             "forked snapshot with {} messages to {} (live conversation unchanged)",
             app.session.messages().len(),
             path.display()
         )),
-        Err(e) => err(&format!("{e:#}")),
+        Err(e) => err(format!("{e:#}")),
     }
 }
 
@@ -158,15 +161,15 @@ pub(super) fn export(arg: &str, app: &App) {
         "md" => export_markdown(app),
         "txt" => export_text(app),
         other => {
-            err(&format!(
+            err(format!(
                 "unknown format '{other}' — usage: /export md|txt [file]"
             ));
             return;
         }
     };
     match std::fs::write(&path, content) {
-        Ok(()) => ok(&format!("exported to {}", path.display())),
-        Err(e) => err(&format!("export failed: {e}")),
+        Ok(()) => ok(format!("exported to {}", path.display())),
+        Err(e) => err(format!("export failed: {e}")),
     }
 }
 
