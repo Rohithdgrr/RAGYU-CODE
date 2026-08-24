@@ -565,9 +565,27 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             Outcome::Handled
         }
         "/agent" => {
-            // TUI-only concept (NORMAL/AGENT mode badge). The REPL is always
-            // agent-capable; function calling toggles with /tools.
-            dim("mode switching is a TUI feature — run `govinda` (TUI) and use /agent <on|off>. In the REPL, tools toggle with /tools on|off.");
+            // Agent mode = function calling on/off. One source of truth on
+            // App so the model really gains/loses tools (the TUI additionally
+            // switches its NORMAL/AGENT badge when it sees the change).
+            match rest.trim() {
+                "on" => {
+                    app.tools_enabled = true;
+                    ok("agent mode ON — function calling enabled.");
+                }
+                "off" => {
+                    app.tools_enabled = false;
+                    ok("agent mode OFF — function calling disabled.");
+                }
+                "" => info(format!(
+                    "agent mode {} (function calling {})",
+                    if app.tools_enabled { "ON" } else { "OFF" },
+                    if app.tools_enabled { "enabled" } else { "disabled" },
+                )),
+                other => info(format!(
+                    "usage: /agent <on|off> (unknown arg '{other}')"
+                )),
+            }
             Outcome::Handled
         }
         "/pin" => {

@@ -520,32 +520,8 @@ impl Tui {
                 }
                 return true;
             }
-            "/agent" => {
-                let requested = match rest.trim() {
-                    "on" => Some(AppMode::Agent),
-                    "off" => Some(AppMode::Normal),
-                    "" => None,
-                    _ => {
-                        self.notice("usage: /agent <on|off>");
-                        None
-                    }
-                };
-                match requested {
-                    Some(next) => {
-                        if self.mode.transition_to(next) {
-                            self.notice(format!("mode: {}", self.mode.label()));
-                        } else {
-                            self.notice(format!(
-                                "cannot enter {} from {}",
-                                next.label(),
-                                self.mode.label()
-                            ));
-                        }
-                    }
-                    None => self.notice(format!("mode: {}", self.mode.label())),
-                }
-                return true;
-            }
+            // "/agent" goes through the unified dispatcher, which toggles
+            // app.tools_enabled for real; handle_tui_slash syncs the badge.
             _ => {}
         }        // Known slash commands and custom skills need App-aware handling
         if crate::commands::SLASH_COMMANDS.contains(&cmd_lc.as_str()) {
@@ -1686,7 +1662,19 @@ async fn handle_tui_slash(
     // Unified command path: the same dispatcher the REPL uses, captured into
     // structured output instead of printing to stdout (which would corrupt
     // the alternate screen). One source of truth for every slash command.
+    let agent_before = app.tools_enabled;
     let out = commands::dispatch_structured(line, app).await;
+    // `/agent on|off` toggles function calling on App — mirror it in the
+    // NORMAL/AGENT badge so the label reflects real capability.
+    if app.tools_enabled != agent_before {
+        let next = if app.tools_enabled {
+            AppMode::Agent
+        } else {
+            AppMode::Normal
+        };
+        let _ = tui.mode.transition_to(next);
+        tui.notice(format!("mode: {}", tui.mode.label()));
+    }
     apply_command_output(app, tui, line, out.clone());
     // `/raw` toggles the renderer inside the dispatcher; keep the pane flag
     // in sync so the chat view switches live.
@@ -2218,6 +2206,23 @@ mod tests {
                 if t.contains("use REPL") || t.contains("REPL-only") || t.contains("requires REPL")));
             assert!(!stubbed, "handle_tui_slash for {cmd} still defers to the REPL");
         }
+    }
+
+    /// `/agent on|off` must toggle REAL capability (`app.tools_enabled`),
+    /// not just a status-bar label — and the badge must follow.
+    #[tokio::test]
+    async fn agent_command_toggles_tools_and_badge() {
+        let mut app = smoke_app();
+        app.tools_enabled = true;
+        let mut tui = Tui::new();
+
+        handle_tui_slash(&mut app, &mut tui, "/agent off").await;
+        assert!(!app.tools_enabled, "tools must be disabled");
+        assert_eq!(tui.mode, AppMode::Normal);
+
+        handle_tui_slash(&mut app, &mut tui, "/agent on").await;
+        assert!(app.tools_enabled, "tools must be re-enabled");
+        assert_eq!(tui.mode, AppMode::Agent);
     }
 
     fn smoke_app() -> App {
