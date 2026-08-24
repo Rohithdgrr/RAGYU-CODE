@@ -472,7 +472,7 @@ impl Tui {
     }
 
     fn local_command(&mut self, line: &str) -> bool {
-        let (cmd, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let (cmd, _rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         let cmd_lc = cmd.to_ascii_lowercase();
         match cmd_lc.as_str() {
             "/quit" | "/exit" | "/q" => {
