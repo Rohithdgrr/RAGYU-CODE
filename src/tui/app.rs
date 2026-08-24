@@ -33,10 +33,10 @@ use crate::commands::{self, App};
 
 /// Slash commands that never take an argument — Enter on the palette runs
 /// them directly instead of opening the args dialog.
-const ZERO_ARG_SLASH: [&str; 25] = [
+const ZERO_ARG_SLASH: [&str; 24] = [
     "/help", "/exit", "/quit", "/q", "/clear", "/reset", "/sessions", "/stats", "/history",
     "/models", "/tools", "/config", "/tokens", "/undo", "/retry", "/compact", "/raw", "/scan",
-    "/pin", "/variants", "/pick", "/agent", "/skills", "/pty", "/auto-compact",
+    "/pin", "/variants", "/pick", "/agent", "/skills", "/auto-compact",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +164,9 @@ pub struct Tui {
     pub at_picker_selected: usize,
     /// Usage/cost dashboard modal state
     pub show_cost_dashboard: bool,
+    /// `/raw` — render assistant output as plain text instead of markdown
+    /// (mirrors `app.renderer.markdown_enabled()`, synced after commands).
+    pub raw_mode: bool,
 }
 
 impl Default for Tui {
@@ -214,6 +217,7 @@ impl Tui {
             at_picker_files: Vec::new(),
             at_picker_selected: 0,
             show_cost_dashboard: false,
+            raw_mode: false,
         };
         // Eagerly open explorer so "No files yet" never shows on startup when
         // the right pane is visible by default (width≥100). Fail silently in tests.
@@ -1684,6 +1688,9 @@ async fn handle_tui_slash(
     // the alternate screen). One source of truth for every slash command.
     let out = commands::dispatch_structured(line, app).await;
     apply_command_output(app, tui, line, out.clone());
+    // `/raw` toggles the renderer inside the dispatcher; keep the pane flag
+    // in sync so the chat view switches live.
+    tui.raw_mode = !app.renderer.markdown_enabled();
     out
 }
 

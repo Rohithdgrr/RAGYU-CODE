@@ -85,6 +85,7 @@ fn render_chat(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
         Some(&streaming),
         tui.busy,
         area.width.saturating_sub(2),
+        tui.raw_mode,
     );
 
     // Clamp scroll so we never show blank space above the first line.

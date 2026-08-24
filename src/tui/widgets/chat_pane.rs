@@ -943,6 +943,29 @@ fn assistant_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// `/raw` mode: plain wrapped text, no markdown parsing.
+fn assistant_raw_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let t = theme::active();
+    let inner = width.saturating_sub(4) as usize;
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!(" {} GOVINDA ", icons::ASSISTANT),
+            Style::default()
+                .fg(t.text_inverse)
+                .bg(t.accent_primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ", t.text()),
+    ])];
+    for l in text.lines() {
+        for w in wrap(l, inner) {
+            lines.push(Line::from(Span::styled(w, t.text())));
+        }
+    }
+    lines.push(Line::default());
+    lines
+}
+
 fn tool_lines(name: &str, args: &str, ok: Option<bool>) -> Vec<Line<'static>> {
     let t = theme::active();
     let args_short: String = {
@@ -1049,18 +1072,26 @@ fn notice_lines(text: &str, width: u16) -> Vec<Line<'static>> {
 }
 
 /// Flattens the transcript (+ optional live streaming buffer) into styled
-/// lines ready for a `Paragraph`.
+/// lines ready for a `Paragraph`. `raw` (from `/raw`) renders assistant
+/// output as plain wrapped text instead of parsed markdown.
 pub fn build_lines(
     entries: &[ChatEntry],
     streaming: Option<&str>,
     busy: bool,
     width: u16,
+    raw: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for e in entries {
         match e {
             ChatEntry::User(t) => lines.extend(user_lines(t, width)),
-            ChatEntry::Assistant(t) => lines.extend(assistant_lines(t, width)),
+            ChatEntry::Assistant(t) => {
+                if raw {
+                    lines.extend(assistant_raw_lines(t, width));
+                } else {
+                    lines.extend(assistant_lines(t, width));
+                }
+            }
             ChatEntry::Tool { name, args, ok } => lines.extend(tool_lines(name, args, *ok)),
             ChatEntry::Checklist { title, steps } => {
                 lines.extend(checklist_lines(title, steps, width))
@@ -1174,8 +1205,20 @@ mod tests {
             },
             ChatEntry::Notice("note".into()),
         ];
-        let lines = build_lines(&entries, None, false, 80);
+        let lines = build_lines(&entries, None, false, 80, false);
         assert!(lines.len() > 6);
+    }
+
+    #[test]
+    fn raw_mode_skips_markdown_parsing() {
+        let entries = vec![ChatEntry::Assistant("### Heading\n- item".into())];
+        // Markdown mode strips the heading marker; raw mode keeps it.
+        let md = build_lines(&entries, None, false, 80, false);
+        let raw = build_lines(&entries, None, false, 80, true);
+        let flat_md: String = md.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect();
+        let flat_raw: String = raw.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect();
+        assert!(!flat_md.contains("###"), "markdown mode should parse headings");
+        assert!(flat_raw.contains("###"), "raw mode should show the text verbatim");
     }
 
     #[test]

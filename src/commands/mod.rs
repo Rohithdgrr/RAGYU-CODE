@@ -33,7 +33,7 @@ pub use plan::{Phase, PipelineStep, generate_pipeline, parse_pipeline_steps};
 
 /// Every slash command the REPL accepts. Drives the reedline completer and
 /// shell-completion scripts; keep in sync with `dispatch()` / `help()`.
-pub const SLASH_COMMANDS: [&str; 47] = [
+pub const SLASH_COMMANDS: [&str; 46] = [
     "/help",
     "/exit",
     "/quit",
@@ -79,7 +79,6 @@ pub const SLASH_COMMANDS: [&str; 47] = [
     "/skills",
     "/commit",
     "/pr",
-    "/pty",
     "/auto-compact",
 ];
 
@@ -565,8 +564,14 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             }
             Outcome::Handled
         }
-        "/pty" => {
-            dim("PTY panel: use run_shell tool for long-running commands (the TUI streams output live)");
+        "/agent" => {
+            // TUI-only concept (NORMAL/AGENT mode badge). The REPL is always
+            // agent-capable; function calling toggles with /tools.
+            dim("mode switching is a TUI feature — run `govinda` (TUI) and use /agent <on|off>. In the REPL, tools toggle with /tools on|off.");
+            Outcome::Handled
+        }
+        "/pin" => {
+            dim("pinning files to context is a TUI feature — open the explorer (Ctrl+P), select a file, /pin. In the REPL, @-mention files in your prompt instead.");
             Outcome::Handled
         }
         "/auto-compact" => {

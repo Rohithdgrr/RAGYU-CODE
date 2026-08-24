@@ -186,7 +186,6 @@ diffs, and result previews in both.
 | `/skills` | List loaded custom skills from `~/.config/govinda/skills/` |
 | `/commit <message>` | Stage all changes and git commit |
 | `/pr [create\|list\|branch]` | Branch/PR workflow: create `govinda/<timestamp>` branch, list, or switch |
-| `/pty` | PTY panel hint for long-running commands |
 
 Input line supports up/down history recall (persisted to `.govinda_history`), slash-command completion as you type, and standard editing keys.
 

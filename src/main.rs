@@ -104,6 +104,9 @@ async fn main() -> Result<()> {
     let http = Config::http_client().context("startup failed")?;
     if let Some(theme) = &config.theme {
         govinda_cli::render::set_theme(theme);
+        // The TUI has its own palette set; honor the saved theme there too
+        // so /theme choices persist across launches in both frontends.
+        let _ = govinda_cli::tui::theme::set_by_name(theme);
     }
     let renderer = Renderer::new(config.render_markdown);
 
