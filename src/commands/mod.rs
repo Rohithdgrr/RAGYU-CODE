@@ -36,26 +36,21 @@ pub use plan::{Phase, PipelineStep, generate_pipeline, parse_pipeline_steps};
 /// list had 55 entries, many of which were stubbed, broken, or duplicated
 /// TUI-only behaviour. Anything removed here is still discoverable via
 /// `/help` (which lists a short summary of each).
-pub const SLASH_COMMANDS: [&str; 19] = [
+pub const SLASH_COMMANDS: [&str; 14] = [
     "/help",
     "/exit",
     "/clear",
-    "/agent",
     "/provider",
     "/model",
     "/models",
     "/router",
     "/theme",
     "/tokens",
-    "/context",
     "/todo",
-    "/tools",
     "/cd",
     "/save",
     "/load",
     "/history",
-    "/undo",
-    "/config",
 ];
 
 /// Shared mutable state for the REPL and command handlers.
@@ -334,15 +329,6 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             print_history(app);
             Outcome::Handled
         }
-        "/undo" => {
-            if app.session.undo() {
-                dim("removed last exchange.");
-                Outcome::Undo
-            } else {
-                dim("nothing to undo.");
-                Outcome::Handled
-            }
-        }
         "/retry" => match retry(app) {
             Some(text) => {
                 dim("regeneratingâ€¦");
@@ -365,34 +351,34 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             }
         }
         "/tokens" => {
-            info(format!(
-                "~{} tokens Â· context budget {} tokens (real BPE count) Â· {} messages Â· provider {}",
-                app.session.approx_tokens(),
-                app.config.context_tokens,
-                app.session.messages().len(),
-                app.config.provider.key(),
-            ));
-            Outcome::Handled
-        }
-        "/context" => {
             let used = app.session.approx_tokens();
             let budget = app.config.context_tokens;
-            let provider_key = app.config.provider.key();
-            let provider_id: &str = provider_key.as_ref();
+            let provider_id: &str = app.config.provider.key().as_ref();
             let model: &str = app.config.model.as_str();
             let registry_window = crate::provider::context_window_for(provider_id, model);
             let headroom = budget.saturating_sub(used);
             let pct = if budget > 0 { (used * 100) / budget } else { 0 };
-            info(format!(
-                "model: {}\nprovider: {}\nused: ~{} tokens ({pct}% of budget)\nbudget: {} tokens (CLI trim cap)\nheadroom: ~{} tokens\nmodel limit: {} tokens{}\nset budget in config.toml: `context_tokens = <N>`",
-                model,
-                provider_id,
-                used,
-                budget,
-                headroom,
+            // Render the token report as a Markdown message so the TUI
+            // shows it in the chat pane (the previous `info()` notice
+            // was easy to miss on long transcripts).
+            let body = format!(
+                "### Token usage\n\
+                 \n\
+                 - **used**: ~{used} tokens ({pct}% of budget)\n\
+                 - **budget**: {budget} tokens (CLI trim cap, `context_tokens` in `config.toml`)\n\
+                 - **headroom**: ~{headroom} tokens\n\
+                 - **messages**: {}\n\
+                 - **model**: `{model}` ({provider_id})\n\
+                 - **model limit**: {} tokens{}",
+                app.session.messages().len(),
                 if registry_window > 0 { registry_window } else { budget },
-                if registry_window == 0 { " (registry unknown â€” set explicitly in TOML)" } else { " (from registry)" },
-            ));
+                if registry_window == 0 {
+                    " (registry unknown -- set `context_tokens` in TOML)"
+                } else {
+                    " (from registry)"
+                },
+            );
+            markdown(body);
             Outcome::Handled
         }
         "/theme" => {
@@ -407,52 +393,12 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             router_cmd::handle(rest, app);
             Outcome::Handled
         }
-        "/tools" => {
-            show_tools(rest, app);
-            Outcome::Handled
-        }
         "/todo" => {
             todo::handle(rest, app);
             Outcome::Handled
         }
         "/cd" | "/open" => {
             return folder::handle(rest, app).await;
-        }
-        "/agent" => {
-            // Agent mode = function calling on/off. One source of truth on
-            // App so the model really gains/loses tools (the TUI additionally
-            // switches its NORMAL/AGENT badge when it sees the change).
-            match rest.trim() {
-                "on" => {
-                    app.tools_enabled = true;
-                    ok("agent mode ON â€” function calling enabled.");
-                }
-                "off" => {
-                    app.tools_enabled = false;
-                    ok("agent mode OFF â€” function calling disabled.");
-                }
-                "" => info(format!(
-                    "agent mode {} (function calling {})",
-                    if app.tools_enabled { "ON" } else { "OFF" },
-                    if app.tools_enabled { "enabled" } else { "disabled" },
-                )),
-                other => info(format!(
-                    "usage: /agent <on|off> (unknown arg '{other}')"
-                )),
-            }
-            Outcome::Handled
-        }
-        "/config" => {
-            if rest.trim().eq_ignore_ascii_case("save") {
-                match persistence::save_runtime_config(app) {
-                    Ok(path) => ok(format!("settings saved to {}", path.display())),
-                    Err(e) => err(format!("config save failed: {e:#}")),
-                }
-            } else {
-                show_config(app);
-                dim("use '/config save' to persist model/theme/timeout/limit settings.");
-            }
-            Outcome::Handled
         }
         unknown => {
             // Map removed/broken old commands to the closest live command.
@@ -497,6 +443,22 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                         "provider: {provider} — set the API key via env ({}_API_KEY=...) or .env, not via slash command.",
                         provider.to_uppercase()
                     ));
+                }
+                "/undo" => {
+                    dim("`/undo` was removed; restart the chat with `/clear` if you want a fresh history.");
+                }
+                "/context" => {
+                    dim("`/context` was merged into `/tokens` — run `/tokens` for the full usage report.");
+                }
+                "/tools" => {
+                    dim("`/tools` was removed; tools are always available to the model unless `/router failover off` pins the active model.");
+                }
+                "/agent" => {
+                    dim("`/agent` was removed; function calling is on by default and toggled via `tools_enabled` in `config.toml`.");
+                }
+                "/config" => {
+                    dim("`/config` was removed; edit `~/.config/govinda/config.toml` directly (TOML is the source of truth).");
+                }
                 }
                 "/test" | "/setup" => {
                     dim("`/test` / `/setup` were removed; run a model call directly to verify the provider.");

@@ -99,7 +99,6 @@ pub fn command(cmd: &str) -> &'static str {
         "/temp" => "\u{f2c9}",     // thermometer-half
         "/system" => "\u{f120}",   // terminal
         "/history" => "\u{f1da}",  // history
-        "/undo" => "\u{f0e2}",     // undo arrow
         "/retry" => "\u{f021}",    // refresh
         "/variants" => "\u{f141}", // ellipsis-h
         "/pick" => "\u{f245}",     // hand-pointer
@@ -114,10 +113,8 @@ pub fn command(cmd: &str) -> &'static str {
         "/theme" => "\u{f1fc}",    // paint-brush
         "/tokens" => "\u{f0e7}",   // bolt
         "/raw" => "\u{f070}",      // eye-slash
-        "/config" => "\u{f0ad}",   // wrench
         "/timeout" => "\u{f252}",  // hourglass-half
         "/limit" => "\u{f0e4}",    // tachometer
-        "/tools" => "\u{f0ad}",    // wrench
         "/todo" => "\u{f046}",     // check-square-o
         "/diff" => "\u{f0db}",     // columns
         "/apply" => "\u{f00c}",    // check
@@ -137,7 +134,7 @@ pub fn command(cmd: &str) -> &'static str {
         "/apikey" => "\u{f023}", // lock
         "/setup" => "\u{f013}", // gear
         "/pin" => PINNED,
-        "/agent" => MODE_AGENT,
+        "/router" => "\u{f0e7}", // bolt
         "/provider" => "\u{f013}", // gear
         "/test" => "\u{f00c}", // check
         _ => INFO,

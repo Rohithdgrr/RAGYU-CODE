@@ -32,12 +32,21 @@ use crate::api;
 use crate::commands::{self, App};
 use crate::provider;
 
-/// Slash commands that never take an argument — Enter on the palette runs
-/// them directly instead of opening the args dialog.
-const ZERO_ARG_SLASH: [&str; 24] = [
-    "/help", "/exit", "/quit", "/q", "/clear", "/reset", "/sessions", "/stats", "/history",
-    "/models", "/tools", "/config", "/tokens", "/undo", "/retry", "/compact", "/raw", "/scan",
-    "/pin", "/variants", "/pick", "/agent", "/skills", "/auto-compact",
+/// Slash commands that never take an argument — Enter on the palette or a
+/// click on the palette row runs them directly instead of opening the args
+/// dialog. These mirror the always-runnable subset of
+/// `commands::SLASH_COMMANDS`.
+const ZERO_ARG_SLASH: [&str; 10] = [
+    "/help",
+    "/exit",
+    "/quit",
+    "/q",
+    "/clear",
+    "/reset",
+    "/models",
+    "/tokens",
+    "/retry",
+    "/history",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,7 +688,7 @@ impl Tui {
                     "keys: Tab focus · ↑/↓ palette/history · Space expand dir · Enter \
                      open/pin file · F5 refresh · Esc clear/cancel · Ctrl+C cancel stream \
                      · Ctrl+L clear · Ctrl+T left tree · Ctrl+P explorer · Ctrl+O open folder · Ctrl+Q quit\n\
-                     cmds: /help /clear /theme /tokens /agent <on|off> /plan <task> /model /temp /system /history /undo /retry /variants /pick /compact /search /save /load /sessions /fork /export /stats /raw /config /timeout /limit /tools /todo /diff /apply /reject /review /scan /project /cd /open\n\
+                     cmds: /help /clear /tokens /model /history /retry /save /load /theme /provider /models /router /todo /cd\n\
                       Tip: type \"/\" to see the palette — Enter/↑↓/click open the args dialog, Tab completes. Ctrl+O to change folder.",
                 );
                 return true;
@@ -715,8 +724,9 @@ impl Tui {
                 }
                 return true;
             }
-            // "/agent" goes through the unified dispatcher, which toggles
-            // app.tools_enabled for real; handle_tui_slash syncs the badge.
+            // All other slash commands go through the unified dispatcher
+            // (which calls App-aware handlers for `/router`, `/provider`,
+            // `/save`, etc.). handle_tui_slash syncs derived state.
             _ => {}
         }        // Known slash commands and custom skills need App-aware handling
         if crate::commands::SLASH_COMMANDS.contains(&cmd_lc.as_str()) {
@@ -894,6 +904,16 @@ impl Tui {
                                     let cmd = hits[idx];
                                     if cmd == "/model" {
                                         self.pending_model_fetch = true;
+                                    } else if ZERO_ARG_SLASH.contains(&cmd) {
+                                        // Run immediately: fill the input
+                                        // with the full command and submit
+                                        // so `local_command` handles it
+                                        // (`/exit` -> quit, `/clear` -> clear,
+                                        // `/tokens` -> dispatch + render).
+                                        self.input = cmd.to_owned();
+                                        self.input_cursor = self.input.chars().count();
+                                        self.slash_selected = 0;
+                                        self.submit();
                                     } else {
                                         self.open_slash_dialog(cmd);
                                     }
@@ -1169,7 +1189,15 @@ impl Tui {
                             // yield a usage notice.
                             let cmd = hits[self.slash_selected.min(hits.len() - 1)];
                             if ZERO_ARG_SLASH.contains(&cmd) {
-                                // fall through to submit() below
+                                // Replace the partial input with the full
+                                // command so `submit()` -> `local_command`
+                                // sees the resolved slash and runs it
+                                // immediately (`/exit` -> quit,
+                                // `/clear` -> clear, `/tokens` -> dispatch).
+                                self.input = cmd.to_owned();
+                                self.input_cursor = self.input.chars().count();
+                                self.slash_selected = 0;
+                                // Fall through to submit() below.
                             } else if cmd == "/model" {
                                 // `/model` needs an async model list fetch before
                                 // opening the dialog, so flag it for the event loop.
@@ -2265,22 +2293,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_via_dialog_reaches_plan_runner() {
-        // Regression: /plan confirmed through the args dialog used to fall
-        // into handle_tui_slash's dead fallback instead of queueing the task.
-        let mut t = Tui::new();
-        type_str(&mut t, "/plan");
-        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(t.slash_dialog.is_some(), "/plan should open the args dialog");
-        type_str(&mut t, "build the parser");
-        t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(
-            t.take_pending_slash().as_deref(),
-            Some("/plan build the parser")
-        );
-    }
-
-    #[test]
     fn dialog_accepts_args_and_confirms() {
         let mut t = Tui::new();
         type_str(&mut t, "/sav");
@@ -2479,25 +2491,16 @@ mod tests {
     fn all_slash_commands_are_handled() {
         // Every SLASH_COMMANDS entry should either be handled locally (notice/quit/clear)
         // or queued as pending_slash for App-aware dispatch — never "not wired".
-        for cmd in crate::commands::SLASH_COMMANDS {
+        let cmds: Vec<&str> = crate::commands::SLASH_COMMANDS.to_vec();
+        for cmd in cmds {
             let mut tui = Tui::new();
             // use a basic arg where needed to avoid usage notices being mistaken for failure
-            let input = match cmd {
+            let input: String = match cmd {
                 "/model" => "/model test-model".to_string(),
-                "/temp" => "/temp 0.5".to_string(),
-                "/system" => "/system test".to_string(),
-                "/search" => "/search hello".to_string(),
                 "/save" => "/save test".to_string(),
                 "/load" => "/load test".to_string(),
-                "/export" => "/export md".to_string(),
-                "/timeout" => "/timeout 30".to_string(),
-                "/limit" => "/limit 8".to_string(),
-                "/tools" => "/tools".to_string(),
                 "/todo" => "/todo list".to_string(),
-                "/scan" => "/scan".to_string(),
-                "/plan" => "/plan task".to_string(),
-                "/project" => "/project show".to_string(),
-                _ => cmd.to_string(),
+                other => other.to_string(),
             };
             tui.set_input(input.clone());
             tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -2540,23 +2543,15 @@ mod tests {
             crate::session::Session::new("sys"),
             crate::render::Renderer::new(false),
         );
-        for cmd in crate::commands::SLASH_COMMANDS {
+        let cmds: Vec<&str> = crate::commands::SLASH_COMMANDS.to_vec();
+        for cmd in cmds {
             let mut tui = Tui::new();
-            let line = match cmd {
+            let line: &str = match cmd {
                 "/model" => "/model foo",
-                "/temp" => "/temp 0.7",
-                "/system" => "/system hi",
-                "/search" => "/search hi",
                 "/save" => "/save t",
                 "/load" => "/load t",
-                "/export" => "/export md",
-                "/timeout" => "/timeout 30",
-                "/limit" => "/limit 8",
                 "/todo" => "/todo list",
-                "/scan" => "/scan",
-                "/project" => "/project show",
-                "/plan" => "/plan do x",
-                _ => cmd,
+                other => other,
             };
             let out = handle_tui_slash(&mut app, &mut tui, line).await;
             let handled = !out.is_silent()
@@ -2572,23 +2567,6 @@ mod tests {
                 if t.contains("use REPL") || t.contains("REPL-only") || t.contains("requires REPL")));
             assert!(!stubbed, "handle_tui_slash for {cmd} still defers to the REPL");
         }
-    }
-
-    /// `/agent on|off` must toggle REAL capability (`app.tools_enabled`),
-    /// not just a status-bar label — and the badge must follow.
-    #[tokio::test]
-    async fn agent_command_toggles_tools_and_badge() {
-        let mut app = smoke_app();
-        app.tools_enabled = true;
-        let mut tui = Tui::new();
-
-        handle_tui_slash(&mut app, &mut tui, "/agent off").await;
-        assert!(!app.tools_enabled, "tools must be disabled");
-        assert_eq!(tui.mode, AppMode::Normal);
-
-        handle_tui_slash(&mut app, &mut tui, "/agent on").await;
-        assert!(app.tools_enabled, "tools must be re-enabled");
-        assert_eq!(tui.mode, AppMode::Agent);
     }
 
     fn smoke_app() -> App {
@@ -2614,32 +2592,6 @@ mod tests {
             crate::session::Session::new("sys"),
             crate::render::Renderer::new(false),
         )
-    }
-
-    /// `/undo` must keep the TUI transcript in sync with the session: the
-    /// last exchange disappears from BOTH.
-    #[tokio::test]
-    async fn undo_syncs_transcript_and_session() {
-        use commands::output::Effect;
-        let mut app = smoke_app();
-        app.session.push_user("q1");
-        app.session.push_assistant("a1");
-        app.session.push_user("q2");
-        app.session.push_assistant("a2");
-        let mut tui = Tui::new();
-        tui.entries.push(ChatEntry::User("q1".into()));
-        tui.entries.push(ChatEntry::Assistant("a1".into()));
-        tui.entries.push(ChatEntry::User("q2".into()));
-        tui.entries.push(ChatEntry::Assistant("a2".into()));
-
-        let out = handle_tui_slash(&mut app, &mut tui, "/undo").await;
-        assert_eq!(out.effect, Effect::PopExchange);
-        assert_eq!(app.session.messages().len(), 2);
-        // Transcript now ends with the first exchange's assistant reply.
-        assert!(matches!(
-            tui.entries.last(),
-            Some(ChatEntry::Assistant(t)) if t == "a1"
-        ));
     }
 
     /// `/save` then `/load` must round-trip through disk with a rebuilt
@@ -2675,18 +2627,6 @@ mod tests {
             "transcript must be rebuilt from the loaded session"
         );
         let _ = std::fs::remove_file(&path);
-    }
-
-    /// A committed variant (`/pick`) lands as an Assistant chat entry.
-    #[tokio::test]
-    async fn pick_commits_variant_as_assistant_entry() {
-        let mut app = smoke_app();
-        app.pending_variants.push("variant answer".to_owned());
-        let mut tui = Tui::new();
-        handle_tui_slash(&mut app, &mut tui, "/pick 1").await;
-        assert!(app.pending_variants.is_empty());
-        assert_eq!(app.session.messages().last().map(|m| m.content.as_str()), Some("variant answer"));
-        assert!(tui.entries.iter().any(|e| matches!(e, ChatEntry::Assistant(t) if t == "variant answer")));
     }
 
     /// `/theme <name>` flows through the unified dispatcher and switches the
