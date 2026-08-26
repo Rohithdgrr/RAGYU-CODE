@@ -652,7 +652,14 @@ impl Tui {
                             }
                         }
                         ProviderWorkflow::Testing { .. } => {
-                            // Wait for async test to complete.
+                            // Allow Esc to cancel a hanging test.
+                            if key.code == KeyCode::Esc {
+                                let wf = self.provider_workflow.take();
+                                if let Some(ProviderWorkflow::Testing { provider, .. }) = wf {
+                                    self.notice(format!("setup test cancelled for {provider}."));
+                                }
+                            }
+                            // Otherwise wait for async test to complete.
                         }
                         ProviderWorkflow::Result { .. } => {
                             // Any key closes the result.
@@ -1579,6 +1586,12 @@ impl Tui {
         if interrupted && !leftover.trim().is_empty() {
             self.entries
                 .push(ChatEntry::Assistant(format!("{leftover}\n\n*(interrupted)*")));
+        } else if !leftover.trim().is_empty() {
+            // Normal completion but streaming buffer has un-flushed content.
+            // This can happen if the model's final text wasn't fully captured
+            // by the Answer update. Preserve it to avoid losing output.
+            self.entries
+                .push(ChatEntry::Assistant(leftover));
         }
     }
 
@@ -1965,10 +1978,35 @@ async fn event_loop(
 
 fn git_branch_and_dirty() -> (Option<String>, bool) {
     // Cheap, sync read of .git/HEAD; no process spawn per frame.
+    // Handles worktrees where .git is a file pointing to the main repo.
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let head = cwd.join(".git").join("HEAD");
+    let git_path = cwd.join(".git");
     let dirty = false; // keep cheap; file-tree handles precise git marks
-    let branch = std::fs::read_to_string(&head).ok().and_then(|s| {
+
+    // In a worktree, .git is a file containing "gitdir: <path>".
+    // We need to resolve the actual gitdir to find HEAD.
+    let head_path = if git_path.is_file() {
+        // Worktree: read the gitdir path from the .git file
+        let content = std::fs::read_to_string(&git_path).ok().unwrap_or_default();
+        let gitdir = content
+            .strip_prefix("gitdir: ")
+            .map(str::trim)
+            .unwrap_or("");
+        if gitdir.is_empty() {
+            return (None, dirty);
+        }
+        // Resolve relative gitdir path against the worktree root
+        let resolved = if std::path::Path::new(gitdir).is_absolute() {
+            std::path::PathBuf::from(gitdir)
+        } else {
+            cwd.join(gitdir)
+        };
+        resolved.join("HEAD")
+    } else {
+        git_path.join("HEAD")
+    };
+
+    let branch = std::fs::read_to_string(&head_path).ok().and_then(|s| {
         let t = s.trim();
         if let Some(rest) = t.strip_prefix("ref: refs/heads/") {
             Some(rest.to_owned())

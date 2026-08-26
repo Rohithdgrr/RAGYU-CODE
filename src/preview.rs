@@ -49,28 +49,33 @@ fn content_type(path: &Path) -> &'static str {
 }
 
 /// Resolves a URL path to a workspace file, rejecting traversal outside the
-/// workspace root and absolute paths.
+/// workspace root, absolute paths, and symlink escapes.
 fn resolve_safe(root: &Path, url_path: &str) -> Option<PathBuf> {
     let stripped = url_path.strip_prefix('/').unwrap_or(url_path);
     // Full percent-decode instead of only %20.
-    let decoded = urlencoding::decode(stripped).ok().unwrap_or_default().into_owned();
+    let decoded = urlencoding::decode(stripped).ok()?.into_owned();
     let rel = Path::new(&decoded);
-    let mut safe = true;
-    for comp in rel.components() {
-        match comp {
-            Component::Normal(_) | Component::CurDir => {}
-            _ => safe = false,
-        }
-    }
-    if !safe || rel.as_os_str().is_empty() {
+
+    // Reject any path with parent references, absolute components, or prefix names.
+    if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
         return None;
     }
-    let full = root.join(rel);
-    if full.is_file() {
-        Some(full)
-    } else {
-        None
+    if rel.as_os_str().is_empty() {
+        return None;
     }
+
+    let full = root.join(rel);
+
+    // Canonicalize and verify the resolved path is still under root.
+    // This prevents symlink-based escapes (e.g., root/sub -> /etc).
+    let canonical_root = root.canonicalize().ok()?;
+    let canonical_full = full.canonicalize().ok()?;
+
+    if !canonical_full.starts_with(&canonical_root) {
+        return None;
+    }
+
+    canonical_full.is_file().then_some(canonical_full)
 }
 
 /// Reads one HTTP request's first line (`GET /path HTTP/1.1`) from the socket.
@@ -120,19 +125,32 @@ async fn handle_conn(mut stream: TcpStream, root: PathBuf) {
 /// Starts the static server on a random free port, if not already running.
 /// Returns the bound address.
 async fn ensure_server() -> Result<SocketAddr> {
-    if let Some(existing) = PREVIEW
-        .lock()
-        .map_err(|_| anyhow::anyhow!("preview state poisoned"))?
-        .as_ref()
-        .map(|s| s.addr)
+    // First check: fast path without holding lock across await.
     {
-        return Ok(existing);
+        let guard = PREVIEW
+            .lock()
+            .map_err(|_| anyhow::anyhow!("preview state poisoned"))?;
+        if let Some(existing) = guard.as_ref().map(|s| s.addr) {
+            return Ok(existing);
+        }
     }
+    // Not running — bind and spawn outside the lock.
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .context("cannot bind preview server")?;
     let addr = listener.local_addr().context("cannot read preview port")?;
     let root = std::env::current_dir().context("cannot resolve working directory")?;
+    // Second check: another task may have started the server while we bound.
+    {
+        let mut guard = PREVIEW
+            .lock()
+            .map_err(|_| anyhow::anyhow!("preview state poisoned"))?;
+        if let Some(existing) = guard.as_ref().map(|s| s.addr) {
+            // Another task won the race — drop our listener (it goes out of scope).
+            return Ok(existing);
+        }
+        *guard = Some(PreviewServer { addr });
+    }
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -143,9 +161,6 @@ async fn ensure_server() -> Result<SocketAddr> {
             }
         }
     });
-    if let Ok(mut guard) = PREVIEW.lock() {
-        *guard = Some(PreviewServer { addr });
-    }
     Ok(addr)
 }
 

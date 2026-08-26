@@ -337,9 +337,13 @@ fn inline_spans(raw: &str, base: Style) -> Vec<Span<'static>> {
         let chunk: String = chars[start..i].iter().collect();
         // preserve prior style for bold context
         out.push(Span::styled(chunk, base));
-        // avoid infinite loop if we didn't advance due to single marker without closing
-        if out.last().is_some() && start == i - 1 && matches!(chars[start], '*' | '_' | '~' | '`' | '[' | '=') {
-            // already handled as plain above; keep moving
+        // If the chunk is a single unmatched marker character, force-advance
+        // past it to prevent an infinite loop on unclosed markdown like `*unclosed`.
+        if start == i - 1 && matches!(chars[start], '*' | '_' | '~' | '`' | '[' | '=') {
+            // The marker was already pushed as plain text above; advance past it.
+            // (i already equals start + 1 from the initial increment, so no extra advance needed,
+            // but the outer `while i < len` will re-enter with the same i if the next char is
+            // also a marker — that's correct behavior since each marker gets its own plain span.)
         }
     }
     // merge consecutive spans with same style to keep rendering cheap
@@ -772,7 +776,9 @@ fn highlight_code_line(line: &str, lang: Option<&str>, t: &theme::Theme) -> Vec<
         }
     };
     while i < len {
-        let c = line[i..].chars().next().unwrap_or(' ');
+        let Some(c) = line[i..].chars().next() else {
+            break;
+        };
 
         // String literal detection
         if c == '"' || c == '\'' || c == '`' {
@@ -781,12 +787,15 @@ fn highlight_code_line(line: &str, lang: Option<&str>, t: &theme::Theme) -> Vec<
             let quote = c;
             let mut j = i + quote.len_utf8();
             while j < len {
-                let cc = line[j..].chars().next().unwrap_or(' ');
+                let Some(cc) = line[j..].chars().next() else {
+                    break;
+                };
                 if cc == '\\' && j + 1 < len {
                     j += cc.len_utf8();
                     if j < len {
-                        let next = line[j..].chars().next().unwrap_or(' ');
-                        j += next.len_utf8();
+                        if let Some(next) = line[j..].chars().next() {
+                            j += next.len_utf8();
+                        }
                     }
                     continue;
                 }
@@ -817,7 +826,9 @@ fn highlight_code_line(line: &str, lang: Option<&str>, t: &theme::Theme) -> Vec<
             push_plain(&mut out, &mut buf_start, i, text_s);
             let mut j = i;
             while j < len {
-                let cc = line[j..].chars().next().unwrap_or(' ');
+                let Some(cc) = line[j..].chars().next() else {
+                    break;
+                };
                 if cc.is_ascii_alphanumeric() || cc == '.' || cc == '_' {
                     j += cc.len_utf8();
                 } else {
@@ -833,7 +844,9 @@ fn highlight_code_line(line: &str, lang: Option<&str>, t: &theme::Theme) -> Vec<
         if c.is_alphabetic() || c == '_' {
             let mut j = i;
             while j < len {
-                let cc = line[j..].chars().next().unwrap_or(' ');
+                let Some(cc) = line[j..].chars().next() else {
+                    break;
+                };
                 if cc.is_alphanumeric() || cc == '_' {
                     j += cc.len_utf8();
                 } else {
@@ -865,7 +878,9 @@ fn highlight_code_line(line: &str, lang: Option<&str>, t: &theme::Theme) -> Vec<
             let mut j = i + c.len_utf8();
             // group runs of same-class punctuation
             while j < len {
-                let cc = line[j..].chars().next().unwrap_or(' ');
+                let Some(cc) = line[j..].chars().next() else {
+                    break;
+                };
                 if matches!(cc, '{' | '}' | '(' | ')' | '[' | ']' | ';' | ',' | '.' | ':' | '<' | '>' | '=' | '+' | '-' | '*' | '/' | '!' | '?' | '&' | '|' | '^' | '~' | '@' | '#' | '$' | '%') {
                     j += cc.len_utf8();
                 } else {
