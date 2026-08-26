@@ -795,7 +795,7 @@ fn render_settings(f: &mut Frame<'_>, area: Rect) {
         Line::default(),
         Line::from(vec![Span::styled(" Provider", Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD))]),
         Line::default(),
-        Line::from(vec![Span::styled("  /provider <name>  ", label), Span::styled("mistral · kimi · groq · ollama", muted)]),
+        Line::from(vec![Span::styled("  /provider <name>  ", label), Span::styled(crate::provider::preset_names().take(4).collect::<Vec<_>>().join(" · "), muted)]),
         Line::from(vec![Span::styled("  /model <name>  ", label), Span::styled("partial match", muted)]),
         Line::default(),
         Line::from(vec![Span::styled("  Esc ", Style::default().fg(t.text_secondary).bg(t.bg_secondary).add_modifier(Modifier::BOLD)), Span::styled(" close", muted)]),

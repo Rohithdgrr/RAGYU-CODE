@@ -414,10 +414,17 @@ pub async fn stream_chat_at(
 ) -> Result<()> {
     let mut body = json!({
         "model": opts.model,
-        "temperature": opts.temperature,
         "stream": true,
         "messages": history,
     });
+    // Skip the explicit `temperature` field when the user has not
+    // changed it from the OpenAI default (1.0). Most providers treat
+    // 1.0 as the default already; explicitly sending it just adds
+    // a few bytes to every request and occasionally confuses
+    // models that have a different default (e.g. reasoning models).
+    if (opts.temperature - 1.0).abs() > f32::EPSILON {
+        body["temperature"] = json!(opts.temperature);
+    }
     if !opts.tools.is_empty() {
         body["tools"] = Value::Array(opts.tools.iter().map(Tool::to_wire).collect());
     }

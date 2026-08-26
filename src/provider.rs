@@ -67,10 +67,27 @@ pub trait Provider: Send + Sync {
     fn auth(&self) -> Auth;
 }
 
+/// The role a model plays in the routing pipeline. Combo gateways
+/// (OmniRoute) tag every model they expose; non-combo providers can
+/// optionally declare a role so the router can pick fallbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterRole {
+    Primary,
+    Coding,
+    Fast,
+    Cheap,
+    Smart,
+    Offline,
+    Generic,
+}
+
 pub struct Preset {
     pub id: &'static str,
     pub base_url: &'static str,
     pub api_key_env: Option<&'static str>,
+    /// Optional role tag. `None` means "no router role"; the provider is
+    /// usable as the active model but contributes no fallbacks.
+    pub role: Option<RouterRole>,
 }
 
 pub const PRESETS: &[Preset] = &[
@@ -80,71 +97,150 @@ pub const PRESETS: &[Preset] = &[
         // works on a fresh install via pre-wired free providers.
         base_url: "http://localhost:20128/v1",
         api_key_env: None,
+        role: Some(RouterRole::Smart),
     },
     Preset {
         id: "mistral",
         base_url: "https://api.mistral.ai/v1",
         api_key_env: Some("MISTRAL_API_KEY"),
+        role: None,
     },
     Preset {
         id: "openai",
         base_url: "https://api.openai.com/v1",
         api_key_env: Some("OPENAI_API_KEY"),
+        role: None,
     },
     Preset {
         id: "openrouter",
         base_url: "https://openrouter.ai/api/v1",
         api_key_env: Some("OPENROUTER_API_KEY"),
+        role: None,
     },
     Preset {
         id: "nvidia",
         base_url: "https://integrate.api.nvidia.com/v1",
         api_key_env: Some("NVIDIA_API_KEY"),
+        role: None,
     },
     Preset {
         id: "deepseek",
         base_url: "https://api.deepseek.com/v1",
         api_key_env: Some("DEEPSEEK_API_KEY"),
+        role: None,
     },
     Preset {
         id: "kimi",
         base_url: "https://api.moonshot.cn/v1",
         api_key_env: Some("KIMI_API_KEY"),
+        role: None,
     },
     Preset {
         id: "glm",
         base_url: "https://open.bigmodel.cn/api/paas/v4",
         api_key_env: Some("GLM_API_KEY"),
+        role: None,
     },
     Preset {
         id: "minimax",
         base_url: "https://api.minimax.chat/v1",
         api_key_env: Some("MINIMAX_API_KEY"),
+        role: None,
     },
     Preset {
         id: "groq",
         base_url: "https://api.groq.com/openai/v1",
         api_key_env: Some("GROQ_API_KEY"),
+        role: None,
     },
     Preset {
         id: "bytez",
         base_url: "https://api.bytez.com/v1",
         api_key_env: Some("BYTEZ_API_KEY"),
+        role: None,
     },
     Preset {
         id: "gemini",
         base_url: "https://generativelanguage.googleapis.com/v1beta",
         api_key_env: Some("GEMINI_API_KEY"),
+        role: None,
     },
     Preset {
         id: "ollama",
         base_url: "http://localhost:11434/v1",
         api_key_env: None,
+        role: Some(RouterRole::Offline),
     },
 ];
 
 pub fn preset_names() -> impl Iterator<Item = &'static str> {
     PRESETS.iter().map(|p| p.id)
+}
+
+/// A typed row of the OmniRoute combo table. Combos are the gateway's
+/// pre-bundled routing strategies (`auto`, `/smart`, `/coding`, …).
+/// `context_window` is the combo's advertised limit; real upstreams may
+/// differ and the agent loop will fall back to the registry value when
+/// the live `/v1/models` answer disagrees.
+pub struct OmniRouteCombo {
+    pub id: &'static str,
+    pub role: RouterRole,
+    pub free: bool,
+    pub description: &'static str,
+    pub context_window: usize,
+}
+
+pub const OMNIROUTE_COMBOS: &[OmniRouteCombo] = &[
+    OmniRouteCombo {
+        id: "auto",
+        role: RouterRole::Smart,
+        free: true,
+        description: "smart router across all connected providers",
+        context_window: 1_048_576,
+    },
+    OmniRouteCombo {
+        id: "/smart",
+        role: RouterRole::Smart,
+        free: true,
+        description: "quality-optimized combo",
+        context_window: 1_048_576,
+    },
+    OmniRouteCombo {
+        id: "/coding",
+        role: RouterRole::Coding,
+        free: true,
+        description: "coding-optimized combo",
+        context_window: 1_048_576,
+    },
+    OmniRouteCombo {
+        id: "/fast",
+        role: RouterRole::Fast,
+        free: true,
+        description: "speed-optimized combo",
+        context_window: 1_048_576,
+    },
+    OmniRouteCombo {
+        id: "/cheap",
+        role: RouterRole::Cheap,
+        free: true,
+        description: "cost-optimized combo",
+        context_window: 1_048_576,
+    },
+    OmniRouteCombo {
+        id: "/offline",
+        role: RouterRole::Offline,
+        free: true,
+        description: "local-only combo",
+        context_window: 32_768,
+    },
+];
+
+/// Returns the OmniRoute combo row for an id, or `None` if `id` is not
+/// a known combo. Strips a leading `<vendor>/` prefix so callers can
+/// pass either `auto` or `oc/auto` interchangeably.
+pub fn omniroute_combo(id: &str) -> Option<&'static OmniRouteCombo> {
+    let bare = id.rsplit_once('/').map(|(_, tail)| tail).unwrap_or(id);
+    OMNIROUTE_COMBOS.iter().find(|c| c.id == bare)
 }
 
 /// A known model with metadata. `context_window` is the model's actual

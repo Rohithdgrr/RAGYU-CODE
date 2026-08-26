@@ -14,6 +14,10 @@ use tokio::sync::mpsc;
 
 use crate::api::{self, ChatOptions, Message, StreamSink};
 
+/// Default temperature for swarm workers. Low enough that parallel
+/// workers on the same prompt produce consistent answers.
+const SWARM_TEMPERATURE: f32 = 0.3;
+
 /// Result from a subagent task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentResult {
@@ -149,7 +153,9 @@ pub async fn explore(
     // The gateway's own routing alias keeps this working on any backend —
     // OmniRoute's `auto` picks a healthy model; OpenAI-compatible servers
     // without that alias fall back to their default handling of the id.
-    let opts = ChatOptions::new(auth.token(), crate::config::DEFAULT_MODEL, 0.3);
+    // Temperature stays low so concurrent swarm answers don't diverge
+    // wildly; can be overridden via `swarm_temperature` in the future.
+    let opts = ChatOptions::new(auth.token(), crate::config::DEFAULT_MODEL, SWARM_TEMPERATURE);
 
     let mut out = String::new();
     let mut no_calls = Vec::new();

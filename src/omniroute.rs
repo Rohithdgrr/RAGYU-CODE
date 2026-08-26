@@ -144,19 +144,29 @@ async fn install_omniroute() -> Result<()> {
 /// so the server outlives Govinda. Uses `std::process::Command` (not tokio)
 /// because tokio's `Child` does not reliably detach on all platforms —
 /// notably Windows where dropping the handle can terminate the grandchild.
-fn spawn_server() -> Result<()> {
+///
+/// `stderr` is redirected to a per-process tempfile so boot failures
+/// are recoverable: the caller can tail the file in the error message
+/// instead of relying on the user to dig through process logs.
+fn spawn_server() -> Result<std::path::PathBuf> {
     let argv = omniroute_cli("");
+    let log_path = std::env::temp_dir().join(format!("omniroute-{}.log", std::process::id()));
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
     let mut cmd = StdCommand::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(log_file));
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     cmd.spawn()
         .context("failed to start the omniroute server")?;
     // Intentionally drop the Child handle — the process must outlive us.
-    Ok(())
+    Ok(log_path)
 }
 
 /// Guarantees the OmniRoute gateway is serving: probe → verify install →
@@ -185,7 +195,7 @@ pub async fn ensure_running(http: &reqwest::Client) -> Result<bool> {
 
     // Step 2: the gateway is installed; start it if it isn't already up.
     eprintln!("starting the OmniRoute gateway on {}...", base_url());
-    spawn_server()?;
+    let log_path = spawn_server()?;
 
     let deadline = tokio::time::Instant::now() + BOOT_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
@@ -193,6 +203,22 @@ pub async fn ensure_running(http: &reqwest::Client) -> Result<bool> {
             return Ok(true);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    // Boot failed: tail the server log so the user has something
+    // actionable instead of a "did not come up in time" mystery.
+    if let Ok(tail) = std::fs::read_to_string(&log_path) {
+        let last: String = tail
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !last.is_empty() {
+            eprintln!("--- omniroute server log (last lines) ---\n{last}\n---");
+        }
     }
     Ok(false)
 }

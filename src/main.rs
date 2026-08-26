@@ -164,6 +164,48 @@ async fn main() -> Result<()> {
         let _ = govinda_cli::tui::theme::set_by_name(theme);
     }
 
+    // Pre-flight: probe the active model once so we surface a clean
+    // error (wrong id, auth, network) before the user invests in a
+    // long prompt. Only the active model is probed; fallbacks are
+    // tested lazily by the router's 3-strike logic.
+    {
+        let probe = govinda_cli::preflight::probe_active(
+            &http,
+            config.provider.as_ref(),
+            &config.model,
+        )
+        .await;
+        match probe.status {
+            govinda_cli::preflight::ProbeStatus::Ok => println!(
+                "{}",
+                paint(
+                    format!(
+                        "preflight: {} answered in {} ms",
+                        probe.model, probe.latency_ms
+                    ),
+                    govinda_cli::render::dim_color()
+                )
+            ),
+            govinda_cli::preflight::ProbeStatus::Warn(reason) => println!(
+                "{}",
+                paint(
+                    format!("preflight: {} warned — {reason}", probe.model),
+                    govinda_cli::render::dim_color()
+                )
+            ),
+            govinda_cli::preflight::ProbeStatus::Err(reason) => println!(
+                "{}",
+                paint(
+                    format!(
+                        "preflight: {} failed — {reason} (use /model <id> to switch)",
+                        probe.model
+                    ),
+                    govinda_cli::render::dim_color()
+                )
+            ),
+        }
+    }
+
     // Live-fetch the model's true context window from the provider's
     // `/v1/models` endpoint. This overrides the static-registry value
     // (and the `DEFAULT_CONTEXT_TOKENS` fallback) when the network is

@@ -3,7 +3,16 @@ use crate::api;
 use futures_util::future::join_all;
 use std::sync::Arc;
 
-pub(super) async fn models(app: &mut App) {
+pub(super) async fn models(arg: &str, app: &mut App) {
+    // Parse optional subcommand: `/models top [N] [--sort=key]`.
+    let trimmed = arg.trim();
+    if let Some(rest) = trimmed.strip_prefix("top") {
+        return models_top(rest.trim(), app).await;
+    }
+    models_list(app).await;
+}
+
+async fn models_list(app: &mut App) {
     let provider_id = app.config.provider.key();
     // Try the live API first; fall back to the static registry.
     let api_list = ensure_models(app).await.ok();
@@ -65,6 +74,54 @@ async fn ensure_models(app: &mut App) -> anyhow::Result<Arc<Vec<String>>> {
         Arc::new(api::list_models(&app.http, &url, app.config.provider.auth().token()).await?);
     app.models_cache = Some(Arc::clone(&list));
     Ok(list)
+}
+
+async fn models_top(rest: &str, app: &mut App) {
+    let mut n: usize = 5;
+    let mut sort_key = crate::model_rank::SortKey::Quality;
+    for tok in rest.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("--sort=") {
+            if let Some(k) = crate::model_rank::SortKey::parse(v) {
+                sort_key = k;
+            } else {
+                err(format!(
+                    "unknown sort key '{v}' (use quality|speed|cost|context|free)"
+                ));
+                return;
+            }
+        } else if let Ok(v) = tok.parse::<usize>() {
+            n = v;
+        }
+    }
+    let provider_id: &str = app.config.provider.key().as_ref();
+    let rows = crate::model_rank::top_models(provider_id, sort_key, n);
+    if rows.is_empty() {
+        err(format!("no registry models for '{provider_id}'"));
+        return;
+    }
+    info(format!(
+        "top {n} models for {provider_id} (sort={sort_key:?}):"
+    ));
+    for (i, m) in rows.iter().enumerate() {
+        let marker = if m.id == app.config.model {
+            "  ← current"
+        } else {
+            ""
+        };
+        let free_tag = if m.free { " [FREE]" } else { "" };
+        let ctx = if m.context_window == 0 {
+            "ctx=?".to_owned()
+        } else {
+            format!("ctx={}", m.context_window)
+        };
+        info(format!(
+            "  {}. {id}{tag}{marker}  ({ctx})  {desc}",
+            i + 1,
+            id = m.id,
+            tag = free_tag,
+            desc = m.description
+        ));
+    }
 }
 
 /// Resolves a model name: `next`/`prev` cycle through the cached list, any
@@ -148,7 +205,9 @@ fn compact_context(history: &[api::Message]) -> Vec<api::Message> {
 }
 
 /// Folds the whole history into a single assistant summary via the API.
-pub(super) async fn compact(app: &mut App) {
+/// Public to the crate so `auto_compact` can call it with a swapped
+/// summarizer model.
+pub(crate) async fn compact(app: &mut App) {
     if app.session.messages().len() < 2 {
         dim("conversation too short to compact.");
         return;
@@ -191,6 +250,7 @@ pub(super) async fn compact(app: &mut App) {
 ///
 /// All variants are requested concurrently; results print in order once the
 /// whole batch settles.
+#[allow(dead_code)]
 pub(super) async fn generate_variants(arg: &str, app: &mut App) {
     let n = arg.parse::<usize>().ok().filter(|n| (1..=5).contains(n));
     let n = match n {
@@ -268,6 +328,7 @@ pub(super) async fn generate_variants(arg: &str, app: &mut App) {
     dim("type /pick <n> to commit one of these, or just keep chatting to discard them.");
 }
 
+#[allow(dead_code)]
 pub(super) fn pick_variant(arg: &str, app: &mut App) {
     let idx: usize = match arg.trim().parse::<usize>() {
         Ok(i) if i >= 1 && i <= app.pending_variants.len() => i - 1,
@@ -296,6 +357,7 @@ pub(super) fn pick_variant(arg: &str, app: &mut App) {
     ok("variant committed.");
 }
 
+#[allow(dead_code)]
 fn truncate_preview(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_owned()

@@ -24,8 +24,12 @@ pub const MAX_FIX_ROUNDS: usize = 3;
 /// Cap applied *before* a tool result enters the session history.
 pub const MAX_TOOL_RESULT_CHARS: usize = 8 * 1024;
 /// Characters of a tool result shown on screen.
-/// Characters of a tool result shown on the completion line.
 const TOOL_RESULT_DISPLAY_CHARS: usize = 200;
+
+// Old tool-result compression is implemented in `session.rs` as
+// `Session::messages_compressed` (and the free function
+// `compress_old_tool_results`); the agent loop calls that helper
+// before `window_with` to keep the prompt lean.
 
 /// How confirmation-gated tools are handled during a turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +139,18 @@ pub async fn run_turn(
     app.session.push_user(input);
     app.last_turn_had_failure = false;
 
+    // Per-turn router: 3 strikes on the active model promote to the
+    // next non-quarantined entry. State is local to the turn — the
+    // pre-flight probe is the cross-turn check.
+    let mut router = crate::router::Router::for_active(
+        app.config.provider.key().as_ref(),
+        &app.config.model,
+    );
+    if !app.router_failover {
+        router.set_failover(false);
+    }
+    let mut failover_attempts: u8 = 0;
+
     // Context-aware windowing: files the prompt mentions ride along even if
     // they only appeared in old messages; the first becomes the breadcrumb.
     {
@@ -175,9 +191,11 @@ pub async fn run_turn(
             return Ok(TurnResult::RoundLimit);
         }
 
-        let history = app
-            .session
-            .window_with(app.config.context_tokens, injection.as_deref());
+        let history = {
+            let compressed = app.session.messages_compressed();
+            app.session
+                .window_with_messages(&compressed, app.config.context_tokens, injection.as_deref())
+        };
         let auth = app.config.provider.auth();
         let opts = ChatOptions {
             max_response_bytes: app.max_response_bytes,
@@ -233,10 +251,65 @@ pub async fn run_turn(
                 finish_answer(app, ui, out);
                 ui.timeline(app.config.model.as_str(), started.elapsed());
                 app.record_turn(started.elapsed());
+                router.record_success(&app.config.model, started.elapsed().as_millis() as u32);
+                crate::router_health::append(&crate::router_health::HealthEntry {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    model: app.config.model.clone(),
+                    latency_ms: started.elapsed().as_millis() as u32,
+                    success: true,
+                    error: None,
+                });
+                match crate::auto_compact::check_and_run(
+                    app,
+                    &mut router,
+                    crate::auto_compact::SOFT_COMPACT_PCT,
+                    crate::auto_compact::HARD_COMPACT_PCT,
+                )
+                .await
+                {
+                    crate::auto_compact::Outcome::Noop => {}
+                    crate::auto_compact::Outcome::SoftCompacted => {
+                        ui.notice("auto-compact: history summarized (>= 90% fill)");
+                    }
+                    crate::auto_compact::Outcome::HardReset => {
+                        ui.notice("auto-compact: hard reset (>= 98% fill)");
+                    }
+                }
                 return Ok(TurnResult::Answered);
             }
             Err(e) => {
                 app.record_error();
+                // Record the failure against the active model and
+                // try the next non-quarantined entry once before
+                // giving up.
+                let active = app.config.model.clone();
+                router.record_failure(
+                    &active,
+                    crate::router::FailureKind::Server,
+                    &format!("{e:#}"),
+                );
+                crate::router_health::append(&crate::router_health::HealthEntry {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    model: active.clone(),
+                    latency_ms: started.elapsed().as_millis() as u32,
+                    success: false,
+                    error: Some(format!("{e:#}")),
+                });
+                if failover_attempts < 1 {
+                    if let Some(next) = router.promote() {
+                        failover_attempts += 1;
+                        app.config.model = next.model.clone();
+                        ui.notice(&format!(
+                            "router: failover to {} after strike on {}",
+                            next.model, active
+                        ));
+                        // Roll back the partial assistant turn so the
+                        // next request starts cleanly.
+                        app.session
+                            .truncate_messages(resume_len.min(app.session.messages().len()));
+                        continue;
+                    }
+                }
                 let fail_fast = ui.fail_fast();
                 handle_round_error(app, ui, out, resume_len, e);
                 if fail_fast {
