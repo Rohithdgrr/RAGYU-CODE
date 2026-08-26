@@ -82,7 +82,7 @@ pub(super) fn apply(app: &mut App) -> bool {
         err("some writes failed — inspect your files before retrying.");
         return false;
     }
-    if let Ok(mut q) = app.pending_edits.lock() {
+    if let Some(mut q) = app.pending_edits.try_lock() {
         q.clear();
     }
     ok(format!(
@@ -97,8 +97,8 @@ pub(super) fn apply(app: &mut App) -> bool {
 #[allow(dead_code)]
 pub(super) fn reject(app: &mut App) {
     let n = snapshot(app).len();
-    match app.pending_edits.lock() {
-        Ok(mut q) => {
+    match app.pending_edits.try_lock() {
+        Some(mut q) => {
             q.clear();
             if n == 0 {
                 dim("nothing staged to reject.");
@@ -108,7 +108,7 @@ pub(super) fn reject(app: &mut App) {
                 ));
             }
         }
-        Err(_) => err("staged-edit queue poisoned."),
+        None => err("staged-edit queue is busy; try again."),
     }
 }
 
@@ -162,10 +162,7 @@ pub(super) fn review(app: &App) {
 
 #[allow(dead_code)]
 fn snapshot(app: &App) -> Vec<EditOp> {
-    app.pending_edits
-        .lock()
-        .map(|q: std::sync::MutexGuard<'_, PendingEdits>| q.ops().to_vec())
-        .unwrap_or_default()
+    app.pending_edits.lock().ops().to_vec()
 }
 
 #[allow(dead_code)]
@@ -181,6 +178,7 @@ fn transform_file(cwd: &std::path::Path, path: &str, group: &[&EditOp]) -> anyho
 mod tests {
     use super::*;
     use crate::tools::PendingEdits;
+    use parking_lot::Mutex as PlMutex;
 
     fn smoke_app() -> App {
         super::super::tests::smoke_app()
@@ -192,7 +190,7 @@ mod tests {
         std::fs::write(ws.0.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         std::fs::write(ws.0.join("b.txt"), "x\n").unwrap();
         let mut app = smoke_app();
-        app.pending_edits = std::sync::Arc::new(std::sync::Mutex::new({
+        app.pending_edits = std::sync::Arc::new(PlMutex::new({
             let mut q = PendingEdits::default();
             q.push(EditOp::Replace {
                 path: "a.txt".into(),
@@ -221,7 +219,7 @@ mod tests {
         std::env::set_current_dir(&ws.0).unwrap();
         std::fs::write(ws.0.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         let mut app = smoke_app();
-        app.pending_edits = std::sync::Arc::new(std::sync::Mutex::new({
+        app.pending_edits = std::sync::Arc::new(PlMutex::new({
             let mut q = PendingEdits::default();
             q.push(EditOp::Replace {
                 path: "a.txt".into(),
@@ -245,7 +243,7 @@ mod tests {
         std::env::set_current_dir(&ws.0).unwrap();
         std::fs::write(ws.0.join("a.txt"), "content\n").unwrap();
         let mut app = smoke_app();
-        app.pending_edits = std::sync::Arc::new(std::sync::Mutex::new({
+        app.pending_edits = std::sync::Arc::new(PlMutex::new({
             let mut q = PendingEdits::default();
             q.push(EditOp::Replace {
                 path: "a.txt".into(),

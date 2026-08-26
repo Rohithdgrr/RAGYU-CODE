@@ -20,7 +20,11 @@ use generation::{compact, models, retry, set_model};
 use output::{CommandOutput, Effect};
 use persistence::{load_session, save_session};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+// `parking_lot::Mutex` for the user-facing `pending_edits` queue: never
+// poisons, so a panic in one task never surfaces to the user as a tool
+// failure on the next attempt.
+use parking_lot::Mutex as PlMutex;
 use std::time::{Duration, Instant};
 use todo::Todo;
 
@@ -99,7 +103,7 @@ pub struct App {
     /// Staged (not yet applied) edits from the surgical editing tools,
     /// shared with the executor; committed via `/apply`, dropped by
     /// `/reject`.
-    pub pending_edits: Arc<Mutex<PendingEdits>>,
+    pub pending_edits: Arc<PlMutex<PendingEdits>>,
     /// Current "focus" file shown in the prompt breadcrumb: the last
     /// workspace file the user mentioned or the agent edited.
     pub focus_file: Option<String>,
@@ -250,7 +254,7 @@ pub fn persist_todos(app: &mut App) {
 pub fn apply_pending_edits(app: &mut App) -> bool {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let pending = app.pending_edits.clone();
-    let mut guard = pending.lock().unwrap();
+    let mut guard = pending.lock();
     let ops = guard.ops().to_vec();
     if ops.is_empty() {
         return false;
@@ -1044,7 +1048,7 @@ pub fn capabilities_summary() -> anyhow::Result<String> {
 /// slash command and the `apply_edits` tool.
 pub fn apply_pending(base: &std::path::Path, app: &App) -> anyhow::Result<String> {
     let pending = app.pending_edits.clone();
-    let mut guard = pending.lock().unwrap();
+    let mut guard = pending.lock();
     let ops = guard.ops().to_vec();
     if ops.is_empty() {
         return Ok("nothing to apply".to_owned());

@@ -20,6 +20,10 @@ use crate::commands::App;
 use crate::provider;
 use crate::router::Router;
 
+/// Directory for persisted CLI metadata (compaction log, checkpoints, todos, etc.).
+/// Changed from `.govinda` to `.govinda-cli` to avoid conflicts with user files.
+pub const GOVINDA_DIR: &str = ".govinda-cli";
+
 pub const SOFT_COMPACT_PCT: u8 = 90;
 pub const HARD_COMPACT_PCT: u8 = 98;
 /// Number of recent turns the hard reset keeps.
@@ -38,7 +42,7 @@ struct State {
     last_soft_pct: u8,
 }
 
-static STATE: std::sync::Mutex<State> = std::sync::Mutex::new(State {
+static STATE: tokio::sync::Mutex<State> = tokio::sync::Mutex::const_new(State {
     soft_streak: 0,
     last_soft_pct: 0,
 });
@@ -77,7 +81,7 @@ pub async fn check_and_run(
 ) -> Outcome {
     let pct = fill_pct(app);
     if pct < soft_pct {
-        reset_streak();
+        reset_streak().await;
         return Outcome::Noop;
     }
     if !app.auto_compact_enabled {
@@ -85,21 +89,23 @@ pub async fn check_and_run(
     }
     if pct >= hard_pct {
         hard_reset(app);
-        reset_streak();
+        reset_streak().await;
         return Outcome::HardReset;
     }
     // Soft path. The streak counter forces a hard reset when two
     // soft compactions in a row did not move the needle.
-    let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
-    let drifted = state.soft_streak >= 1
-        && pct.abs_diff(state.last_soft_pct) < 5
-        && pct >= soft_pct;
-    state.last_soft_pct = pct;
-    state.soft_streak = state.soft_streak.saturating_add(1);
-    drop(state);
+    let drifted = {
+        let mut state = STATE.lock().await;
+        let drifted = state.soft_streak >= 1
+            && pct.abs_diff(state.last_soft_pct) < 5
+            && pct >= soft_pct;
+        state.last_soft_pct = pct;
+        state.soft_streak = state.soft_streak.saturating_add(1);
+        drifted
+    };
     if drifted {
         hard_reset(app);
-        reset_streak();
+        reset_streak().await;
         return Outcome::HardReset;
     }
     if soft_compact(app, router).await {
@@ -109,8 +115,8 @@ pub async fn check_and_run(
     }
 }
 
-fn reset_streak() {
-    let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
+async fn reset_streak() {
+    let mut state = STATE.lock().await;
     state.soft_streak = 0;
     state.last_soft_pct = 0;
 }
@@ -136,7 +142,7 @@ async fn soft_compact(app: &mut App, router: &Router) -> bool {
 
 /// Keeps the system prompt + the last `HARD_KEEP_TURNS` turns and
 /// drops everything else. Persists a one-line marker to
-/// `.govinda/compaction.log` for observability.
+/// `GOVINDA_DIR` for observability.
 fn hard_reset(app: &mut App) {
     use crate::api::Message;
     let keep = HARD_KEEP_TURNS;
@@ -155,11 +161,13 @@ fn hard_reset(app: &mut App) {
     new_msgs.push(Message::system(note));
     new_msgs.append(&mut tail);
     app.session.replace_messages(new_msgs);
-    let _ = std::fs::create_dir_all(".govinda");
+    let govinda_dir = GOVINDA_DIR;
+    let _ = std::fs::create_dir_all(govinda_dir);
+    let _ = std::fs::create_dir_all(govinda_dir);
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(".govinda/compaction.log")
+        .open(format!("{govinda_dir}/compaction.log"))
         .and_then(|mut f| {
             use std::io::Write;
             writeln!(f, "hard_reset ts={} dropped={drop_count}", chrono::Utc::now().to_rfc3339())

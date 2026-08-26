@@ -811,6 +811,7 @@ dependencies = [
  "crossterm",
  "dotenvy",
  "futures-util",
+ "parking_lot",
  "ratatui",
  "reedline",
  "regex",

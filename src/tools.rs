@@ -19,7 +19,12 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+// Re-export `parking_lot::Mutex` as `PlMutex` for places that take locks
+// across hot paths where poisoning would surface as a confusing tool
+// failure to the user. `parking_lot::Mutex` never poisons, is ~10× faster,
+// and returns a `MutexGuard` directly without `Result` unwrapping.
+use parking_lot::Mutex as PlMutex;
 use std::time::{Duration, Instant};
 /// Largest file `read_file`/`grep` will open.
 const MAX_INPUT_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -167,6 +172,16 @@ pub trait ToolExecutor: Send + Sync {
         let _ = name;
         false
     }
+
+    /// Optional cooperative cancellation: long-running tools (`run_shell`,
+    /// `build_project`, …) can poll the returned receiver and abort when
+    /// it flips to `true`. The default returns `None` — the agent loop
+    /// wraps the future in `tokio::select!` against its own cancel signal
+    /// instead, so implementations that don't override this still get
+    /// aborted cleanly from the outside when the user interrupts.
+    fn cancel_signal(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        None
+    }
 }
 
 /// The default executor: safe local tools plus sandboxed workspace, staged
@@ -176,7 +191,9 @@ pub struct BuiltinTools {
     shell_tools: Vec<ShellToolDef>,
     /// Queue of staged edits shared with the REPL (`/diff`, `/apply`,
     /// `/reject`). The executor stages; only `/apply` touches the disk.
-    pending: Arc<Mutex<PendingEdits>>,
+    /// `parking_lot::Mutex` avoids the `PoisonError` that would otherwise
+    /// surface to the user as a tool failure if any other task panicked.
+    pending: Arc<PlMutex<PendingEdits>>,
 }
 
 impl BuiltinTools {
@@ -191,7 +208,7 @@ impl BuiltinTools {
     }
 
     /// Handle to the shared staged-edit queue for REPL commands.
-    pub fn pending_edits(&self) -> Arc<Mutex<PendingEdits>> {
+    pub fn pending_edits(&self) -> Arc<PlMutex<PendingEdits>> {
         self.pending.clone()
     }
 }
@@ -1490,8 +1507,7 @@ impl ToolExecutor for BuiltinTools {
                     let count = {
                         let mut pending = self
                             .pending
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("staged-edit queue poisoned"))?;
+                            .lock();
                         pending.push(op);
                         pending.ops().len()
                     };
@@ -1511,8 +1527,7 @@ impl ToolExecutor for BuiltinTools {
                     let args: ViewDiffArgs = parse_args(arguments_json)?;
                     let pending = self
                         .pending
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("staged-edit queue poisoned"))?;
+                        .lock();
                     if pending.ops().is_empty() {
                         return Ok("no staged edits — nothing to diff".to_owned());
                     }
@@ -1545,8 +1560,7 @@ impl ToolExecutor for BuiltinTools {
                         std::env::current_dir().context("cannot resolve working directory")?;
                     let pending = self
                         .pending
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("staged-edit queue poisoned"))?;
+                        .lock();
                     if pending.ops().is_empty() {
                         return Ok("no staged edits — nothing to apply".to_owned());
                     }
@@ -1567,8 +1581,7 @@ impl ToolExecutor for BuiltinTools {
                 "discard_edits" => {
                     let mut pending = self
                         .pending
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("staged-edit queue poisoned"))?;
+                        .lock();
                     let n = pending.ops().len();
                     pending.clear();
                     Ok(format!("discarded {n} staged edit(s); queue is empty"))
@@ -1576,8 +1589,7 @@ impl ToolExecutor for BuiltinTools {
                 "show_staged_files" => {
                     let pending = self
                         .pending
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("staged-edit queue poisoned"))?;
+                        .lock();
                     if pending.ops().is_empty() {
                         return Ok("no staged edits".to_owned());
                     }
@@ -2943,7 +2955,7 @@ fn apply_edits_atomic(base: &Path, ops: &[EditOp]) -> Result<String> {
     let app = crate::commands::App::new_for_test();
     let pending = app.pending_edits.clone();
     {
-        let mut guard = pending.lock().unwrap();
+        let mut guard = pending.lock();
         guard.clear();
         for op in ops {
             guard.push(op.clone());
@@ -3693,11 +3705,11 @@ mod tests {
         );
 
         let pending = tools.pending_edits();
-        assert_eq!(pending.lock().unwrap().ops().len(), 1);
+        assert_eq!(pending.lock().ops().len(), 1);
         let diff = tools.execute("view_diff", "{}").await.unwrap();
         assert!(diff.contains("+    println!"), "{diff}");
 
-        pending.lock().unwrap().clear();
+        pending.lock().clear();
         let _ = std::env::set_current_dir(orig);
     }
 

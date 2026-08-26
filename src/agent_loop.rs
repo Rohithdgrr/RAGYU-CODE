@@ -232,9 +232,19 @@ pub async fn run_turn(
                 .window_with_messages(&compressed, app.config.context_tokens, injection.as_deref())
         };
         let auth = app.config.provider.auth();
+        // Cap the model's per-answer output at 25% of its true context
+        // window (clamped to [1k, 32k]). Without this, free-tier providers
+        // use their default (often 4k-8k) and the model gets cut off
+        // mid-answer with `finish_reason: "length"`.
+        let max_output = {
+            let window = crate::auto_compact::context_window_for(app);
+            let cap = (window / 4).clamp(1024, 32_768);
+            Some(cap)
+        };
         let opts = ChatOptions {
             max_response_bytes: app.max_response_bytes,
             read_timeout: app.read_timeout,
+            max_tokens: max_output,
             tools: if app.tools_enabled {
                 app.tool_specs
                     .iter()
@@ -467,7 +477,11 @@ async fn run_tool_round(
         allowed.push(approved);
     }
 
-    // Concurrent execution pass; results print as they settle.
+    // Concurrent execution pass; results print as they settle. Cancellation
+    // is observed at the result-gathering loop: when the user interrupts
+    // we stop awaiting new results and mark the still-running calls as
+    // interrupted. The tool futures themselves (which may not see the
+    // signal) are dropped as soon as we exit the loop.
     let mut futures: futures_util::stream::FuturesUnordered<_> = calls
         .iter()
         .enumerate()
@@ -489,7 +503,34 @@ async fn run_tool_round(
 
     let mut outcomes: Vec<Option<anyhow::Result<String>>> = (0..calls.len()).map(|_| None).collect();
     let mut had_failure = false;
-    while let Some((i, outcome)) = futures.next().await {
+    let mut cancelled = false;
+    loop {
+        // Poll the cancel future fresh each iteration: it returns a new
+        // `Pin<Box<Future>>` per call (default impl is `Box::pin(pending())`)
+        // and we can only `.await` it once.
+        let cancel = ui.cancel_wait();
+        let next = tokio::select! {
+            res = futures.next() => res,
+            _ = cancel => {
+                cancelled = true;
+                None
+            }
+        };
+        let Some((i, outcome)) = next else {
+            if cancelled {
+                // Drop any still-pending futures (this aborts them when
+                // their task is on a Tokio runtime) and mark them as
+                // interrupted.
+                for slot in outcomes.iter_mut() {
+                    if slot.is_none() {
+                        *slot = Some(Err(anyhow::anyhow!("interrupted by user")));
+                        had_failure = true;
+                    }
+                }
+                futures.clear();
+            }
+            break;
+        };
         let ok = outcome.is_ok();
         let snippet = match &outcome {
             Ok(value) => truncate_chars(first_line(value), TOOL_RESULT_DISPLAY_CHARS),
@@ -501,6 +542,9 @@ async fn run_tool_round(
             had_failure = true;
         }
         outcomes[i] = Some(outcome);
+    }
+    if cancelled {
+        ui.notice("tool execution cancelled by user");
     }
 
     // Session commit stays in call order regardless of completion order; the

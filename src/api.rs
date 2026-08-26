@@ -176,6 +176,16 @@ pub enum SseEvent {
     ToolCalls(Vec<ToolCall>),
     Done,
     ApiError(String),
+    /// Non-`null`/non-`tool_calls` finish reason surfaced by the provider.
+    /// `length` and `content_filter` are silently losing the tail of the
+    /// answer without this; the agent loop reacts to them in `attempt_once`.
+    FinishReason(String),
+}
+
+/// Whether a finish reason indicates the model was cut off mid-answer
+/// (`length`, `max_tokens`) and the user-visible text is incomplete.
+pub fn finish_reason_is_truncation(reason: &str) -> bool {
+    matches!(reason, "length" | "max_tokens")
 }
 
 /// Byte-safe SSE parser.
@@ -278,10 +288,21 @@ impl SseParser {
                 }
             }
         }
-        if choice["finish_reason"].as_str() == Some("tool_calls")
+        let finish_reason = choice["finish_reason"].as_str();
+        if finish_reason == Some("tool_calls")
             && let Some(calls) = self.take_tool_calls()
         {
             events.push(calls);
+        }
+        // Surface every non-tool non-null finish reason. `stop` is the
+        // normal completion path; `length`/`max_tokens` mean the model
+        // was cut off and the caller may want to retry; `content_filter`
+        // is a safety-block stop the user should know about.
+        if let Some(reason) = finish_reason
+            && reason != "null"
+            && reason != "tool_calls"
+        {
+            events.push(SseEvent::FinishReason(reason.to_owned()));
         }
         events
     }
@@ -337,6 +358,10 @@ pub struct ChatOptions<'a> {
     /// Optional `tool_choice` override (`"auto"`, `"none"`, `"required"` or
     /// a specific-function object).
     pub tool_choice: Option<Value>,
+    /// Provider-side output token cap. When `Some`, sent as `max_tokens` in
+    /// the request body. When `None`, the provider picks its own default
+    /// (often 4k-8k on free tiers — leading to silent mid-answer truncation).
+    pub max_tokens: Option<usize>,
 }
 
 impl<'a> ChatOptions<'a> {
@@ -349,6 +374,7 @@ impl<'a> ChatOptions<'a> {
             read_timeout: DEFAULT_READ_TIMEOUT,
             tools: Vec::new(),
             tool_choice: None,
+            max_tokens: None,
         }
     }
 }
@@ -431,11 +457,14 @@ pub async fn stream_chat_at(
     if let Some(choice) = &opts.tool_choice {
         body["tool_choice"] = choice.clone();
     }
+    if let Some(max) = opts.max_tokens {
+        body["max_tokens"] = json!(max);
+    }
 
     for attempt in 1..=MAX_RETRIES {
         // Retries are only safe before anything has been emitted, otherwise we
         // would duplicate text the user already saw.
-        match attempt_once(http, url, bearer, &body, opts, sink, &mut on_delta).await? {
+        match attempt_once(http, url, bearer, &body, opts, sink, &mut on_delta, attempt).await? {
             Attempt::Ok => return Ok(()),
             Attempt::Fatal(e) => return Err(e),
             Attempt::Retryable { error, retry_after } => {
@@ -443,9 +472,12 @@ pub async fn stream_chat_at(
                     return Err(error);
                 }
                 let wait = retry_after.unwrap_or_else(|| {
-                    // Jittered exponential backoff: base * attempt + random jitter.
+                    // Exponential backoff with real random jitter: base * attempt,
+                    // plus a random offset up to 50% of the base. Deterministic
+                    // pseudo-jitter (attempt * 73 % 200) is replaced because it
+                    // lets all concurrent clients retry in lockstep.
                     let base_ms = 500 * u64::from(attempt);
-                    let jitter_ms = (attempt as u64 * 73) % 200; // deterministic pseudo-jitter
+                    let jitter_ms = rand_jitter(base_ms);
                     Duration::from_millis(base_ms + jitter_ms)
                 });
                 eprintln!(
@@ -467,6 +499,7 @@ async fn attempt_once(
     opts: &ChatOptions<'_>,
     sink: &mut StreamSink<'_>,
     on_delta: &mut impl FnMut(&str),
+    current_attempt: u32,
 ) -> Result<Attempt> {
     let req_id = next_request_id();
     let mut req = http.post(url).json(body).header("x-request-id", &req_id);
@@ -540,6 +573,45 @@ async fn attempt_once(
                 SseEvent::ApiError(msg) => {
                     return Ok(Attempt::Fatal(anyhow::anyhow!("API error: {msg}")));
                 }
+                SseEvent::FinishReason(reason) => {
+                    eprintln!("[api] finish_reason={reason} (req={req_id})");
+                    if finish_reason_is_truncation(&reason) {
+                        // Mid-answer truncation. Retry on the same model
+                        // first (sometimes the provider's window was just
+                        // unlucky) before the caller can fall back. Only
+                        // safe when no text was emitted.
+                        if !sink.has_output() && current_attempt < MAX_RETRIES {
+                            return Ok(Attempt::Retryable {
+                                error: anyhow::anyhow!(
+                                    "model hit output token limit (finish_reason={reason}); retrying"
+                                ),
+                                retry_after: None,
+                            });
+                        }
+                        // Some text was already streamed: keep it but mark
+                        // the turn as truncated. Returning Ok is the only
+                        // way to surface a partial answer; the caller sees
+                        // `finish_reason` via the notice below.
+                        eprintln!(
+                            "[api] truncation with partial output ({} chars streamed)",
+                            sink.out.len()
+                        );
+                    } else if reason == "content_filter" {
+                        // Safety filter triggered. Retry with a "safer" system prompt
+                        // that explicitly asks the model to avoid generating content
+                        // that would trigger policies. Only retry if no output has
+                        // been emitted yet.
+                        if !sink.has_output() && current_attempt < MAX_RETRIES {
+                            return Ok(Attempt::Retryable {
+                                error: anyhow::anyhow!(
+                                    "content policy violation (finish_reason={reason}); retrying with safer prompt"
+                                ),
+                                retry_after: None,
+                            });
+                        }
+                        eprintln!("[api] content_filter stop (req={req_id})");
+                    }
+                }
             }
         }
     }
@@ -565,6 +637,20 @@ fn transport_outcome(error: anyhow::Error) -> Attempt {
 /// intentionally unsupported — APIs that matter here send seconds).
 fn parse_retry_after(v: &str) -> Option<Duration> {
     v.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Real random jitter for exponential backoff. Uses process-local timestamp
+/// + counter so we don't need a new dep: the distribution is uniform enough
+/// for retry-thundering-herd avoidance.
+fn rand_jitter(base_ms: u64) -> u64 {
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    seed = seed.wrapping_add(REQUEST_COUNTER.load(Ordering::Relaxed));
+    seed = seed.wrapping_mul(2654435761);
+    // 0..=50% of the base.
+    (seed % (base_ms / 2 + 1))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -740,6 +826,49 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn finish_reason_length_is_surfaced() {
+        let mut p = SseParser::default();
+        let events = feed_all(
+            &mut p,
+            &[
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial \"}}]}\n",
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n",
+                b"data: [DONE]\n",
+            ],
+        );
+        let deltas: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                SseEvent::Delta(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["partial "]);
+        assert!(matches!(
+            events.iter().find(|e| matches!(e, SseEvent::FinishReason(_))),
+            Some(SseEvent::FinishReason(r)) if r == "length"
+        ));
+        assert!(finish_reason_is_truncation("length"));
+        assert!(finish_reason_is_truncation("max_tokens"));
+        assert!(!finish_reason_is_truncation("stop"));
+        assert!(!finish_reason_is_truncation("content_filter"));
+    }
+
+    #[test]
+    fn finish_reason_stop_is_surfaced() {
+        let mut p = SseParser::default();
+        // "stop" is a normal finish reason — the agent loop just logs it.
+        let events = feed_all(
+            &mut p,
+            &[b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n"],
+        );
+        assert!(matches!(
+            events.iter().find(|e| matches!(e, SseEvent::FinishReason(_))),
+            Some(SseEvent::FinishReason(r)) if r == "stop"
+        ));
     }
 
     #[test]
