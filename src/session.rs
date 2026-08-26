@@ -254,7 +254,13 @@ impl Session {
             messages: self.messages.clone(),
         };
         let json = serde_json::to_string_pretty(&file).context("failed to serialize session")?;
-        std::fs::write(path, json).with_context(|| format!("cannot write {}", path.display()))
+        // Atomic write: write to a temp file first, then rename to avoid
+        // corruption if the process is interrupted mid-write.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("cannot rename {} to {}", tmp.display(), path.display()))
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {

@@ -30,6 +30,7 @@ use super::widgets::file_tree::FileTree;
 use super::{draw, icons, theme};
 use crate::api;
 use crate::commands::{self, App};
+use crate::provider;
 
 /// Slash commands that never take an argument — Enter on the palette runs
 /// them directly instead of opening the args dialog.
@@ -164,9 +165,60 @@ pub struct Tui {
     pub at_picker_selected: usize,
     /// Usage/cost dashboard modal state
     pub show_cost_dashboard: bool,
+    /// Settings modal (theme / provider)
+    pub show_settings: bool,
+    /// Shortcuts modal (single entry for all hints)
+    pub show_shortcuts: bool,
     /// `/raw` — render assistant output as plain text instead of markdown
     /// (mirrors `app.renderer.markdown_enabled()`, synced after commands).
     pub raw_mode: bool,
+    /// Last known mouse X position (for focused-pane beam effect).
+    pub mouse_x: u16,
+    /// Current provider name — drives accent color remapping.
+    pub provider_name: String,
+    /// Multi-step provider setup workflow state.
+    pub provider_workflow: Option<ProviderWorkflow>,
+    /// Signals event loop to fetch models for (provider, api_key) and open SelectModel step.
+    pub pending_setup_models: Option<(String, String)>,
+    /// Signals event loop to run connection test for the current workflow.
+    pub pending_setup_test: bool,
+}
+
+/// Multi-step guided provider setup: select provider → API key → model → test.
+#[derive(Debug, Clone)]
+pub enum ProviderWorkflow {
+    /// Step 1: user is selecting a provider from the list.
+    SelectProvider {
+        providers: Vec<String>,
+        selected: usize,
+    },
+    /// Step 2: user is entering an API key for the chosen provider.
+    EnterApiKey {
+        provider: String,
+        key_input: String,
+        cursor: usize,
+    },
+    /// Step 3: user is selecting a model from the provider.
+    SelectModel {
+        provider: String,
+        api_key: String,
+        models: Vec<String>,
+        selected: usize,
+    },
+    /// Step 4: testing the connection with the chosen model.
+    Testing {
+        provider: String,
+        api_key: String,
+        model: String,
+    },
+    /// Step 5: showing the result.
+    Result {
+        provider: String,
+        api_key: String,
+        model: String,
+        ok: bool,
+        message: String,
+    },
 }
 
 impl Default for Tui {
@@ -217,7 +269,14 @@ impl Tui {
             at_picker_files: Vec::new(),
             at_picker_selected: 0,
             show_cost_dashboard: false,
+            show_settings: false,
+            show_shortcuts: false,
             raw_mode: false,
+            mouse_x: 0,
+            provider_name: String::new(),
+            provider_workflow: None,
+            pending_setup_models: None,
+            pending_setup_test: false,
         };
         // Eagerly open explorer so "No files yet" never shows on startup when
         // the right pane is visible by default (width≥100). Fail silently in tests.
@@ -315,9 +374,13 @@ impl Tui {
         self.input.clear();
         self.input_cursor = 0;
         self.slash_selected = 0;
-        // For `/model`, populate the dialog with available models from cache.
+        // Populate dialog lists: /model uses cached models, /provider uses static presets, /theme uses theme names.
         let models = if cmd == "/model" && !self.models_cache.is_empty() {
             self.models_cache.clone()
+        } else if cmd == "/provider" {
+            crate::provider::preset_names().map(|s| s.to_owned()).collect()
+        } else if cmd == "/theme" {
+            crate::tui::theme::NAMED_THEMES.iter().map(|t| t.name.to_owned()).collect()
         } else {
             Vec::new()
         };
@@ -339,14 +402,18 @@ impl Tui {
     fn confirm_slash_dialog(&mut self) {
         if let Some(d) = self.slash_dialog.take() {
             let full = if d.arg_input.trim().is_empty() {
-                // For `/model`, use the highlighted model from the list.
-                if d.command == "/model" && !d.models.is_empty() {
+                // For list-backed commands, use the highlighted entry.
+                if (d.command == "/model" || d.command == "/provider" || d.command == "/theme") && !d.models.is_empty() {
                     let name = d
                         .models
                         .get(d.models_selected)
                         .cloned()
                         .unwrap_or_default();
-                    format!("{} {}", d.command, name)
+                    if name.is_empty() {
+                        d.command.clone()
+                    } else {
+                        format!("{} {}", d.command, name)
+                    }
                 } else {
                     d.command.clone()
                 }
@@ -471,6 +538,130 @@ impl Tui {
         true
     }
 
+    /// Starts the multi-step provider setup workflow.
+    pub fn start_provider_workflow(&mut self) {
+        let providers: Vec<String> = crate::provider::preset_names().map(|s| s.to_owned()).collect();
+        self.provider_workflow = Some(ProviderWorkflow::SelectProvider {
+            providers,
+            selected: 0,
+        });
+    }
+
+    /// Handles key events during the multi-step provider setup workflow.
+    fn handle_workflow_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.provider_workflow = None;
+                self.notice("setup cancelled.");
+            }
+            _ => {
+                if let Some(ref mut wf) = self.provider_workflow {
+                    match wf {
+                        ProviderWorkflow::SelectProvider { providers, selected } => {
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    if *selected + 1 < providers.len() {
+                                        *selected += 1;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let chosen = providers[*selected].clone();
+                                    // Skip API key step for local providers.
+                                    if chosen == "ollama" {
+                                        let wf = std::mem::replace(wf, ProviderWorkflow::SelectProvider { providers: vec![], selected: 0 });
+                                        if let ProviderWorkflow::SelectProvider { providers: _, selected: _ } = wf {
+                                            // Fetch models for ollama and go to model selection.
+                                            self.pending_setup_models = Some((chosen, String::new()));
+                                        }
+                                    } else {
+                                        *wf = ProviderWorkflow::EnterApiKey {
+                                            provider: chosen,
+                                            key_input: String::new(),
+                                            cursor: 0,
+                                        };
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        ProviderWorkflow::EnterApiKey { provider, key_input, cursor } => {
+                            match key.code {
+                                KeyCode::Char(c) => {
+                                    let byte = key_input.char_indices().nth(*cursor).map_or(key_input.len(), |(i, _)| i);
+                                    key_input.insert(byte, c);
+                                    *cursor += 1;
+                                }
+                                KeyCode::Backspace if *cursor > 0 => {
+                                    let byte = key_input.char_indices().nth(*cursor).map_or(key_input.len(), |(i, _)| i);
+                                    let prev = key_input[..byte].char_indices().next_back().map_or(0, |(i, _)| i);
+                                    key_input.replace_range(prev..byte, "");
+                                    *cursor -= 1;
+                                }
+                                KeyCode::Left if *cursor > 0 => *cursor -= 1,
+                                KeyCode::Right if *cursor < key_input.chars().count() => *cursor += 1,
+                                KeyCode::Home => *cursor = 0,
+                                KeyCode::End => *cursor = key_input.chars().count(),
+                                KeyCode::Enter => {
+                                    let key_val = key_input.clone();
+                                    let prov = provider.clone();
+                                    // Move to model selection.
+                                    let wf = std::mem::replace(wf, ProviderWorkflow::SelectProvider { providers: vec![], selected: 0 });
+                                    if let ProviderWorkflow::EnterApiKey { .. } = wf {
+                                        self.pending_setup_models = Some((prov, key_val));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        ProviderWorkflow::SelectModel { provider, api_key, models, selected } => {
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    if *selected + 1 < models.len() {
+                                        *selected += 1;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let model = models[*selected].clone();
+                                    let prov = provider.clone();
+                                    let key = api_key.clone();
+                                    // Move to testing step.
+                                    *wf = ProviderWorkflow::Testing {
+                                        provider: prov,
+                                        api_key: key,
+                                        model,
+                                    };
+                                    // Signal event loop to run the test.
+                                    self.pending_setup_test = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        ProviderWorkflow::Testing { .. } => {
+                            // Wait for async test to complete.
+                        }
+                        ProviderWorkflow::Result { .. } => {
+                            // Any key closes the result.
+                            let result = self.provider_workflow.take();
+                            if let Some(ProviderWorkflow::Result { provider, api_key: _, model, ok, message }) = result {
+                                if ok {
+                                    self.notice(format!("setup complete: {provider} / {model}"));
+                                } else {
+                                    self.notice(format!("setup failed: {message}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn local_command(&mut self, line: &str) -> bool {
         let (cmd, _rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         let cmd_lc = cmd.to_ascii_lowercase();
@@ -487,9 +678,9 @@ impl Tui {
                 self.notice(
                     "keys: Tab focus · ↑/↓ palette/history · Space expand dir · Enter \
                      open/pin file · F5 refresh · Esc clear/cancel · Ctrl+C cancel stream \
-                     · Ctrl+L clear · Ctrl+T left tree · Ctrl+P explorer · Ctrl+Q quit\n\
-                     cmds: /help /clear /theme /tokens /agent <on|off> /plan <task> /model /temp /system /history /undo /retry /variants /pick /compact /search /save /load /sessions /fork /export /stats /raw /config /timeout /limit /tools /todo /diff /apply /reject /review /scan /project\n\
-                      Tip: type \"/\" to see the palette — Enter/↑↓/click open the args dialog, Tab completes.",
+                     · Ctrl+L clear · Ctrl+T left tree · Ctrl+P explorer · Ctrl+O open folder · Ctrl+Q quit\n\
+                     cmds: /help /clear /theme /tokens /agent <on|off> /plan <task> /model /temp /system /history /undo /retry /variants /pick /compact /search /save /load /sessions /fork /export /stats /raw /config /timeout /limit /tools /todo /diff /apply /reject /review /scan /project /cd /open\n\
+                      Tip: type \"/\" to see the palette — Enter/↑↓/click open the args dialog, Tab completes. Ctrl+O to change folder.",
                 );
                 return true;
             }
@@ -498,6 +689,10 @@ impl Tui {
                 // the unified command dispatcher (commands::dispatch) so the
                 // TUI and REPL always agree.
                 return false;
+            }
+            "/setup" => {
+                self.start_provider_workflow();
+                return true;
             }
             "/pin" => {
                 if let Some(tree) = &self.tree {
@@ -530,14 +725,14 @@ impl Tui {
 
         // Unknown command — queue for handle_tui_slash which checks skills
         false
-    }
-
-    pub     fn handle_event(&mut self, ev: Event) {
+    }    pub fn handle_event(&mut self, ev: Event) {
         match ev {
             Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
                 self.handle_key(key);
             }
             Event::Mouse(me) => {
+                // Track mouse X for the focused-pane beam effect.
+                self.mouse_x = me.column;
                 // Mouse is handled in event_loop with layout context; fallback scroll-only here
                 self.handle_mouse_fallback(me);
             }
@@ -571,6 +766,7 @@ impl Tui {
 
     /// Mouse with layout — called from event_loop where pane rects are known.
     pub fn handle_mouse_with_layout(&mut self, me: MouseEvent, layout: &super::layout::PaneLayout) {
+        self.mouse_x = me.column;
         let col = me.column;
         let row = me.row;
         // helper to test inside rect
@@ -816,6 +1012,17 @@ impl Tui {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // Provider workflow captures all keys when active.
+        if self.provider_workflow.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+            {
+                self.quit = true;
+                return;
+            }
+            self.handle_workflow_key(key);
+            return;
+        }
         // Dialog captures all keys (Enter confirms, Esc cancels, typing edits arg)
         if self.slash_dialog.is_some() {
             // allow Ctrl+Q to quit even with dialog
@@ -832,16 +1039,37 @@ impl Tui {
         // future interactive gating; the shared agent loop currently runs
         // gated tools in AutoRun mode, so this never triggers.)
         if self.confirm_pending {
-            match (key.modifiers, key.code) {
-                (KeyModifiers::CONTROL, KeyCode::Char('q')) => self.quit = true,
-                _ => {}
-            }
+            if let (KeyModifiers::CONTROL, KeyCode::Char('q')) = (key.modifiers, key.code) { self.quit = true }
             return;
         }
 
         // Global bindings. Handle case-insensitive for Ctrl.
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char(c) = key.code {
+        // Modals capture Esc first
+        if self.show_settings || self.show_shortcuts || self.show_cost_dashboard {
+            if key.code == KeyCode::Esc {
+                self.show_settings = false;
+                self.show_shortcuts = false;
+                self.show_cost_dashboard = false;
+                return;
+            }
+            // any other key closes shortcuts/settings as well
+            if self.show_shortcuts || self.show_settings {
+                self.show_shortcuts = false;
+                self.show_settings = false;
+                return;
+            }
+        }
+        // Single shortcut entry: "?" shows the shortcuts modal (when not typing)
+        if key.code == KeyCode::Char('?') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.focus == Focus::Input && !self.input.is_empty() {
+                // let "?" be typed
+            } else {
+                self.show_shortcuts = !self.show_shortcuts;
+                return;
+            }
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && let KeyCode::Char(c) = key.code {
                 match c.to_ascii_lowercase() {
                     'q' => {
                         self.quit = true;
@@ -872,8 +1100,17 @@ impl Tui {
                         self.show_cost_dashboard = !self.show_cost_dashboard;
                         return;
                     }
+                    ',' => {
+                        self.show_settings = !self.show_settings;
+                        return;
+                    }
                     'o' => {
-                        // Ctrl+O: zen mode (toggle sidebars)
+                        // Ctrl+O: open folder — change working directory
+                        self.open_slash_dialog("/open");
+                        return;
+                    }
+                    'z' => {
+                        // Ctrl+Z: zen mode (toggle sidebars) — moved from Ctrl+O
                         if self.show_tree || self.show_tools {
                             self.show_tree = false;
                             self.show_tools = false;
@@ -891,7 +1128,6 @@ impl Tui {
                     _ => {}
                 }
             }
-        }
 
         // Plan confirmation gate: y executes, anything else aborts.
         if self.plan_awaiting {
@@ -962,7 +1198,7 @@ impl Tui {
                 if self.focus == Focus::Input && self.input.starts_with('/') {
                     // fallback: complete first ghost
                     if let Some(ghost) = crate::tui::widgets::input_bar::completion(&self.input) {
-                        self.input.push_str(&ghost);
+                        self.input.push_str(ghost);
                         self.input_cursor = self.input.chars().count();
                         self.slash_selected = 0;
                         return;
@@ -1268,17 +1504,24 @@ impl Tui {
                     *slot = Some(ok);
                 } else {
                     self.entries.push(ChatEntry::Tool {
-                        name,
-                        args,
+                        name: name.clone(),
+                        args: args.clone(),
                         ok: Some(ok),
                     });
                 }
-                // Result preview so users can see what read_file/grep/…
-                // returned without leaving the transcript.
+                // Result preview — for shell-like tools use the terminal-styled Shell entry.
                 if !snippet.trim().is_empty() {
-                    let text: String = snippet.chars().take(160).collect();
-                    self.entries
-                        .push(ChatEntry::Notice(format!("↳ {text}")));
+                    if matches!(name.as_str(), "run_shell" | "run_test" | "check_project") {
+                        self.entries.push(ChatEntry::Shell {
+                            cmd: args.clone(),
+                            output: snippet.chars().take(800).collect(),
+                            ok,
+                        });
+                    } else {
+                        let text: String = snippet.chars().take(160).collect();
+                        self.entries
+                            .push(ChatEntry::Notice(format!("↳ {text}")));
+                    }
                 }
             }
             TurnUpdate::Answer(text) => {
@@ -1427,6 +1670,9 @@ async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> Result<()> {
     let mut tui = Tui::new();
+    // Set initial provider name and remap accent color.
+    tui.provider_name = app.config.provider.key().to_string();
+    theme::apply_provider_accent(&tui.provider_name);
     tui.notice(format!(
         "govinda-cli v{} — {} mode · type /help for keys",
         env!("CARGO_PKG_VERSION"),
@@ -1469,7 +1715,8 @@ async fn event_loop(
             }
             // Fetch available models from the API, then open the /model dialog.
             if tui.take_model_fetch_request() {
-                let models = if let Some(url) = app.config.provider.models_url() {
+                let provider_id = app.config.provider.key().to_string();
+                let api_models = if let Some(url) = app.config.provider.models_url() {
                     match api::list_models(&app.http, &url, app.config.provider.auth().token()).await {
                         Ok(list) => list,
                         Err(e) => {
@@ -1478,15 +1725,102 @@ async fn event_loop(
                         }
                     }
                 } else {
-                    tui.notice(format!(
-                        "provider '{}' has no model-listing endpoint",
-                        app.config.provider.id()
-                    ));
                     Vec::new()
                 };
+                // Merge API models with known static registry.
+                let known = crate::provider::known_models(&provider_id);
+                let mut models = api_models;
+                let api_set: std::collections::HashSet<&str> = models.iter().map(|s| s.as_str()).collect();
+                let extras: Vec<String> = known.iter()
+                    .filter(|m| !api_set.contains(m.id))
+                    .map(|m| m.id.to_owned())
+                    .collect();
+                models.extend(extras);
+                if models.is_empty() {
+                    tui.notice(format!(
+                        "no models available for '{provider_id}' — try /model <name> manually"
+                    ));
+                }
                 tui.models_cache = models;
                 tui.open_slash_dialog("/model");
                 continue;
+            }
+            // Provider setup workflow: fetch models for the chosen provider.
+            if let Some((prov, key)) = tui.pending_setup_models.take() {
+                let known = crate::provider::known_models(&prov);
+                let mut models: Vec<String> = known.iter().map(|m| m.id.to_owned()).collect();
+                // Try live API fetch to get real models.
+                if let Ok(p) = crate::provider::resolve(&prov, None, None, {
+                    let k = key.clone();
+                    move |_: &str| Some(k.clone())
+                })
+                    && let Some(url) = p.models_url()
+                        && let Ok(api_models) = api::list_models(&app.http, &url, p.auth().token()).await {
+                    let known_set: std::collections::HashSet<&str> = models.iter().map(|s| s.as_str()).collect();
+                    let extras: Vec<String> = api_models.into_iter().filter(|m| !known_set.contains(m.as_str())).collect();
+                    models.extend(extras);
+                        }
+                if models.is_empty() {
+                    models.push("default".to_owned());
+                }
+                tui.provider_workflow = Some(ProviderWorkflow::SelectModel {
+                    provider: prov,
+                    api_key: key,
+                    models,
+                    selected: 0,
+                });
+                continue;
+            }
+            // Provider setup workflow: test the connection by fetching models.
+            if tui.pending_setup_test {
+                tui.pending_setup_test = false;
+                if let Some(ProviderWorkflow::Testing { provider, api_key, model }) = tui.provider_workflow.take() {
+                    let test_result = {
+                        match crate::provider::resolve(&provider, None, None, {
+                            let k = api_key.clone();
+                            move |_: &str| Some(k.clone())
+                        }) {
+                            Ok(p) => {
+                                if let Some(url) = p.models_url() {
+                                    match crate::api::list_models(&app.http, &url, p.auth().token()).await {
+                                        Ok(list) => {
+                                            let ok = !list.is_empty();
+                                            let msg = if ok {
+                                                format!("{} models available — connection verified", list.len())
+                                            } else {
+                                                "provider returned no models (may still work for direct calls)".to_owned()
+                                            };
+                                            (ok, msg)
+                                        }
+                                        Err(e) => (false, format!("{e:#}")),
+                                    }
+                                } else {
+                                    // Provider has no models endpoint — trust the resolve worked.
+                                    (true, "provider resolved successfully (no model listing endpoint)".to_owned())
+                                }
+                            }
+                            Err(e) => (false, format!("{e:#}")),
+                        }
+                    };
+                    let (ok, message) = test_result;
+                    // Apply provider and model on success.
+                    if ok
+                        && let Ok(p) = crate::provider::resolve(&provider, None, None, {
+                            let k = api_key.clone();
+                            move |_: &str| Some(k.clone())
+                        }) {
+                            app.config.provider = p;
+                            app.config.model = model.clone();
+                        }
+                    tui.provider_workflow = Some(ProviderWorkflow::Result {
+                        provider,
+                        api_key,
+                        model,
+                        ok,
+                        message,
+                    });
+                    continue;
+                }
             }
             if let Some(slash) = tui.take_pending_slash() {
                 handle_tui_slash(app, &mut tui, &slash).await;
@@ -1622,11 +1956,29 @@ fn git_branch_and_dirty() -> (Option<String>, bool) {
 
 fn status_info(app: &App, tui: &Tui) -> draw::StatusInfo {
     let (git_branch, git_dirty) = git_branch_and_dirty();
+    // Pick the larger of the CLI budget and the model's true context
+    // window so the bar always reflects real available room. When the
+    // user set a small `context_tokens` in TOML, `budget` is the small
+    // value (and the trimmer enforces it) — the bar still shows the
+    // model's full limit so they can see the cap.
+    let model_context = {
+        let from_registry = provider::context_window_for(
+            &app.config.provider.key(),
+            &app.config.model,
+        );
+        if from_registry > app.config.context_tokens {
+            from_registry
+        } else {
+            app.config.context_tokens
+        }
+    };
     draw::StatusInfo {
-        provider: app.config.provider.id().to_owned(),
+        provider: app.config.provider.key().to_string(),
         model: app.config.model.to_string(),
+        provider_name: tui.provider_name.clone(),
         tokens: app.session.approx_tokens(),
         budget: app.config.context_tokens,
+        model_context,
         turns: app.stats.turns,
         errors: app.stats.errors,
         avg_latency_ms: if app.stats.turns > 0 {
@@ -1646,6 +1998,7 @@ fn status_info(app: &App, tui: &Tui) -> draw::StatusInfo {
                     .is_some_and(|e| e.requires_confirmation(&t.name)),
             })
             .collect(),
+        todos: app.todos.clone(),
         git_branch,
         git_dirty,
         pinned: tui.pinned_files.len(),
@@ -1679,6 +2032,24 @@ async fn handle_tui_slash(
     // `/raw` toggles the renderer inside the dispatcher; keep the pane flag
     // in sync so the chat view switches live.
     tui.raw_mode = !app.renderer.markdown_enabled();
+    // Sync provider name and remap accent color on provider switch.
+    let new_provider = app.config.provider.key().to_string();
+    if tui.provider_name != new_provider {
+        tui.provider_name = new_provider;
+        theme::apply_provider_accent(&tui.provider_name);
+    }
+    // Folder change: refresh tree to new cwd and prune pinned files
+    let cmd_lc = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if matches!(cmd_lc.as_str(), "/cd" | "/cwd" | "/folder" | "/open") {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        tui.tree = Some(FileTree::open(&cwd));
+        tui.pinned_files.retain(|p| p.starts_with(&cwd));
+        tui.show_tree = true;
+        // Ensure layout shows at least one pane
+        if !tui.show_tools {
+            // keep todo pane visible
+        }
+    }
     out
 }
 
@@ -1704,21 +2075,15 @@ fn apply_command_output(app: &mut App, tui: &mut Tui, line: &str, out: commands:
             tui.quit = true;
         }
         Effect::Resend(text) => {
-            // `/retry` semantics: drop the trailing assistant entries so the
-            // regenerated answer does not duplicate the failed one.
-            let mut end = tui.entries.len();
-            while end > 0 {
-                match tui.entries[end - 1] {
-                    ChatEntry::Notice(_) => end -= 1,
-                    ChatEntry::Assistant(_) => break,
-                    _ => break,
-                }
+            // `/retry` semantics: drop the trailing assistant side so the
+            // regenerated answer does not duplicate.
+            while tui.entries.last().is_some_and(|e| matches!(e, ChatEntry::Notice(_))) {
+                tui.entries.pop();
             }
-            let mut keep = end;
-            if keep > 0 && matches!(tui.entries[keep - 1], ChatEntry::Assistant(_)) {
-                keep -= 1;
+            // Pop back until just before the last assistant-side block, but keep the User.
+            while tui.entries.last().is_some_and(|e| matches!(e, ChatEntry::Assistant(_) | ChatEntry::Tool {..} | ChatEntry::Op(_) | ChatEntry::Shell {..} | ChatEntry::Code {..} | ChatEntry::Checklist {..})) {
+                tui.entries.pop();
             }
-            tui.entries.truncate(keep);
             tui.pending_prompt = Some(text);
         }
         Effect::Plan(steps) => {
@@ -1750,18 +2115,18 @@ fn apply_command_output(app: &mut App, tui: &mut Tui, line: &str, out: commands:
 /// Drops the trailing user+assistant pair from the transcript, skipping any
 /// notices printed alongside (the dispatcher emits them before the effect).
 fn pop_last_exchange(entries: &mut Vec<ChatEntry>) {
-    let mut end = entries.len();
-    while end > 0 && matches!(entries[end - 1], ChatEntry::Notice(_)) {
-        end -= 1;
+    // Strip trailing notices first.
+    while entries.last().is_some_and(|e| matches!(e, ChatEntry::Notice(_))) {
+        entries.pop();
     }
-    let mut keep = end;
-    if keep > 0 && matches!(entries[keep - 1], ChatEntry::Assistant(_)) {
-        keep -= 1;
+    // Find last User and truncate to before it, removing the whole exchange
+    // (User + any following assistant/tool/op/shell/code/checklist entries).
+    if let Some(pos) = entries.iter().rposition(|e| matches!(e, ChatEntry::User(_))) {
+        entries.truncate(pos);
     }
-    if keep > 0 && matches!(entries[keep - 1], ChatEntry::User(_)) {
-        keep -= 1;
+    while entries.last().is_some_and(|e| matches!(e, ChatEntry::Notice(_))) {
+        entries.pop();
     }
-    entries.truncate(keep);
 }
 
 // ─── Turn runner ─────────────────────────────────────────────────────────────
@@ -2163,6 +2528,7 @@ mod tests {
             context_tokens: 2048,
             provider,
             source_path: None,
+            provider_explicit: false,
             shell_tools: Vec::new(),
             theme: None,
             timeout_secs: 30,
@@ -2236,6 +2602,7 @@ mod tests {
             context_tokens: 2048,
             provider,
             source_path: None,
+            provider_explicit: false,
             shell_tools: Vec::new(),
             theme: None,
             timeout_secs: 30,

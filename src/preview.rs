@@ -51,10 +51,9 @@ fn content_type(path: &Path) -> &'static str {
 /// Resolves a URL path to a workspace file, rejecting traversal outside the
 /// workspace root and absolute paths.
 fn resolve_safe(root: &Path, url_path: &str) -> Option<PathBuf> {
-    let decoded = url_path
-        .strip_prefix('/')
-        .unwrap_or(url_path)
-        .replace("%20", " ");
+    let stripped = url_path.strip_prefix('/').unwrap_or(url_path);
+    // Full percent-decode instead of only %20.
+    let decoded = urlencoding::decode(stripped).ok().unwrap_or_default().into_owned();
     let rel = Path::new(&decoded);
     let mut safe = true;
     for comp in rel.components() {

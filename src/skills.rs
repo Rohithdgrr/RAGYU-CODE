@@ -82,8 +82,7 @@ fn parse_skill_file(path: &Path) -> Result<Skill> {
     anyhow::ensure!(!raw.is_empty(), "empty skill file");
 
     // Parse YAML-like frontmatter between `---` markers.
-    let (frontmatter, body) = if raw.starts_with("---") {
-        let rest = &raw[3..];
+    let (frontmatter, body) = if let Some(rest) = raw.strip_prefix("---") {
         let Some(end) = rest.find("---") else {
             anyhow::bail!("unclosed frontmatter in {}", path.display());
         };

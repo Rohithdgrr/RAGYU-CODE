@@ -249,7 +249,7 @@ pub(super) fn show_config(app: &App) {
     info(format!(
         "config file    {}\nprovider       {} ({})\nmodel          {}\ntemperature    {:.2}\ncontext budget {} tokens (tokenizer-trimmed)\nrendering      {}\ntheme          {}\ntimeout        {}s\nresponse cap   {} MB\nhistory        {} messages (~{} tokens)",
         config_file,
-        app.config.provider.id(),
+        app.config.provider.key(),
         app.config.provider.chat_url(),
         app.config.model,
         app.config.temperature,

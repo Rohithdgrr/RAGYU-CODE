@@ -724,8 +724,17 @@ impl ToolExecutor for BuiltinTools {
                     let args: DelegateTaskArgs = parse_args(arguments_json)?;
                     let cwd = std::env::current_dir().context("cannot resolve working directory")?;
                     let overview = crate::scan::scan(&cwd).await;
-                    let http = crate::config::Config::http_client().unwrap_or_default();
-                    let provider = crate::provider::resolve("mistral", None, None, |_| None).unwrap();
+                    let http = crate::config::Config::http_client()
+                        .context("failed to build HTTP client for delegation")?;
+                    // Resolve provider from env (same as main app startup).
+                    let provider = crate::provider::resolve(
+                        &std::env::var("GOVINDA_PROVIDER")
+                            .unwrap_or_else(|_| crate::config::DEFAULT_PROVIDER.to_owned()),
+                        None,
+                        None,
+                        |name| std::env::var(format!("{name}_API_KEY")).ok(),
+                    )
+                    .context("provider setup failed for delegation")?;
                     let result = crate::swarm::explore(&args.task, &http, provider.as_ref(), &overview).await;
                     match result {
                         Ok(output) => Ok(format!("{{\"task\":\"{}\",\"status\":\"completed\",\"output\":{}}}", args.task, serde_json::json!(output))),
@@ -927,6 +936,7 @@ async fn web_search_tool(args: WebSearchArgs) -> Result<String> {
             .map(|i| &block[i + 1..])
             .and_then(|title_rest| title_rest.find("</a>"))
             .map(|end| {
+                #[allow(clippy::unwrap_used)] // safe: outer find() succeeded
                 let title_rest = &block[block.find('>').unwrap() + 1..];
                 &title_rest[..end]
             })
@@ -938,6 +948,7 @@ async fn web_search_tool(args: WebSearchArgs) -> Result<String> {
             .map(|i| &block[i + 22..])
             .and_then(|snip_rest| snip_rest.find("</td>"))
             .map(|end| {
+                #[allow(clippy::unwrap_used)] // safe: outer find() succeeded
                 let snip_rest = &block[block.find("class=\"result-snippet\"").unwrap() + 22..];
                 &snip_rest[..end]
             })
@@ -996,11 +1007,28 @@ async fn web_fetch_tool(args: WebFetchArgs) -> Result<String> {
         url.starts_with("http://") || url.starts_with("https://"),
         "url must start with http:// or https://"
     );
+    // SSRF protection: block requests to private/loopback/link-local IPs.
+    if let Ok(parsed) = url::Url::parse(url)
+        && let Some(host) = parsed.host_str() {
+            let h = host.to_lowercase();
+            anyhow::ensure!(
+                !h.starts_with("127.")
+                    && !h.starts_with("10.")
+                    && !h.starts_with("192.168.")
+                    && !h.starts_with("172.")
+                    && h != "localhost"
+                    && h != "::1"
+                    && h != "0.0.0.0"
+                    && h != "169.254.169.254",
+                "requests to private/loopback/link-local addresses are blocked"
+            );
+        }
     let max_chars = args.max_chars.unwrap_or(20_000).min(100_000);
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .context("failed to build HTTP client for web fetch")?;
     let resp = client
@@ -1958,9 +1986,10 @@ fn list_files(base: &Path, args: &ListFilesArgs) -> Result<String> {
 
     let mut lines = Vec::new();
     let ignore = crate::ignore::IgnoreRules::load(base);
-    let mut stack = vec![root.clone()];
-    while let Some(dir) = stack.pop() {
-        if lines.len() >= max_entries {
+    // (directory, depth)
+    let mut stack = vec![(root.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if lines.len() >= max_entries || depth >= MAX_WALK_DEPTH {
             break;
         }
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -1985,7 +2014,7 @@ fn list_files(base: &Path, args: &ListFilesArgs) -> Result<String> {
             }
             if ft.is_dir() {
                 lines.push(format!("{rel}/", rel = rel));
-                stack.push(entry.path());
+                stack.push((entry.path(), depth + 1));
             } else if ft.is_file() {
                 lines.push(rel);
             }
@@ -3130,5 +3159,25 @@ mod tests {
         save_disabled_tools(&HashSet::new()).unwrap();
         assert!(load_disabled_tools().is_empty());
         std::fs::remove_file(disabled_tools_path()).ok();
+    }
+
+    #[test]
+    fn list_files_respects_depth_cap() {
+        // list_files should not exceed MAX_WALK_DEPTH (12)
+        // This test verifies the depth cap is applied
+        let base = std::env::temp_dir().join("govinda-depth-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a/b/c/d/e/f/g/h/i/j/k/l/m")).unwrap();
+        std::fs::write(base.join("a/b/c/d/e/f/g/h/i/j/k/l/m/deep.txt"), "x").unwrap();
+        std::fs::write(base.join("a/top.txt"), "x").unwrap();
+
+        let args = ListFilesArgs {
+            path: Some("a".into()),
+            max_entries: Some(100),
+        };
+        // Should succeed without stack overflow
+        let result = list_files(&base, &args);
+        assert!(result.is_ok(), "list_files should handle deep paths: {result:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -35,3 +35,5 @@ pub mod tools;
 pub mod tui;
 pub mod memory;
 pub mod checkpoint;
+pub mod opencode;
+pub mod omniroute;

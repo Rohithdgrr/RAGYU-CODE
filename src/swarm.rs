@@ -146,7 +146,10 @@ pub async fn explore(
     ];
 
     let auth = provider.auth();
-    let opts = ChatOptions::new(auth.token(), "mistral-small-latest", 0.3);
+    // The gateway's own routing alias keeps this working on any backend —
+    // OmniRoute's `auto` picks a healthy model; OpenAI-compatible servers
+    // without that alias fall back to their default handling of the id.
+    let opts = ChatOptions::new(auth.token(), crate::config::DEFAULT_MODEL, 0.3);
 
     let mut out = String::new();
     let mut no_calls = Vec::new();

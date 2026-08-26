@@ -100,14 +100,96 @@ async fn main() -> Result<()> {
         govinda_cli::completions::emit(shell)?;
         return Ok(());
     }
-    let config = Config::load().context("startup failed")?;
+    let mut config = Config::load().context("startup failed")?;
     let http = Config::http_client().context("startup failed")?;
+
+    // Auto-connect chain, zero manual setup: OpenCode first (borrows its
+    // connected providers/models); if not detected, the loaded defaults
+    // already point at the local OmniRoute gateway (`auto` model works
+    // keylessly on a fresh install) — just say so. Detection failures are
+    // deliberately quiet; `/opencode status` explains what happened.
+    if !config.provider_explicit && config.api_key.is_empty() {
+        match govinda_cli::opencode::auto_connect(&http, &config.model).await {
+            Ok(Some((provider, model))) => {
+                let pid = provider.key().to_string();
+                config.adopt_provider(provider);
+                config.model = model;
+                println!(
+                    "{}",
+                    paint(
+                        format!("OpenCode detected — borrowing {pid} · model {}", config.model),
+                        govinda_cli::render::dim_color()
+                    )
+                );
+            }
+            _ => {
+                // OmniRoute fallback with full bootstrap: install the npm
+                // package and start the server if they are missing, then
+                // wait for the gateway to answer.
+                match govinda_cli::omniroute::ensure_running(&http).await {
+                    Ok(true) => println!(
+                        "{}",
+                        paint(
+                            format!(
+                                "OpenCode not detected — OmniRoute gateway ready ({}) · model {}",
+                                config.provider.base_url(),
+                                config.model
+                            ),
+                            govinda_cli::render::dim_color()
+                        )
+                    ),
+                    Ok(false) => println!(
+                        "{}",
+                        paint(
+                            "OmniRoute did not come up in time — start it manually with 'omniroute'",
+                            govinda_cli::render::dim_color()
+                        )
+                    ),
+                    Err(e) => println!(
+                        "{}",
+                        paint(
+                            format!("OmniRoute unavailable ({e:#}) — first chat will fail until it is running"),
+                            govinda_cli::render::dim_color()
+                        )
+                    ),
+                }
+            }
+        }
+    }
+
     if let Some(theme) = &config.theme {
         govinda_cli::render::set_theme(theme);
         // The TUI has its own palette set; honor the saved theme there too
         // so /theme choices persist across launches in both frontends.
         let _ = govinda_cli::tui::theme::set_by_name(theme);
     }
+
+    // Live-fetch the model's true context window from the provider's
+    // `/v1/models` endpoint. This overrides the static-registry value
+    // (and the `DEFAULT_CONTEXT_TOKENS` fallback) when the network is
+    // reachable. The previous default of 8k silently capped 200k models
+    // like `oc/hy3-free`; this restores the real limit.
+    let detected = govinda_cli::provider::fetch_model_context(
+        &http,
+        config.provider.as_ref(),
+        &config.model,
+    )
+    .await;
+    if detected > 0 && config.context_tokens < detected {
+        let used = detected;
+        eprintln!(
+            "{}",
+            paint(
+                format!(
+                    "context: {used} tokens (auto-detected for {}; was {})",
+                    config.model, config.context_tokens
+                ),
+                govinda_cli::render::dim_color()
+            )
+        );
+        config.context_tokens = used;
+    }
+
     let renderer = Renderer::new(config.render_markdown);
 
     // Resume a named session, or start fresh.
@@ -245,26 +327,39 @@ fn parse_args() -> Result<Args> {
     let mut completion = None;
     let mut force_repl = false;
     let mut force_tui = false;
+    let mut separated = false; // after `--`, treat remaining as values
     while let Some(arg) = argv.next() {
+        if arg == "--" {
+            separated = true;
+            continue;
+        }
+        if separated || !arg.starts_with('-') {
+            // After `--` or non-flag arg: treat as a value for the last flag
+            if resume.is_none() && query.is_none() && build.is_none() && completion.is_none() {
+                // No flag pending; treat as resume name for backward compat
+                resume = Some(arg);
+            }
+            continue;
+        }
         match arg.as_str() {
             "--resume" | "-r" => {
                 let name = argv
                     .next()
-                    .filter(|n| !n.starts_with('-'))
+                    .filter(|n| separated || !n.starts_with('-'))
                     .ok_or_else(|| anyhow::anyhow!("--resume needs a session name"))?;
                 resume = Some(name);
             }
             "--query" | "-q" => {
                 let prompt = argv
                     .next()
-                    .filter(|p| !p.starts_with('-'))
+                    .filter(|p| separated || !p.starts_with('-'))
                     .ok_or_else(|| anyhow::anyhow!("-q needs a prompt (quote it)"))?;
                 query = Some(prompt);
             }
             "--build" | "-b" => {
                 let prompt = argv
                     .next()
-                    .filter(|p| !p.starts_with('-'))
+                    .filter(|p| separated || !p.starts_with('-'))
                     .ok_or_else(|| anyhow::anyhow!("--build needs a prompt (quote it)"))?;
                 build = Some(prompt);
             }

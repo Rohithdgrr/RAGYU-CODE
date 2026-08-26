@@ -4,19 +4,50 @@ use futures_util::future::join_all;
 use std::sync::Arc;
 
 pub(super) async fn models(app: &mut App) {
-    match ensure_models(app).await {
-        Ok(list) => {
-            info("available models:");
-            for id in list.iter() {
-                let marker = if **id == app.config.model {
-                    "  ← current"
-                } else {
-                    ""
-                };
-                info(format!("  {id}{marker}"));
+    let provider_id = app.config.provider.key();
+    // Try the live API first; fall back to the static registry.
+    let api_list = ensure_models(app).await.ok();
+    let known = crate::provider::known_models(&provider_id);
+
+    // Merge: API models first (with free tags from registry), then known-only.
+    if let Some(ref list) = api_list {
+        info(format!("models for {provider_id} (from API):"));
+        for id in list.iter() {
+            let marker = if **id == app.config.model { "  ← current" } else { "" };
+            let free_tag = known.iter().find(|k| *k.id == **id).map_or("", |k| {
+                if k.free { " [FREE]" } else { "" }
+            });
+            let desc = known.iter().find(|k| *k.id == **id).map_or("", |k| k.description);
+            let suffix = if !desc.is_empty() || !free_tag.is_empty() {
+                format!("  {free_tag}  {desc}")
+            } else {
+                String::new()
+            };
+            info(format!("  {id}{marker}{suffix}"));
+        }
+        // Show known models not in API list
+        let api_set: std::collections::HashSet<&str> = list.iter().map(|s| s.as_str()).collect();
+        let extra: Vec<&crate::provider::KnownModel> = known.iter().filter(|k| !api_set.contains(k.id)).collect();
+        if !extra.is_empty() {
+            info("");
+            info("known models (not listed by API):")
+;            for m in &extra {
+                let marker = if *m.id == app.config.model { "  ← current" } else { "" };
+                let tag = if m.free { " [FREE]" } else { "" };
+                info(format!("  {}{tag}{marker}  {}", m.id, m.description));
             }
         }
-        Err(e) => err(format!("{e:#}")),
+    } else if !known.is_empty() {
+        info(format!("models for {provider_id} (from registry):"));
+        for m in known {
+            let marker = if m.id == app.config.model { "  ← current" } else { "" };
+            let tag = if m.free { " [FREE]" } else { "" };
+            info(format!("  {}{tag}{marker}  {}", m.id, m.description));
+        }
+    } else {
+        err(format!(
+            "no models available for '{provider_id}' — try /models after switching provider",
+        ));
     }
 }
 
@@ -27,7 +58,7 @@ async fn ensure_models(app: &mut App) -> anyhow::Result<Arc<Vec<String>>> {
     let url = app.config.provider.models_url().ok_or_else(|| {
         anyhow::anyhow!(
             "provider '{}' has no model-listing endpoint",
-            app.config.provider.id()
+            app.config.provider.key()
         )
     })?;
     let list =

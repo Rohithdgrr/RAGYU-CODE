@@ -1,5 +1,6 @@
 mod display;
 mod edits;
+mod folder;
 mod generation;
 pub mod output;
 mod persistence;
@@ -33,7 +34,7 @@ pub use plan::{Phase, PipelineStep, generate_pipeline, parse_pipeline_steps};
 
 /// Every slash command the REPL accepts. Drives the reedline completer and
 /// shell-completion scripts; keep in sync with `dispatch()` / `help()`.
-pub const SLASH_COMMANDS: [&str; 47] = [
+pub const SLASH_COMMANDS: [&str; 55] = [
     "/help",
     "/exit",
     "/quit",
@@ -41,6 +42,7 @@ pub const SLASH_COMMANDS: [&str; 47] = [
     "/reset",
     "/agent",
     "/provider",
+    "/opencode",
     "/pin",
     "/models",
     "/model",
@@ -81,6 +83,13 @@ pub const SLASH_COMMANDS: [&str; 47] = [
     "/commit",
     "/pr",
     "/auto-compact",
+    "/cd",
+    "/cwd",
+    "/folder",
+    "/open",
+    "/apikey",
+    "/setup",
+    "/test",
 ];
 
 /// Shared mutable state for the REPL and command handlers.
@@ -306,7 +315,7 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                 // List presets and show the active provider.
                 info(format!(
                     "current provider: {} ({}){}",
-                    app.config.provider.id(),
+                    app.config.provider.key(),
                     app.config.provider.base_url(),
                     if app.config.provider.auth().token().is_some() {
                         " · API key loaded"
@@ -319,32 +328,118 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                     crate::provider::preset_names().collect::<Vec<_>>().join(", ")
                 ));
                 dim("switch with /provider <name>, or a custom endpoint with /provider <name> <base-url>");
+                dim("for interactive setup, use: /provider <name> -i");
                 return Outcome::Handled;
             }
-            let (name, base_url) = match arg.split_once(char::is_whitespace) {
-                Some((n, u)) => (n.trim(), Some(u.trim())),
-                None => (arg, None),
+            
+            // Check for interactive mode flag
+            let (arg_part, interactive) = if arg.ends_with(" -i") || arg.ends_with(" --interactive") {
+                (arg.trim_end_matches(" -i").trim_end_matches(" --interactive").trim(), true)
+            } else {
+                (arg, false)
             };
-            // Keys resolve from the environment (.env included at startup).
-            let key_env_lookup = |var: &str| std::env::var(var).ok();
-            match crate::provider::resolve(name, base_url, None, key_env_lookup) {
-                Ok(new_provider) => {
-                    app.config.provider = new_provider;
-                    // Cached model ids belong to the old backend.
-                    app.models_cache = None;
-                    ok(format!(
-                        "provider switched to {} ({}){}",
-                        app.config.provider.id(),
-                        app.config.provider.chat_url(),
-                        if app.config.provider.auth().token().is_some() {
-                            " · API key loaded"
-                        } else {
-                            ""
-                        },
-                    ));
-                    dim("pick a model for this provider with /model <name> (or /models to list). Persist the switch with /config save.");
+            
+            let (name, base_url) = match arg_part.split_once(char::is_whitespace) {
+                Some((n, u)) => (n.trim(), Some(u.trim())),
+                None => (arg_part, None),
+            };
+            
+            if interactive {
+                // Interactive setup workflow
+                if let Err(e) = interactive_provider_setup(name, base_url, app).await {
+                    err(format!("setup failed: {e:#}"));
                 }
-                Err(e) => err(&format!("{e:#}")),
+            } else {
+                // Direct switch (original behavior)
+                let key_env_lookup = |var: &str| std::env::var(var).ok();
+                match crate::provider::resolve(name, base_url, None, key_env_lookup) {
+                    Ok(new_provider) => {
+                        app.config.provider = new_provider;
+                        // Cached model ids belong to the old backend.
+                        app.models_cache = None;
+                        ok(format!(
+                            "provider switched to {} ({}){}",
+                            app.config.provider.key(),
+                            app.config.provider.chat_url(),
+                            if app.config.provider.auth().token().is_some() {
+                                " · API key loaded"
+                            } else {
+                                ""
+                            },
+                        ));
+                        dim("pick a model for this provider with /model <name> (or /models to list). Persist the switch with /config save.");
+                        dim("for interactive setup, use: /provider <name> -i");
+                    }
+                    Err(e) => err(format!("{e:#}")),
+                }
+            }
+            Outcome::Handled
+        }
+        "/opencode" => {
+            let arg = rest.trim();
+            let (sub, target) = match arg.split_once(char::is_whitespace) {
+                Some((s, t)) => (s, t.trim()),
+                None => (arg, ""),
+            };
+            const USAGE: &str = "usage: /opencode [status|connect|models|disconnect] [provider]";
+            match sub {
+                "status" | "" => {
+                    info(format!(
+                        "opencode: {}",
+                        crate::opencode::status_line(&app.http).await
+                    ));
+                    if app
+                        .config
+                        .provider
+                        .key()
+                        .starts_with(crate::opencode::KEY_PREFIX)
+                    {
+                        ok(format!(
+                            "active backend borrowed from OpenCode · model {}",
+                            app.config.model
+                        ));
+                    } else {
+                        dim("not currently borrowing from OpenCode — try '/opencode connect'");
+                    }
+                }
+                "connect" => {
+                    let requested = target.split_whitespace().next().map(str::to_owned);
+                    match crate::opencode::connect(&app.http, requested.as_deref()).await {
+                        Ok((provider, model, summary)) => {
+                            app.config.provider = provider;
+                            app.config.model = model;
+                            // Cached model ids belong to the old backend.
+                            app.models_cache = None;
+                            ok(summary);
+                            dim("list models with /models · persist with /config save");
+                        }
+                        Err(e) => err(format!("{e:#}")),
+                    }
+                }
+                "models" => match crate::opencode::fetch_catalog(&app.http).await {
+                    Ok(catalog) if !catalog.is_empty() => {
+                        for entry in &catalog.entries {
+                            info(format!("{} ({})", entry.pid, entry.base_url));
+                            for model in &entry.models {
+                                dim(format!("  {model}"));
+                            }
+                        }
+                        match catalog.default {
+                            Some((pid, mid)) => {
+                                dim(format!("default: {pid}/{mid}"));
+                            }
+                            None => {}
+                        }
+                    }
+                    Ok(_) => err(
+                        "OpenCode is reachable but no compatible providers are connected",
+                    ),
+                    Err(e) => err(format!("{e:#}")),
+                },
+                "disconnect" => {
+                    dim("switch away with /provider <name> (e.g. /provider mistral)");
+                }
+                _ => err(USAGE),
             }
             Outcome::Handled
         }
@@ -408,7 +503,28 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                 app.session.approx_tokens(),
                 app.config.context_tokens,
                 app.session.messages().len(),
-                app.config.provider.id(),
+                app.config.provider.key(),
+            ));
+            Outcome::Handled
+        }
+        "/context" => {
+            let used = app.session.approx_tokens();
+            let budget = app.config.context_tokens;
+            let provider_key = app.config.provider.key();
+            let provider_id: &str = provider_key.as_ref();
+            let model: &str = app.config.model.as_str();
+            let registry_window = crate::provider::context_window_for(provider_id, model);
+            let headroom = budget.saturating_sub(used);
+            let pct = if budget > 0 { (used * 100) / budget } else { 0 };
+            info(format!(
+                "model: {}\nprovider: {}\nused: ~{} tokens ({pct}% of budget)\nbudget: {} tokens (CLI trim cap)\nheadroom: ~{} tokens\nmodel limit: {} tokens{}\nset budget in config.toml: `context_tokens = <N>`",
+                model,
+                provider_id,
+                used,
+                budget,
+                headroom,
+                if registry_window > 0 { registry_window } else { budget },
+                if registry_window == 0 { " (registry unknown — set explicitly in TOML)" } else { " (from registry)" },
             ));
             Outcome::Handled
         }
@@ -641,6 +757,9 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             dim("pinning files to context is a TUI feature — open the explorer (Ctrl+P), select a file, /pin. In the REPL, @-mention files in your prompt instead.");
             Outcome::Handled
         }
+        "/cd" | "/cwd" | "/folder" | "/open" => {
+            return folder::handle(rest, app).await;
+        }
         "/auto-compact" => {
             let arg = rest.trim();
             if arg == "on" {
@@ -665,6 +784,46 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                 show_config(app);
                 dim("use '/config save' to persist model/theme/timeout/limit settings.");
             }
+            Outcome::Handled
+        }
+        "/apikey" => {
+            let key = rest.trim();
+            if key.is_empty() {
+                let provider = app.config.provider.key().to_string();
+                let has_key = app.config.provider.auth().token().is_some();
+                info(format!(
+                    "provider: {provider} — API key: {}",
+                    if has_key { "loaded" } else { "not set" },
+                ));
+                dim(format!(
+                    "set with: /apikey <key>\nthen /config save to persist, or set {provider}_API_KEY in .env"
+                ));
+            } else {
+                // Re-resolve the current provider with the new key.
+                let name = app.config.provider.key().to_string();
+                if name.starts_with(crate::opencode::KEY_PREFIX) {
+                    err(
+                        "OpenCode-backed providers use credentials from OpenCode's own store — re-authenticate inside OpenCode, or /provider <name> to switch first",
+                    );
+                    return Outcome::Handled;
+                }
+                let base_url = Some(app.config.provider.base_url().to_owned());
+                let key_owned = key.to_owned();
+                let key_env_lookup = |_: &str| Some(key_owned.clone());
+                match crate::provider::resolve(&name, base_url.as_deref(), None, key_env_lookup) {
+                    Ok(new_provider) => {
+                        app.config.provider = new_provider;
+                        app.config.api_key = std::sync::Arc::new(zeroize::Zeroizing::new(key.to_owned()));
+                        ok(format!("API key set for {name} — model calls will authenticate now."));
+                        dim("use /config save to persist, or /models to list available models.");
+                    }
+                    Err(e) => err(format!("could not set API key: {e:#}")),
+                }
+            }
+            Outcome::Handled
+        }
+        "/test" => {
+            test_provider(app).await;
             Outcome::Handled
         }
         unknown => {
@@ -700,17 +859,197 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
     }
 }
 
+/// Test the current provider and model configuration
+async fn test_provider(app: &mut App) {
+    info("Testing provider configuration...");
+    
+    let provider_id = app.config.provider.key();
+    let model = &app.config.model;
+    let has_key = app.config.provider.auth().token().is_some();
+    
+    info(format!("Provider: {}", provider_id));
+    info(format!("Model: {}", model));
+    info(format!("API Key: {}", if has_key { "loaded" } else { "not set" }));
+    
+    if !has_key && provider_id != "ollama" {
+        err("API key is required for this provider");
+        dim(format!("Set {}_API_KEY in .env or use /apikey <key>", provider_id.to_uppercase()));
+        return;
+    }
+    
+    dim("Sending test request...");
+    
+    let test_message = "Hello! Please respond with 'Test successful' if you can read this.";
+    let ctx = vec![
+        crate::api::Message::system("You are a helpful assistant. Keep responses brief."),
+        crate::api::Message::user(test_message),
+    ];
+    
+    let auth = app.config.provider.auth();
+    let opts = crate::api::ChatOptions {
+        max_response_bytes: app.max_response_bytes,
+        read_timeout: app.read_timeout,
+        ..crate::api::ChatOptions::new(auth.token(), model, app.config.temperature)
+    };
+    
+    let mut out = String::new();
+    let mut no_calls = Vec::new();
+    let mut sink = crate::api::StreamSink::new(&mut out, &mut no_calls);
+    
+    match crate::api::stream_chat(
+        &app.http,
+        app.config.provider.as_ref(),
+        &opts,
+        &ctx,
+        &mut sink,
+        |_| {},
+    )
+    .await
+    {
+        Ok(()) if !out.trim().is_empty() => {
+            ok("Test successful!");
+            info(format!("Response: {}", out.trim()));
+            dim("Your provider and model are working correctly.");
+        }
+        Ok(()) => {
+            err("Test failed: empty response from API");
+            dim("The API returned an empty response. Check your model name.");
+        }
+        Err(e) => {
+            err(format!("Test failed: {e:#}"));
+            dim("Possible issues:");
+            dim("- Invalid API key");
+            dim("- Incorrect model name");
+            dim("- Network connectivity problems");
+            dim("- Provider service outage");
+            dim(format!("Try /models to see available models for {}", provider_id));
+        }
+    }
+}
+
+/// Interactive provider setup workflow: select provider -> API key -> model -> test -> load
+async fn interactive_provider_setup(
+    name: &str,
+    base_url_override: Option<&str>,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    // Step 1: Select provider
+    let provider_name = if name.is_empty() {
+        info("Available providers:");
+        for preset in crate::provider::PRESETS.iter() {
+            info(format!("  - {}", preset.id));
+        }
+        dim("Enter provider name:");
+        return Err(anyhow::anyhow!("Provider name required. Use: /provider <name> -i"));
+    } else {
+        name
+    };
+    
+    info(format!("Setting up provider: {}", provider_name));
+    
+    // Step 2: Check if API key is needed
+    let preset = crate::provider::PRESETS.iter().find(|p| p.id == provider_name);
+    
+    match preset.and_then(|p| p.api_key_env) {
+        Some(env_var) => {
+            let current_key = std::env::var(env_var).ok();
+            
+            if current_key.is_none() || current_key.as_ref().map_or(true, |k| k.trim().is_empty()) {
+                info(format!("API key required for {}", provider_name));
+                info(format!("Environment variable: {}", env_var));
+                dim("Options:");
+                dim(format!("1. Set {} in your .env file", env_var));
+                dim(format!("2. Export it: export {}=your_key", env_var));
+                dim(format!("3. Use /apikey <key> to set it interactively"));
+                return Err(anyhow::anyhow!("API key not set. Please set {} and try again.", env_var));
+            } else {
+                ok(format!("API key found in {}", env_var));
+            }
+        }
+        None => {
+            ok("No API key required for this provider");
+        }
+    }
+    
+    // Step 3: Resolve provider
+    let key_env_lookup = |var: &str| std::env::var(var).ok();
+    let new_provider = crate::provider::resolve(provider_name, base_url_override, None, key_env_lookup)?;
+    app.config.provider = new_provider.clone();
+    app.models_cache = None;
+    
+    ok(format!("Provider configured: {} ({})", new_provider.key(), new_provider.base_url()));
+    
+    // Step 4: List available models
+    info("Fetching available models...");
+    let provider_id = new_provider.key().to_string();
+    let known_models = crate::provider::known_models(&provider_id);
+    
+    if !known_models.is_empty() {
+        info(format!("Known models for {}:", provider_id));
+        for (i, model) in known_models.iter().enumerate() {
+            let tag = if model.free { " [FREE]" } else { "" };
+            info(format!("  {}. {}{} - {}", i + 1, model.id, tag, model.description));
+        }
+    }
+    
+    // Try to fetch live models
+    if let Some(models_url) = new_provider.models_url() {
+        match crate::api::list_models(&app.http, &models_url, new_provider.auth().token()).await {
+            Ok(live_models) => {
+                info(format!("Live models available: {}", live_models.len()));
+                for (i, model) in live_models.iter().take(10).enumerate() {
+                    info(format!("  {}. {}", i + 1, model));
+                }
+                if live_models.len() > 10 {
+                    dim(format!("... and {} more", live_models.len() - 10));
+                }
+            }
+            Err(e) => {
+                dim(format!("Could not fetch live models: {e:#}"));
+                dim("Using known models from registry");
+            }
+        }
+    }
+    
+    // Step 5: Prompt for model selection
+    info("Step 5: Select a model");
+    dim("Enter model name or use first known model as default");
+    
+    // Auto-select first known model if available
+    if let Some(first_model) = known_models.first() {
+        app.config.model = first_model.id.to_string();
+        ok(format!("Auto-selected model: {} - {}", first_model.id, first_model.description));
+        dim("You can change this with /model <name>");
+    } else {
+        dim("No known models available. Please specify a model with /model <name>");
+    }
+    
+    // Step 6: Test the configuration
+    info("Step 6: Testing configuration...");
+    dim("Run /test to verify your API key and model are working");
+    
+    ok("Provider setup complete!");
+    dim("Use /config save to persist these settings");
+    dim("Use /models to see all available models");
+    dim("Use /model <name> to change the selected model");
+    
+    Ok(())
+}
+
 fn help(app: &App) {
     info(format!(
         "{} v{} — OpenAI-compatible CLI chatbot ({})",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
-        app.config.provider.id()
+        app.config.provider.key()
     ));
     info(
         "  /help              this help\n\
          \x20 /exit, /quit       quit\n\
          \x20 /clear, /reset     wipe conversation history\n\
+         \x20 /provider [name]   list or switch AI provider (add -i for interactive setup)\n\
+         \x20 /apikey [key]      view or set API key for current provider\n\
+         \x20 /test              test current provider and model configuration\n\
          \x20 /models            list models available to your key\n\
          \x20 /model <name>      switch model; `next`/`prev` cycle, partial ids match\n\
          \x20 /temp <0.0-1.0>    sampling temperature\n\
@@ -736,15 +1075,24 @@ fn help(app: &App) {
            \x20 /tools [on|off]    toggle function calling, or list the registry\n\
            \x20 /tools en|dis <n>  enable/disable a single tool (persisted across runs)\n\
             \x20 /todo [sub]        task list: list | add <text> | done <n> | undo <n> | rm <n> | clear\n\
-            \x20 /diff              show staged edits as a unified diff (nothing applied yet)\n\
-         \x20 /apply             commit all staged edits to disk (atomic batch)\n\
-         \x20 /reject            discard all staged edits\n\
-         \x20 /review            per-file +N/-M summary of staged edits\n\
-         \x20 /scan              rebuild the symbol index and print a workspace overview\n\
-         \x20 /plan <task>       decompose a task into steps, confirm, execute autonomously\n\
+             \x20 /diff              show staged edits as a unified diff (nothing applied yet)\n\
+          \x20 /apply             commit all staged edits to disk (atomic batch)\n\
+          \x20 /reject            discard all staged edits\n\
+          \x20 /review            per-file +N/-M summary of staged edits\n\
+          \x20 /scan              rebuild the symbol index and print a workspace overview\n\
+          \x20 /plan <task>       decompose a task into steps, confirm, execute autonomously\n\
+          \x20 /cd, /open <path>  change folder — open workspace (Ctrl+O)\n\
          \x20 /project [sub]     project memory: show | set test|build <cmd> | clear test|build\n\
          \x20 /config [save]     show settings; `save` persists model/theme/timeout/limit",
     );
+    dim("");
+    dim("Provider setup workflow:");
+    dim("  1. /provider <name> -i    # Interactive setup for a provider");
+    dim("  2. /apikey <key>           # Set API key if needed");
+    dim("  3. /models                 # List available models");
+    dim("  4. /model <name>           # Select a model");
+    dim("  5. /test                   # Test the configuration");
+    dim("  6. /config save            # Persist settings");
 }
 
 // ---------------------------------------------------------------------------
@@ -937,6 +1285,7 @@ mod tests {
             context_tokens: 2048,
             provider,
             source_path: None,
+            provider_explicit: false,
             shell_tools: Vec::new(),
             theme: None,
             timeout_secs: 30,

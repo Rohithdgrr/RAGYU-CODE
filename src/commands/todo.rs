@@ -27,9 +27,16 @@ pub fn load() -> Vec<Todo> {
 
 /// Persists the current list (also used by `/plan` to track execution).
 pub(super) fn save(app: &App) {
-    if let Ok(json) = serde_json::to_string_pretty(&app.todos)
-        && let Err(e) = std::fs::write(todo_path(), json)
-    {
+    let Ok(json) = serde_json::to_string_pretty(&app.todos) else {
+        return;
+    };
+    let path = todo_path();
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        err(format!("could not save todos: {e}"));
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
         err(format!("could not save todos: {e}"));
     }
 }

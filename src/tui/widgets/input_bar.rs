@@ -198,6 +198,9 @@ pub fn describe(cmd: &str) -> &'static str {
         "/clear" | "/reset" => "clear chat",
         "/agent" => "agent mode on/off",
         "/provider" => "switch provider",
+        "/opencode" => "OpenCode bridge status/connect",
+        "/apikey" => "view/set API key",
+        "/test" => "test provider config",
         "/pin" => "pin file to context",
         "/models" => "list models",
         "/model" => "switch model",
@@ -238,6 +241,9 @@ pub fn describe(cmd: &str) -> &'static str {
         "/commit" => "git commit",
         "/pr" => "branch/PR workflow",
         "/auto-compact" => "auto-compact session",
+        "/cd" | "/cwd" | "/folder" | "/open" => "change folder — open workspace",
+        "/apikey" => "set API key for provider",
+        "/setup" => "guided provider setup",
         _ => "",
     }
 }
@@ -334,19 +340,10 @@ pub fn footer_hint(has_ghost: bool, focus_input: bool, confirm_pending: bool) ->
             Span::styled(" clear ", muted),
         ]);
     }
-    // default modern rail: evenly spaced affordances
+    // single shortcut entry — all other hints live in the Shortcuts modal (?)
     Line::from(vec![
-        Span::styled(" / ", key_style),
-        Span::styled("commands ", muted),
-        Span::styled("·", muted),
-        Span::styled(" @ ", key_style),
-        Span::styled("files ", muted),
-        Span::styled("·", muted),
-        Span::styled(" Esc ", key_style),
-        Span::styled("clear ", muted),
-        Span::styled("·", muted),
-        Span::styled(" ↑↓ ", key_style),
-        Span::styled("history ", muted),
+        Span::styled(" ? ", key_style),
+        Span::styled("Shortcuts ", muted),
         Span::styled("  ", muted),
         Span::styled(format!(" {} Send ", icons::SEND), action_style),
         Span::styled(" ", muted),
@@ -387,10 +384,10 @@ pub fn build(mode: AppMode, focus_input: bool, input: &str) -> (String, Line<'st
     spans.push(Span::styled(" ❯ ", prompt_style));
 
     if input.is_empty() && focus_input {
-        // rich placeholder: primary hint + dim secondary hint
+        // rich placeholder: higher contrast for light glass
         spans.push(Span::styled(
             "Ask me to code, debug, or explain…",
-            Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+            Style::default().fg(t.text_secondary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             "  ·  try \"/\" for commands",
@@ -480,7 +477,7 @@ mod tests {
         assert_eq!(completion("/help"), None); // exact match → no ghost
         assert_eq!(completion("hello"), None);
         // A space means the command is already typed; no completion.
-        assert_eq!("/tools ".contains(' '), true);
+        assert!("/tools ".contains(' '));
     }
 
     #[test]

@@ -46,6 +46,7 @@ impl CheckpointStore {
     }
 
     /// Creates a checkpoint with the given label.
+    #[allow(clippy::expect_used)] // safe: we just pushed to the vec
     pub fn checkpoint(
         &mut self,
         label: &str,
@@ -64,7 +65,7 @@ impl CheckpointStore {
         if self.checkpoints.len() > self.max_checkpoints {
             self.checkpoints.remove(0);
         }
-        self.checkpoints.last().expect("just pushed")
+        self.checkpoints.last().expect("just pushed checkpoint")
     }
 
     /// Returns all checkpoints (newest last).
@@ -129,7 +130,10 @@ pub fn save_checkpoint(workspace: &Path, cp: &Checkpoint) -> Result<PathBuf> {
     };
     let json =
         serde_json::to_string_pretty(&data).context("failed to serialize checkpoint")?;
-    fs::write(&path, json)?;
+    // Atomic write to avoid corruption on crash.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &json)?;
+    fs::rename(&tmp, &path)?;
     Ok(path)
 }
 
@@ -145,7 +149,14 @@ pub fn load_checkpoints(workspace: &Path) -> Result<Vec<Checkpoint>> {
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .collect();
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(|e| {
+        e.file_name()
+            .to_string_lossy()
+            .strip_prefix("cp-")
+            .and_then(|s| s.strip_suffix(".json"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    });
     for entry in entries {
         let raw = fs::read_to_string(entry.path())?;
         if let Ok(data) = serde_json::from_str::<PersistedCheckpoint>(&raw) {
@@ -172,7 +183,14 @@ pub fn prune_checkpoints(workspace: &Path, keep: usize) -> Result<()> {
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .collect();
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(|e| {
+        e.file_name()
+            .to_string_lossy()
+            .strip_prefix("cp-")
+            .and_then(|s| s.strip_suffix(".json"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    });
     // Remove oldest (first) entries beyond `keep`.
     let to_remove = entries.len().saturating_sub(keep);
     for entry in entries.into_iter().take(to_remove) {
@@ -239,6 +257,35 @@ mod tests {
         let loaded = load_checkpoints(&dir).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].label, "second");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_sorts_numerically_not_lexically() {
+        // cp-10.json must sort after cp-2.json, not before
+        let dir = std::env::temp_dir().join("govinda-cp-sort");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Manually create checkpoint files with IDs that would sort
+        // incorrectly lexicographically (cp-10 < cp-2)
+        for id in [1, 2, 10, 3] {
+            let cp = Checkpoint {
+                id,
+                label: format!("cp-{id}"),
+                timestamp: format!("10:0{id}:00"),
+                messages: vec![],
+                message_count: 0,
+            };
+            save_checkpoint(&dir, &cp).unwrap();
+        }
+
+        // Keep only 2 — should remove the oldest (1 and 2), not 10
+        prune_checkpoints(&dir, 2).unwrap();
+        let loaded = load_checkpoints(&dir).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, 3);
+        assert_eq!(loaded[1].id, 10);
         let _ = fs::remove_dir_all(&dir);
     }
 }

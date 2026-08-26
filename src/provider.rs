@@ -1,11 +1,16 @@
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// Default context budget for token-aware trimming (`context_tokens` in TOML).
-pub const DEFAULT_CONTEXT_TOKENS: usize = 8192;
+/// Raised from 8192 → 128_000 so the CLI never under-utilizes large-context
+/// models (Gemini 1M, Claude 200k, OpenCode-routed 200k+, etc.) when no
+/// explicit `context_tokens` is set in `config.toml`. Users can still set
+/// a smaller value in TOML to force aggressive history trimming.
+pub const DEFAULT_CONTEXT_TOKENS: usize = 128_000;
 const MIN_CONTEXT_TOKENS: usize = 256;
-const MAX_CONTEXT_TOKENS: usize = 200_000;
+const MAX_CONTEXT_TOKENS: usize = 1_000_000;
 
 /// Clamps a user-supplied context budget into the sane range.
 pub fn clamp_context_tokens(raw: Option<usize>) -> usize {
@@ -45,7 +50,15 @@ impl Auth {
 /// streaming implementation serves Mistral, OpenAI, Ollama, LM Studio,
 /// vLLM and friends; only endpoints and auth differ.
 pub trait Provider: Send + Sync {
+    /// Static family id (`mistral`, `ollama`, `opencode`…). Dynamic
+    /// backends that need a per-instance identity override [`Provider::key`]
+    /// instead of widening this signature.
     fn id(&self) -> &'static str;
+    /// Stable unique key used for config persistence and display.
+    /// Defaults to `id()`; dynamic providers return e.g. `opencode-<pid>`.
+    fn key(&self) -> Cow<'static, str> {
+        Cow::Borrowed(self.id())
+    }
     fn chat_url(&self) -> String;
     /// The configured API root (for display and config persistence).
     fn base_url(&self) -> &str;
@@ -54,13 +67,20 @@ pub trait Provider: Send + Sync {
     fn auth(&self) -> Auth;
 }
 
-struct Preset {
-    id: &'static str,
-    base_url: &'static str,
-    api_key_env: Option<&'static str>,
+pub struct Preset {
+    pub id: &'static str,
+    pub base_url: &'static str,
+    pub api_key_env: Option<&'static str>,
 }
 
-const PRESETS: &[Preset] = &[
+pub const PRESETS: &[Preset] = &[
+    Preset {
+        id: "omniroute",
+        // Local AI gateway (`npm i -g omniroute`); keyless `auto` model
+        // works on a fresh install via pre-wired free providers.
+        base_url: "http://localhost:20128/v1",
+        api_key_env: None,
+    },
     Preset {
         id: "mistral",
         base_url: "https://api.mistral.ai/v1",
@@ -112,6 +132,11 @@ const PRESETS: &[Preset] = &[
         api_key_env: Some("BYTEZ_API_KEY"),
     },
     Preset {
+        id: "gemini",
+        base_url: "https://generativelanguage.googleapis.com/v1beta",
+        api_key_env: Some("GEMINI_API_KEY"),
+    },
+    Preset {
         id: "ollama",
         base_url: "http://localhost:11434/v1",
         api_key_env: None,
@@ -120,6 +145,172 @@ const PRESETS: &[Preset] = &[
 
 pub fn preset_names() -> impl Iterator<Item = &'static str> {
     PRESETS.iter().map(|p| p.id)
+}
+
+/// A known model with metadata. `context_window` is the model's actual
+/// input-token limit (from the provider's `/v1/models` or documented specs).
+/// When 0, no metadata is known and the CLI falls back to
+/// [`DEFAULT_CONTEXT_TOKENS`].
+pub struct KnownModel {
+    pub id: &'static str,
+    pub free: bool,
+    pub description: &'static str,
+    /// Model's true input context window in tokens. `0` = unknown.
+    pub context_window: usize,
+}
+
+/// Looks up the context window for a specific model on a given provider.
+/// Returns 0 when no metadata is available (caller should then use
+/// [`DEFAULT_CONTEXT_TOKENS`]).
+///
+/// Strips a leading `<vendor>/` prefix from the model name so callers can
+/// pass either `hy3-free` or `oc/hy3-free` interchangeably.
+pub fn context_window_for(provider: &str, model: &str) -> usize {
+    let bare = model.rsplit_once('/').map(|(_, tail)| tail).unwrap_or(model);
+    for km in known_models(provider) {
+        if km.id == model || km.id == bare {
+            return km.context_window;
+        }
+    }
+    0
+}
+
+/// Returns known models for a provider. Used as fallback when the API
+/// model-listing endpoint is unavailable, and to show free-tier tags.
+pub fn known_models(provider: &str) -> &'static [KnownModel] {
+    match provider {
+        "omniroute" => &[
+            KnownModel { id: "auto", free: true, description: "smart router across all connected providers", context_window: 1_048_576 },
+            KnownModel { id: "/coding", free: true, description: "coding-optimized combo", context_window: 1_048_576 },
+            KnownModel { id: "/fast", free: true, description: "speed-optimized combo", context_window: 1_048_576 },
+            KnownModel { id: "/cheap", free: true, description: "cost-optimized combo", context_window: 1_048_576 },
+            KnownModel { id: "/offline", free: true, description: "local-only combo", context_window: 32_768 },
+            KnownModel { id: "/smart", free: true, description: "quality-optimized combo", context_window: 1_048_576 },
+        ],
+        "mistral" => &[
+            KnownModel { id: "mistral-small-latest", free: true, description: "fast general (free tier)", context_window: 32_000 },
+            KnownModel { id: "mistral-medium-latest", free: false, description: "balanced quality", context_window: 128_000 },
+            KnownModel { id: "mistral-large-latest", free: false, description: "highest quality", context_window: 128_000 },
+            KnownModel { id: "codestral-latest", free: true, description: "code specialist (free tier)", context_window: 32_000 },
+            KnownModel { id: "open-mistral-nemo", free: true, description: "open model (free tier)", context_window: 128_000 },
+            KnownModel { id: "open-codestral-mamba", free: true, description: "code Mamba (free tier)", context_window: 256_000 },
+            KnownModel { id: "mistral-tiny-latest", free: true, description: "tiny/fast (free tier)", context_window: 32_000 },
+        ],
+        "openai" => &[
+            KnownModel { id: "gpt-4o-mini", free: false, description: "fast & cheap", context_window: 128_000 },
+            KnownModel { id: "gpt-4o", free: false, description: "flagship model", context_window: 128_000 },
+            KnownModel { id: "gpt-3.5-turbo", free: false, description: "legacy fast", context_window: 16_385 },
+            KnownModel { id: "o1-mini", free: false, description: "reasoning (small)", context_window: 128_000 },
+            KnownModel { id: "o1-preview", free: false, description: "reasoning (full)", context_window: 128_000 },
+        ],
+        "openrouter" => &[
+            KnownModel { id: "mistralai/mistral-7b-instruct:free", free: true, description: "Mistral 7B (free)", context_window: 32_000 },
+            KnownModel { id: "meta-llama/llama-3.1-8b-instruct:free", free: true, description: "Llama 3.1 8B (free)", context_window: 131_000 },
+            KnownModel { id: "meta-llama/llama-3.1-70b-instruct:free", free: true, description: "Llama 3.1 70B (free)", context_window: 131_000 },
+            KnownModel { id: "google/gemma-2-9b-it:free", free: true, description: "Gemma 2 9B (free)", context_window: 8_192 },
+            KnownModel { id: "qwen/qwen-2-7b-instruct:free", free: true, description: "Qwen 2 7B (free)", context_window: 32_000 },
+            KnownModel { id: "huggingfaceh4/zephyr-7b-beta:free", free: true, description: "Zephyr 7B (free)", context_window: 32_000 },
+            KnownModel { id: "openchat/openchat-7b:free", free: true, description: "OpenChat 7B (free)", context_window: 8_192 },
+            KnownModel { id: "gryphe/mythomist-7b:free", free: true, description: "Mythomist 7B (free)", context_window: 32_000 },
+            KnownModel { id: "nousresearch/hermes-3-llama-3.1-405b:free", free: true, description: "Hermes 3 405B (free)", context_window: 131_000 },
+            KnownModel { id: "mistralai/mixtral-8x7b-instruct", free: false, description: "Mixtral 8x7B", context_window: 32_000 },
+            KnownModel { id: "meta-llama/llama-3.1-405b-instruct", free: false, description: "Llama 3.1 405B", context_window: 131_000 },
+            KnownModel { id: "meta-llama/llama-3.1-70b-instruct", free: false, description: "Llama 3.1 70B", context_window: 131_000 },
+            KnownModel { id: "anthropic/claude-3.5-sonnet", free: false, description: "Claude 3.5 Sonnet", context_window: 200_000 },
+            KnownModel { id: "anthropic/claude-3.5-sonnet:beta", free: false, description: "Claude 3.5 Sonnet (beta)", context_window: 200_000 },
+            KnownModel { id: "openai/gpt-4o-mini", free: false, description: "GPT-4o Mini", context_window: 128_000 },
+            KnownModel { id: "openai/gpt-4o", free: false, description: "GPT-4o", context_window: 128_000 },
+            KnownModel { id: "google/gemini-pro-1.5", free: false, description: "Gemini Pro 1.5", context_window: 1_000_000 },
+            KnownModel { id: "deepseek/deepseek-chat", free: false, description: "DeepSeek Chat", context_window: 64_000 },
+        ],
+        "kimi" => &[
+            KnownModel { id: "moonshot-v1-8k", free: false, description: "8k context", context_window: 8_192 },
+            KnownModel { id: "moonshot-v1-32k", free: false, description: "32k context", context_window: 32_000 },
+            KnownModel { id: "moonshot-v1-128k", free: false, description: "128k context", context_window: 128_000 },
+        ],
+        "groq" => &[
+            KnownModel { id: "llama-3.3-70b-versatile", free: true, description: "Llama 3.3 70B (free tier)", context_window: 131_000 },
+            KnownModel { id: "llama-3.1-8b-instant", free: true, description: "Llama 3.1 8B fast (free tier)", context_window: 131_000 },
+            KnownModel { id: "llama3-70b-8192", free: true, description: "Llama 3 70B (free tier)", context_window: 8_192 },
+            KnownModel { id: "llama3-8b-8192", free: true, description: "Llama 3 8B (free tier)", context_window: 8_192 },
+            KnownModel { id: "gemma2-9b-it", free: true, description: "Gemma 2 9B (free tier)", context_window: 8_192 },
+            KnownModel { id: "mixtral-8x7b-32768", free: true, description: "Mixtral 8x7B (free tier)", context_window: 32_768 },
+            KnownModel { id: "gemma-7b-it", free: true, description: "Gemma 7B (free tier)", context_window: 8_192 },
+        ],
+        "ollama" => &[
+            KnownModel { id: "llama3.1", free: true, description: "Llama 3.1 (local)", context_window: 128_000 },
+            KnownModel { id: "llama3.2", free: true, description: "Llama 3.2 (local)", context_window: 128_000 },
+            KnownModel { id: "codellama", free: true, description: "Code Llama (local)", context_window: 16_000 },
+            KnownModel { id: "mistral", free: true, description: "Mistral (local)", context_window: 32_000 },
+            KnownModel { id: "mixtral", free: true, description: "Mixtral (local)", context_window: 32_000 },
+            KnownModel { id: "phi3", free: true, description: "Phi-3 (local)", context_window: 128_000 },
+            KnownModel { id: "gemma2", free: true, description: "Gemma 2 (local)", context_window: 8_192 },
+            KnownModel { id: "qwen2.5", free: true, description: "Qwen 2.5 (local)", context_window: 128_000 },
+            KnownModel { id: "deepseek-coder-v2", free: true, description: "DeepSeek Coder V2 (local)", context_window: 128_000 },
+            KnownModel { id: "command-r", free: true, description: "Command R (local)", context_window: 128_000 },
+            KnownModel { id: "vicuna", free: true, description: "Vicuna (local)", context_window: 4_096 },
+            KnownModel { id: "neural-chat", free: true, description: "Neural Chat (local)", context_window: 4_096 },
+        ],
+        "deepseek" => &[
+            KnownModel { id: "deepseek-chat", free: true, description: "DeepSeek Chat (free tier)", context_window: 64_000 },
+            KnownModel { id: "deepseek-reasoner", free: true, description: "DeepSeek Reasoner/R1 (free tier)", context_window: 64_000 },
+            KnownModel { id: "deepseek-coder", free: true, description: "DeepSeek Coder (free tier)", context_window: 64_000 },
+        ],
+        "nvidia" => &[
+            KnownModel { id: "nvidia/llama-3.1-nemotron-70b-instruct", free: true, description: "Nemotron 70B (free tier)", context_window: 131_000 },
+            KnownModel { id: "meta/llama-3.1-405b-instruct", free: true, description: "Llama 3.1 405B (free tier)", context_window: 131_000 },
+            KnownModel { id: "meta/llama-3.1-70b-instruct", free: true, description: "Llama 3.1 70B (free tier)", context_window: 131_000 },
+            KnownModel { id: "meta/llama-3.1-8b-instruct", free: true, description: "Llama 3.1 8B (free tier)", context_window: 131_000 },
+            KnownModel { id: "mistralai/mistral-large-instruct", free: true, description: "Mistral Large (free tier)", context_window: 32_000 },
+            KnownModel { id: "mistralai/mixtral-8x7b-instruct", free: true, description: "Mixtral 8x7B (free tier)", context_window: 32_000 },
+            KnownModel { id: "google/gemma-2-27b-it", free: true, description: "Gemma 2 27B (free tier)", context_window: 8_192 },
+            KnownModel { id: "google/gemma-2-9b-it", free: true, description: "Gemma 2 9B (free tier)", context_window: 8_192 },
+            KnownModel { id: "ai21/jamba-1-5-large", free: true, description: "Jamba 1.5 Large (free tier)", context_window: 256_000 },
+            KnownModel { id: "snowflake/snowflake-arctic-instruct", free: true, description: "Arctic Instruct (free tier)", context_window: 4_096 },
+        ],
+        "bytez" => &[
+            KnownModel { id: "bytez-auto", free: true, description: "auto-select (free tier)", context_window: 0 },
+            KnownModel { id: "meta-llama/Llama-3.3-70B-Instruct-Turbo", free: true, description: "Llama 3.3 70B Turbo (free tier)", context_window: 131_000 },
+            KnownModel { id: "meta-llama/Llama-3.1-70B-Instruct", free: true, description: "Llama 3.1 70B (free tier)", context_window: 131_000 },
+            KnownModel { id: "meta-llama/Llama-3.1-8B-Instruct", free: true, description: "Llama 3.1 8B (free tier)", context_window: 131_000 },
+            KnownModel { id: "mistralai/Mistral-7B-Instruct-v0.3", free: true, description: "Mistral 7B v0.3 (free tier)", context_window: 32_000 },
+            KnownModel { id: "google/gemma-2-9b-it", free: true, description: "Gemma 2 9B (free tier)", context_window: 8_192 },
+        ],
+        "gemini" => &[
+            KnownModel { id: "gemini-2.0-flash-exp", free: true, description: "Gemini 2.0 Flash Experimental (free tier)", context_window: 1_000_000 },
+            KnownModel { id: "gemini-1.5-flash", free: true, description: "Gemini 1.5 Flash (free tier)", context_window: 1_000_000 },
+            KnownModel { id: "gemini-1.5-flash-8b", free: true, description: "Gemini 1.5 Flash 8B (free tier)", context_window: 1_000_000 },
+            KnownModel { id: "gemini-1.5-pro", free: true, description: "Gemini 1.5 Pro (free tier)", context_window: 1_000_000 },
+            KnownModel { id: "gemini-1.0-pro", free: true, description: "Gemini 1.0 Pro (free tier)", context_window: 32_000 },
+        ],
+        "glm" => &[
+            KnownModel { id: "glm-4-flash", free: true, description: "GLM-4 Flash (free tier)", context_window: 128_000 },
+            KnownModel { id: "glm-4-air", free: false, description: "GLM-4 Air", context_window: 128_000 },
+            KnownModel { id: "glm-4-airx", free: false, description: "GLM-4 AirX", context_window: 8_192 },
+            KnownModel { id: "glm-4-long", free: false, description: "GLM-4 Long (128k)", context_window: 1_000_000 },
+            KnownModel { id: "glm-4-plus", free: false, description: "GLM-4 Plus", context_window: 128_000 },
+            KnownModel { id: "codegeex-4", free: true, description: "CodeGeeX 4 (free tier)", context_window: 128_000 },
+        ],
+        "minimax" => &[
+            KnownModel { id: "MiniMax-Text-01", free: false, description: "MiniMax Text 01", context_window: 1_000_000 },
+            KnownModel { id: "abab6.5s-chat", free: false, description: "Abab 6.5S Chat", context_window: 32_000 },
+            KnownModel { id: "abab5.5-chat", free: false, description: "Abab 5.5 Chat", context_window: 16_000 },
+        ],
+        // OpenCode-routed models. Context windows match the
+        // `oc/*` entries returned by OmniRoute's `/v1/models` (and OpenCode's
+        // own Zen service). All 200k+ for the "h3" family / "hy3-free" /
+        // big-pickle / nemotron / north / gemma4 31B; 1M for the free
+        // mimo-v2.5 and deepseek-v4-flash-free variants.
+        "opencode" => &[
+            KnownModel { id: "big-pickle", free: true, description: "Big Pickle (200k)", context_window: 200_000 },
+            KnownModel { id: "hy3-free", free: true, description: "hy3-free (200k)", context_window: 200_000 },
+            KnownModel { id: "deepseek-v4-flash-free", free: true, description: "DeepSeek V4 Flash Free (1M)", context_window: 1_000_000 },
+            KnownModel { id: "mimo-v2.5-free", free: true, description: "mimo-v2.5-free (1M)", context_window: 1_048_576 },
+            KnownModel { id: "nemotron-3-ultra-free", free: true, description: "nemotron-3-ultra-free (200k)", context_window: 200_000 },
+            KnownModel { id: "north-mini-code-free", free: true, description: "north-mini-code-free (200k)", context_window: 200_000 },
+        ],
+        _ => &[],
+    }
 }
 
 /// A resolved provider: preset (or custom `base_url`) + optional key.
@@ -206,6 +397,64 @@ pub fn resolve(
     }))
 }
 
+/// Live-fetch the `context_length` (or `max_input_tokens`) of a model from
+/// the provider's `/v1/models` endpoint. Returns the detected window, or
+/// `0` if the request fails / the model is not listed.
+///
+/// This is the authoritative source: the static `known_models()` table is a
+/// fallback for offline / keyless scenarios. The OpenAI-compatible spec
+/// allows each entry to carry `context_length`, `max_input_tokens`, or
+/// `max_tokens`; we accept any of them.
+pub async fn fetch_model_context(
+    http: &reqwest::Client,
+    provider: &dyn Provider,
+    model: &str,
+) -> usize {
+    let Some(url) = provider.models_url() else { return 0 };
+    let token = match provider.auth() {
+        Auth::Bearer(t) => Some(t.as_str().to_owned()),
+        Auth::None => None,
+    };
+    let mut req = http.get(&url);
+    if let Some(tok) = token {
+        req = req.bearer_auth(tok);
+    }
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        req.send(),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        _ => return 0,
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let entries = body.get("data").and_then(|d| d.as_array());
+    let Some(arr) = entries else { return 0 };
+    let bare = model.rsplit_once('/').map(|(_, tail)| tail).unwrap_or(model);
+    for entry in arr {
+        let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id == model || id == bare {
+            // OpenAI-compat spec: prefer `context_length`, then
+            // `max_input_tokens`, then `max_tokens`. Some providers
+            // (e.g. Ollama) use `context_length` only.
+            let n = entry
+                .get("context_length")
+                .and_then(|v| v.as_u64())
+                .or_else(|| entry.get("max_input_tokens").and_then(|v| v.as_u64()))
+                .or_else(|| entry.get("max_tokens").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
+            if n > 0 {
+                return n as usize;
+            }
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +510,24 @@ mod tests {
     #[test]
     fn unknown_name_without_base_url_fails() {
         assert!(resolve("wat", None, None, lookup).is_err());
+    }
+
+    #[test]
+    fn context_window_lookup_returns_registered_value() {
+        assert_eq!(context_window_for("opencode", "hy3-free"), 200_000);
+        assert_eq!(context_window_for("opencode", "mimo-v2.5-free"), 1_048_576);
+        assert_eq!(context_window_for("opencode", "oc/hy3-free"), 200_000);
+        assert_eq!(context_window_for("openai", "gpt-4o"), 128_000);
+        assert_eq!(context_window_for("gemini", "gemini-1.5-pro"), 1_000_000);
+        assert_eq!(context_window_for("groq", "llama3-8b-8192"), 8_192);
+        assert_eq!(context_window_for("ollama", "llama3.1"), 128_000);
+        assert_eq!(context_window_for("nope", "whatever"), 0);
+    }
+
+    #[test]
+    fn context_window_for_handles_slash_prefixed_model() {
+        // Users type "oc/hy3-free" but the registry stores "hy3-free".
+        // The lookup must still resolve it.
+        assert_eq!(context_window_for("opencode", "oc/hy3-free"), 200_000);
     }
 }

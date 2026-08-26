@@ -42,6 +42,12 @@ pub struct DiffState {
     pub scroll_offset: usize,
 }
 
+impl Default for DiffState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiffState {
     pub fn new() -> Self {
         Self {

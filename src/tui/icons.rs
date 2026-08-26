@@ -38,12 +38,21 @@ pub const LIVE: &str = "\u{f012}"; // signal
 pub const USER: &str = "\u{f007}"; // user
 pub const ASSISTANT: &str = "\u{f0d0}"; // magic wand (sparkles)
 pub const THINKING: &str = "\u{f1ce}"; // circle-o-notch
+pub const CODE_BLOCK: &str = "\u{f121}"; // code
+pub const TABLE: &str = "\u{f0ce}"; // table
+pub const LIST: &str = "\u{f0ca}"; // list
+pub const QUOTE: &str = "\u{f10d}"; // quote-left
+pub const TIP: &str = "\u{f0eb}"; // lightbulb
+pub const SEARCH: &str = "\u{f002}"; // search
+pub const LINK: &str = "\u{f0c1}"; // link
 
 // ── Tool status ─────────────────────────────────────────────────────────────
 pub const CHECK: &str = "\u{f00c}";
 pub const CROSS: &str = "\u{f00d}";
 pub const PENDING: &str = "\u{f252}"; // hourglass-half
 pub const LOCKED: &str = "\u{f023}"; // lock
+
+pub const CHAT: &str = "\u{f086}"; // comments
 
 // ── Panes / chrome ──────────────────────────────────────────────────────────
 pub const FOLDER: &str = "\u{f07b}";
@@ -125,8 +134,12 @@ pub fn command(cmd: &str) -> &'static str {
         "/pr" => "\u{f126}",        // code-fork
         "/pty" => "\u{f120}",       // terminal
         "/auto-compact" => "\u{f0e7}", // bolt
+        "/apikey" => "\u{f023}", // lock
+        "/setup" => "\u{f013}", // gear
         "/pin" => PINNED,
         "/agent" => MODE_AGENT,
+        "/provider" => "\u{f013}", // gear
+        "/test" => "\u{f00c}", // check
         _ => INFO,
     }
 }

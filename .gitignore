@@ -1,6 +1,9 @@
 /target
 .env
 sessions/
+.govinda/
 .govinda_history
 .govinda_todo.json
 .govinda_tools.json
+.freebuff/
+test_provider_workflow.md

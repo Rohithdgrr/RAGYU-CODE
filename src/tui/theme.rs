@@ -54,6 +54,7 @@ pub struct Theme {
     pub syntax_comment: Color,
     pub syntax_function: Color,
     pub syntax_type: Color,
+    pub syntax_number: Color,
 }
 
 impl Theme {
@@ -119,7 +120,7 @@ pub const LIGHT_THEME: Theme = glass_light("light", GLASS_BLUE, VIOLET, MINT, AM
 /// "Midnight Glass" — deep navy layers with neon edge-lighting.
 pub const DARK_THEME: Theme = glass_dark("dark", NEON_BLUE, VIOLET, MINT, AMBER, CORAL);
 
-static ACTIVE: RwLock<Theme> = RwLock::new(DARK_THEME);
+static ACTIVE: RwLock<Theme> = RwLock::new(LIGHT_THEME);
 const GLASS_BLUE: Color = Color::Rgb(63, 118, 227);
 const NEON_BLUE: Color = Color::Rgb(88, 148, 255);
 const VIOLET: Color = Color::Rgb(124, 92, 255);
@@ -127,6 +128,8 @@ const MINT: Color = Color::Rgb(52, 211, 153);
 const AMBER: Color = Color::Rgb(251, 191, 36);
 const CORAL: Color = Color::Rgb(248, 113, 113);
 const ROSE: Color = Color::Rgb(232, 74, 74);
+const LAVENDER: Color = Color::Rgb(167, 139, 250);
+const PINK: Color = Color::Rgb(244, 114, 182);
 
 /// Builds a light glass palette: shared misty surfaces + accent set.
 const fn glass_light(
@@ -159,6 +162,7 @@ const fn glass_light(
         syntax_comment: Color::Rgb(96, 132, 100),
         syntax_function: Color::Rgb(122, 82, 178),
         syntax_type: Color::Rgb(20, 108, 180),
+        syntax_number: Color::Rgb(180, 80, 80),
     }
 }
 
@@ -193,6 +197,7 @@ const fn glass_dark(
         syntax_comment: Color::Rgb(120, 168, 120),
         syntax_function: Color::Rgb(196, 181, 253),
         syntax_type: Color::Rgb(103, 202, 255),
+        syntax_number: Color::Rgb(255, 199, 116),
     }
 }
 
@@ -249,9 +254,50 @@ pub fn set(theme: Theme) {
     }
 }
 
+/// Remaps the accent colors of the current theme to match a provider.
+/// Called live when the user switches providers via `/provider`.
+pub fn apply_provider_accent(provider: &str) {
+    let accent = match provider {
+        "omniroute" => Color::Rgb(124, 58, 237),
+        "mistral" => Color::Rgb(63, 118, 227),
+        "openai" => Color::Rgb(16, 163, 127),
+        "kimi" => Color::Rgb(124, 92, 255),
+        "groq" => Color::Rgb(249, 115, 22),
+        "ollama" => Color::Rgb(107, 114, 128),
+        "deepseek" => Color::Rgb(14, 165, 233),
+        "nvidia" => Color::Rgb(118, 185, 0),
+        "bytez" => Color::Rgb(225, 29, 72),
+        "gemini" => Color::Rgb(66, 133, 244),
+        "glm" => LAVENDER,
+        "minimax" => PINK,
+        _ => Color::Rgb(63, 118, 227), // fallback to cobalt
+    };
+    let accent2 = match provider {
+        "omniroute" => Color::Rgb(167, 139, 250),
+        "mistral" => Color::Rgb(88, 148, 255),
+        "openai" => Color::Rgb(52, 211, 153),
+        "kimi" => Color::Rgb(167, 139, 250),
+        "groq" => Color::Rgb(251, 191, 36),
+        "ollama" => Color::Rgb(156, 163, 175),
+        "deepseek" => Color::Rgb(56, 189, 248),
+        "nvidia" => Color::Rgb(163, 230, 53),
+        "bytez" => Color::Rgb(251, 113, 133),
+        "gemini" => Color::Rgb(66, 133, 244),
+        "glm" => Color::Rgb(167, 139, 250),
+        "minimax" => Color::Rgb(244, 114, 182),
+        _ => Color::Rgb(88, 148, 255),
+    };
+    if let Ok(mut slot) = ACTIVE.write() {
+        slot.accent_primary = accent;
+        slot.accent_secondary = accent2;
+        slot.border_focus = accent;
+    }
+}
+
 /// Flips between the light and dark glass bases and returns the now-active
 /// theme. Named palettes are preserved as targets: `mono` represents the
 /// light base, `default` the dark one.
+#[allow(clippy::expect_used)] // safe: "default" and "mono" are always in NAMED_THEMES
 pub fn toggle() -> Theme {
     let next = if active().bg_primary == LIGHT_THEME.bg_primary {
         *NAMED_THEMES.iter().find(|t| t.name == "default").expect("default theme exists")
