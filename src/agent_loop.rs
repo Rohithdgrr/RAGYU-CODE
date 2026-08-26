@@ -21,6 +21,14 @@ use crate::commands::App;
 pub const MAX_TOOL_ROUNDS: usize = 5;
 /// Extra rounds granted after a failed tool round (self-correction loop).
 pub const MAX_FIX_ROUNDS: usize = 3;
+/// Upper bound when the GOVINDA protocol is enforcing. The master prompt
+/// demands 10k+ lines of production output, so the default 5-round cap
+/// would strangle the model — bump it to 50.
+pub const MAX_TOOL_ROUNDS_ENFORCED: usize = 50;
+/// Extra fix rounds granted when the protocol is enforcing. The default
+/// 3 isn't enough when every file needs tests, docs, and a design-system
+/// audit.
+pub const MAX_FIX_ROUNDS_ENFORCED: usize = 6;
 /// Cap applied *before* a tool result enters the session history.
 pub const MAX_TOOL_RESULT_CHARS: usize = 8 * 1024;
 /// Characters of a tool result shown on screen.
@@ -136,14 +144,41 @@ pub async fn run_turn(
     input: &str,
 ) -> anyhow::Result<TurnResult> {
     let started = Instant::now();
-    app.session.push_user(input);
+    // GOVINDA protocol: prepend any pending per-turn header (set by
+    // /plan) to the user message so the model sees the reminder even
+    // when enforcement_mode is off. The header is consumed once.
+    let effective_input;
+    let input_ref: &str = if let Some(header) = app.pending_protocol_header.take() {
+        effective_input = format!("{header}\n\n---\n\n{input}");
+        &effective_input
+    } else {
+        input
+    };
+    app.session.push_user(input_ref);
     app.last_turn_had_failure = false;
+
+    // Protocol-driven round caps: when enforcement is on, allow the model
+    // enough rounds to actually reach the 10k-line target the master
+    // prompt requires. Without this, the loop would short-circuit long
+    // before the model could finish.
+    let protocol_on = app.config.protocol.enforcement_mode;
+    let max_rounds = if protocol_on {
+        MAX_TOOL_ROUNDS_ENFORCED
+    } else {
+        MAX_TOOL_ROUNDS
+    };
+    let max_fixes = if protocol_on {
+        MAX_FIX_ROUNDS_ENFORCED
+    } else {
+        MAX_FIX_ROUNDS
+    };
 
     // Per-turn router: 3 strikes on the active model promote to the
     // next non-quarantined entry. State is local to the turn — the
     // pre-flight probe is the cross-turn check.
+    let provider_key = app.config.provider.key();
     let mut router = crate::router::Router::for_active(
-        app.config.provider.key().as_ref(),
+        provider_key.as_ref(),
         &app.config.model,
     );
     if !app.router_failover {
@@ -178,10 +213,10 @@ pub async fn run_turn(
 
     loop {
         round_no += 1;
-        if round_no > MAX_TOOL_ROUNDS + fixes_granted {
+        if round_no > max_rounds + fixes_granted {
             ui.notice(&format!(
                 "stopped after {} tool rounds{} — ask again to continue.",
-                MAX_TOOL_ROUNDS + fixes_granted,
+                max_rounds + fixes_granted,
                 if fixes_granted > 0 {
                     format!(" (+{fixes_granted} self-correction)")
                 } else {
@@ -235,19 +270,65 @@ pub async fn run_turn(
         match result {
             Ok(()) if !tool_calls.is_empty() && app.tools_enabled => {
                 show_prose(ui, &out);
+                // GOVINDA protocol: track the current phase from the
+                // model's [Phase N] markers so we can spot the assistant
+                // prematurely claiming completion.
+                if let Some(phase) = crate::govinda_protocol::detect_phase(&out) {
+                    app.current_phase = Some(phase);
+                }
                 let had_failure = run_tool_round(app, ui, gate, &out, &tool_calls).await;
                 if had_failure {
                     app.last_turn_had_failure = true;
                 }
-                if had_failure && fixes_granted < MAX_FIX_ROUNDS {
+                if had_failure && fixes_granted < max_fixes {
                     fixes_granted += 1;
                     ui.notice(&format!(
-                        "↻ failure detected — granting self-correction round ({fixes_granted}/{MAX_FIX_ROUNDS} max)"
+                        "↻ failure detected — granting self-correction round ({fixes_granted}/{max_fixes} max)"
                     ));
                 }
                 continue; // stream again so the model sees the results
             }
             Ok(()) => {
+                // GOVINDA protocol: if the model claims completion without
+                // reaching FINAL_VALIDATION, push back and grant a fix
+                // round. This is the "self-correction pressure" the
+                // master prompt demands. Only active in enforcement mode
+                // so plain chat is unaffected.
+                if protocol_on
+                    && app.config.protocol.require_quality_gates
+                    && app.current_phase
+                        != Some(crate::govinda_protocol::ProjectPhase::FinalValidation)
+                    && crate::govinda_protocol::looks_like_premature_completion(&out)
+                {
+                    if fixes_granted < max_fixes {
+                        fixes_granted += 1;
+                        let phase_str = app
+                            .current_phase
+                            .map(|p| p.as_str())
+                            .unwrap_or("INSTRUCTION_INGESTION");
+                        ui.notice(&format!(
+                            "GOVINDA PROTOCOL: premature completion detected (phase={phase_str}). \
+                             Granting self-correction round {fixes_granted}/{max_fixes}. \
+                             Continue with the next phase and call quality_gate_check before \
+                             claiming completion."
+                        ));
+                        // Inject the pressure as an extra user turn so
+                        // the model sees it in the next stream.
+                        app.session.push_user(
+                            "[GOVINDA PROTOCOL] You have NOT completed the protocol. \
+                             Current phase is not FINAL_VALIDATION and the quality_gate_check \
+                             tool has not been satisfied. Continue the work — emit your next \
+                             [Phase N] marker, then either keep implementing or call \
+                             quality_gate_check with phase=FINAL_VALIDATION.",
+                        );
+                        continue;
+                    } else {
+                        ui.notice(
+                            "GOVINDA PROTOCOL: self-correction budget exhausted; \
+                             accepting the current answer.",
+                        );
+                    }
+                }
                 finish_answer(app, ui, out);
                 ui.timeline(app.config.model.as_str(), started.elapsed());
                 app.record_turn(started.elapsed());

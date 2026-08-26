@@ -47,7 +47,8 @@ static STATE: std::sync::Mutex<State> = std::sync::Mutex::new(State {
 /// model pair, falling back to the configured `context_tokens` when
 /// the registry returns 0.
 pub fn context_window_for(app: &App) -> usize {
-    let provider_id: &str = app.config.provider.key().as_ref();
+    let provider_key = app.config.provider.key();
+    let provider_id: &str = provider_key.as_ref();
     let model: &str = app.config.model.as_str();
     let from_registry = provider::context_window_for(provider_id, model);
     if from_registry == 0 {

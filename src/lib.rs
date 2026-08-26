@@ -16,6 +16,7 @@ pub mod config;
 pub mod context;
 pub mod diff;
 pub mod git;
+pub mod govinda_protocol;
 pub mod hooks;
 pub mod ignore;
 pub mod lsp;

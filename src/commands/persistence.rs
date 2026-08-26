@@ -98,6 +98,7 @@ pub(super) fn load_session(arg: &str, app: &mut App) -> bool {
 }
 
 /// Lists saved sessions, newest first, marking the one currently in use.
+#[allow(dead_code)]
 pub(super) fn list_named_sessions(app: &App) {
     let entries = sessions::list();
     if entries.is_empty() {
@@ -118,6 +119,7 @@ pub(super) fn list_named_sessions(app: &App) {
 }
 
 /// Saves a snapshot of the current conversation without touching the live one.
+#[allow(dead_code)]
 pub(super) fn fork_session(arg: &str, app: &mut App) {
     let path = match arg.is_empty() {
         true => PathBuf::from(format!(
@@ -143,6 +145,7 @@ pub(super) fn fork_session(arg: &str, app: &mut App) {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn export(arg: &str, app: &App) {
     let (fmt, file) = match arg.split_once(char::is_whitespace) {
         Some((f, r)) => (f.to_ascii_lowercase(), Some(r.trim().to_owned())),
@@ -179,6 +182,7 @@ pub(super) fn export(arg: &str, app: &App) {
     }
 }
 
+#[allow(dead_code)]
 fn export_markdown(app: &App) -> String {
     let mut out = format!("# Conversation ({})\n\n", clock::now_iso8601());
     out.push_str(&format!(
@@ -214,6 +218,7 @@ fn export_markdown(app: &App) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn export_text(app: &App) -> String {
     let mut out = String::new();
     for m in app.session.messages() {

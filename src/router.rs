@@ -244,8 +244,9 @@ mod tests {
     #[test]
     fn promote_returns_none_when_all_quarantined() {
         let mut r = fixture();
-        for entry in r.iter() {
-            r.record_failure(&entry.model, FailureKind::Server, "x");
+        let models: Vec<String> = r.iter().map(|e| e.model.clone()).collect();
+        for model in &models {
+            r.record_failure(model, FailureKind::Server, "x");
         }
         assert!(r.promote().is_none());
     }

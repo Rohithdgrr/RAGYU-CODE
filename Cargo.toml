@@ -15,6 +15,7 @@ regex = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 termimad = "0.35.2"
 tiktoken-rs = { version = "0.12.0", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "process", "net", "io-util"] }

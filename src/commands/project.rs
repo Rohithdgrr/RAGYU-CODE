@@ -9,6 +9,7 @@ use super::{dim, err, info, ok};
 ///   set test <cmd…>    store the preferred test command
 ///   set build <cmd…>   store the preferred build/check command
 ///   clear test|build   remove a stored command
+#[allow(dead_code)]
 pub(super) fn handle(rest: &str) {
     let rest = rest.trim();
     let mut words = rest.split_whitespace();
@@ -35,6 +36,7 @@ pub(super) fn handle(rest: &str) {
     }
 }
 
+#[allow(dead_code)]
 fn show() {
     let mem = crate::project::load();
     info("project memory (.govinda_project.json)");
@@ -46,6 +48,7 @@ fn show() {
     print_slot("build", mem.build_command.as_deref());
 }
 
+#[allow(dead_code)]
 fn print_slot(name: &str, value: Option<&str>) {
     match value {
         Some(cmd) => ok(format!("{name} command: {cmd}")),
@@ -53,6 +56,7 @@ fn print_slot(name: &str, value: Option<&str>) {
     }
 }
 
+#[allow(dead_code)]
 fn set_command(slot: &str, command: String) {
     if command.trim().is_empty() {
         err("command must not be empty");
@@ -74,6 +78,7 @@ fn set_command(slot: &str, command: String) {
     }
 }
 
+#[allow(dead_code)]
 fn clear_command(slot: &str) {
     let mut mem = crate::project::load();
     match slot {

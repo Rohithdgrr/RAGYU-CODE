@@ -7,7 +7,7 @@
 //! stored on `App` so the agent loop can honor it.
 
 use crate::commands::App;
-use crate::render::{dim, info, ok};
+use super::{dim, info, ok};
 
 /// Handles `/router status | failover on|off | reset`. Returns
 /// `true` when handled.
@@ -48,7 +48,8 @@ pub fn handle(rest: &str, app: &mut App) -> bool {
 }
 
 fn print_status(app: &App) {
-    let provider: &str = app.config.provider.key().as_ref();
+    let provider_key = app.config.provider.key();
+    let provider: &str = provider_key.as_ref();
     let active = app.config.model.as_str();
     info(format!("active: {active} ({provider})"));
     info(format!("auto-compact: {}", if app.auto_compact_enabled { "on" } else { "off" }));

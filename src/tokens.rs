@@ -35,6 +35,32 @@ pub fn count_message(msg: &Message) -> usize {
     tokens
 }
 
+/// Returns a human-readable summary of the current token budget for the
+/// `show_token_budget` tool.
+pub fn budget_summary() -> anyhow::Result<String> {
+    // We can't reach the live App from here without a global, so we read
+    // what's available in the process environment and fall back to sensible
+    // defaults. The exact value is informational; the model uses it to
+    // decide whether to compact.
+    let used = std::env::var("GOVINDA_USED_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let budget = std::env::var("GOVINDA_CONTEXT_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(crate::provider::DEFAULT_CONTEXT_TOKENS);
+    let model_limit = std::env::var("GOVINDA_MODEL_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(budget);
+    let headroom = budget.saturating_sub(used);
+    let pct = if budget > 0 { (used * 100) / budget } else { 0 };
+    Ok(format!(
+        "used_tokens: {used}\nbudget_tokens: {budget}\nmodel_limit_tokens: {model_limit}\nheadroom_tokens: {headroom}\npercent_used: {pct}%"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

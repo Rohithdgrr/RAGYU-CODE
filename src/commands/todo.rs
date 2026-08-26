@@ -1,9 +1,17 @@
 //! `/todo` — a small persistent task list shared by the REPL and TUI.
+//!
+//! Storage: `.govinda/todos.json` under the project root (the cwd at the
+//! time the list is first created). Storing under `.govinda/` keeps the
+//! state inside the project, so opening a different project loads a
+//! different list — instead of a single global file that would appear to
+//! "reset" (look empty) when switching folders.
 
 use super::{App, dim, err, info, ok};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-const TODO_FILE: &str = ".govinda_todo.json";
+const TODO_DIR: &str = ".govinda";
+const TODO_FILE: &str = "todos.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Todo {
@@ -11,15 +19,18 @@ pub struct Todo {
     pub done: bool,
 }
 
-fn todo_path() -> std::path::PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(TODO_FILE)
+fn todo_path() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    cwd.join(TODO_DIR).join(TODO_FILE)
 }
 
 /// Loads the persisted list; a missing or unreadable file means "empty".
 pub fn load() -> Vec<Todo> {
-    std::fs::read_to_string(todo_path())
+    let path = todo_path();
+    if !path.exists() {
+        return Vec::new();
+    }
+    std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
@@ -31,6 +42,9 @@ pub(super) fn save(app: &App) {
         return;
     };
     let path = todo_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, &json) {
         err(format!("could not save todos: {e}"));
@@ -39,6 +53,12 @@ pub(super) fn save(app: &App) {
     if let Err(e) = std::fs::rename(&tmp, &path) {
         err(format!("could not save todos: {e}"));
     }
+}
+
+/// Returns the on-disk path of the current todo list. Useful for the model
+/// tool so it can tell the user where the file lives.
+pub fn current_path() -> PathBuf {
+    todo_path()
 }
 
 /// Entry point for `/todo [subcommand]`.

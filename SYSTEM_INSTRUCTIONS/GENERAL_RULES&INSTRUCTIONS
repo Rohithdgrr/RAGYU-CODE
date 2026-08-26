@@ -1,0 +1,420 @@
+# GOVINDA CLI — UNIVERSAL PROJECT INSTRUCTIONS
+# Version: 1.0
+# Purpose: When a user submits ANY build request, read these instructions FIRST.
+#          Do NOT generate code until every section below is satisfied.
+
+================================================================================
+SECTION 0: PROJECT DISCOVERY PROTOCOL
+================================================================================
+BEFORE writing any code, you MUST perform this analysis:
+
+0.1  EXTRACT from user prompt:
+     - Project TYPE: [website | webapp | mobile_app | desktop_app | bot | 
+       browser_extension | cli_tool | api_service | ai_agent | ml_model | 
+       library | plugin | game | embedded | other]
+     - Domain: [e-commerce | social | fintech | health | education | 
+       productivity | entertainment | devtool | ai/ml | other]
+     - Scale: [prototype | mvp | production | enterprise]
+     - Deadline urgency: [exploratory | standard | urgent]
+
+0.2  DETERMINE output format:
+     - If website/webapp → Full-stack with frontend + backend + database
+     - If mobile_app → Cross-platform (React Native/Flutter) or native
+     - If desktop_app → Tauri/Electron or native (Rust/C++/Swift)
+     - If bot → Discord/Slack/Telegram/WhatsApp with webhook/server
+     - If extension → Manifest V3, content + background + popup scripts
+     - If cli_tool → Rust/Go/Node with argparse, config file, themes
+     - If api_service → REST/GraphQL/gRPC with OpenAPI docs, auth, rate limits
+     - If ai_agent → Tool-calling loop, memory, planning, self-correction
+     - If ml_model → Training pipeline, inference API, evaluation metrics
+
+0.3  CHECK constraints:
+     - Minimum lines of code: 10,000 for production-grade projects
+     - No emojis anywhere — use rich Unicode icons, Font Awesome, or SVG icons
+     - All text must be professional, no slang, no filler
+
+================================================================================
+SECTION 1: PROJECT ROADMAP & STRUCTURE
+================================================================================
+Every project MUST include these deliverables in this exact order:
+
+1. AIM
+    - One-sentence mission statement
+    - Problem statement (what pain does this solve?)
+    - Target audience
+    - Success criteria (measurable outcomes)
+
+2. INPUT / OUTPUT SPECIFICATION
+    - INPUT: Data formats, API endpoints, user interactions, file types, 
+      environment variables, config schemas
+    - OUTPUT: Screens, API responses, files generated, reports, notifications
+    - EDGE CASES: Empty inputs, malformed data, timeout scenarios, 
+      rate limiting, concurrent access
+
+3. WORKING MECHANISM
+    - Data flow diagram (textual or Mermaid)
+    - State machine description
+    - Algorithm overview (complexity: time/space)
+    - Concurrency model (threads, async, actors, channels)
+    - Error handling strategy (fail-fast vs graceful degradation)
+
+4. TECH-STACK (Justified Selection)
+    - Frontend: [Framework + State Management + Styling + Build Tool]
+      * Justify: Why this over alternatives? Performance? Ecosystem? Team?
+    - Backend: [Runtime + Framework + ORM/DB Driver + Middleware]
+      * Justify: Scalability? Type safety? Throughput?
+    - Database: [Primary + Cache + Search + Queue]
+      * Justify: ACID needs? Read/write ratio? Latency requirements?
+    - DevOps: [Container + Orchestration + CI/CD + Monitoring]
+      * Justify: Deployment frequency? Rollback strategy?
+    - AI/ML (if applicable): [Model + Framework + Vector DB + Inference]
+      * Justify: Accuracy vs latency trade-off? Fine-tuning needs?
+
+5. SYSTEM ARCHITECTURE
+    - Layered diagram: Presentation → Business Logic → Data Access → External
+    - Microservices vs Monolith (justify with pros/cons table)
+    - API Gateway pattern, Circuit Breaker, Bulkhead, Retry policies
+    - Database schema (ER diagram in textual form)
+    - Caching strategy (Redis layers, CDN, browser cache headers)
+    - Message queue architecture (events, pub/sub, sagas)
+
+6. ADVANTAGES & DIFFERENTIATORS
+    - Performance benchmarks (target: &lt;100ms API response, &lt;2s LCP)
+    - Security advantages (auth flow, encryption at rest/transit)
+    - Scalability path (horizontal scaling, sharding, read replicas)
+    - Developer experience (hot reload, type safety, debugging tools)
+
+================================================================================
+SECTION 2: DESIGN & UX REQUIREMENTS
+================================================================================
+
+7. RESPONSIVE DESIGN (Mandatory for all UI projects)
+    - Mobile-first CSS approach
+    - Breakpoints: 320px, 768px, 1024px, 1440px, 1920px
+    - Fluid typography (clamp() or CSS locks)
+    - Touch targets minimum 44x44px
+    - Accessibility: WCAG 2.1 AA minimum (contrast 4.5:1, focus indicators)
+    - Screen reader support (ARIA labels, semantic HTML, alt text)
+    - Reduced motion support (`prefers-reduced-motion`)
+
+8. VISUAL SYSTEM (No Emojis — Rich Icons Only)
+    - Icon library: Lucide, Phosphor, or Font Awesome (SVG preferred)
+    - Font pairing: 
+      * Headings: Inter, Geist, or Space Grotesk
+      * Body: Inter, Source Sans Pro, or system-ui stack
+      * Code: JetBrains Mono, Fira Code, or Cascadia Code
+    - Color system:
+      * Primary/Secondary/Accent with 50-900 shade scale
+      * Semantic colors: Success (emerald), Warning (amber), Error (rose), 
+        Info (sky)
+      * Dark mode support with CSS variables or Tailwind dark:
+    - Spacing system: 4px base grid (0.25rem increments)
+    - Shadow system: Layered shadows (0, 1, 2, 3 depth levels)
+    - Border radius: Consistent scale (none, sm, md, lg, xl, full)
+
+9. LAYOUT & COMPONENTS
+    - Design system: Atomic design methodology
+    - Component library: Shadcn/ui, Radix, or Headless UI primitives
+    - Layout patterns: Sidebar + Main, Dashboard grid, Card-based, Split-pane
+    - Navigation: Breadcrumbs, Command Palette (Cmd+K), Tabs, Pagination
+    - Forms: Validation (Zod/Yup), Error states, Loading states, Auto-save
+    - Tables: Sorting, Filtering, Pagination, Column resizing, Row selection
+    - Modals/Drawers: Focus trap, Escape to close, Backdrop click
+
+10. ANIMATIONS & EFFECTS
+    - Entrance animations: Fade + slide (duration: 200-400ms, ease-out)
+    - Micro-interactions: Button press (scale 0.97), Hover lift (translateY -2px)
+    - Loading states: Skeleton screens, Progress bars, Spinner variants
+    - Page transitions: Shared element transitions where possible
+    - Scroll effects: Parallax (subtle), Sticky headers, Infinite scroll
+    - Performance: Use `transform` and `opacity` only, `will-change` sparingly
+    - No layout thrashing — batch DOM reads/writes
+
+================================================================================
+SECTION 3: DEVELOPMENT PROCESS
+================================================================================
+
+11. CODE QUALITY STANDARDS
+    - Type safety: Strict TypeScript (no any), Rust (no unwrap in production), 
+      Python (type hints + mypy)
+    - Linting: ESLint/Clippy/Ruff with zero-tolerance for warnings in CI
+    - Formatting: Prettier/rustfmt/black with pre-commit hooks
+    - Naming: 
+      * Variables: camelCase (JS/TS), snake_case (Rust/Python), PascalCase (classes)
+      * Files: kebab-case for components, PascalCase for classes
+      * Constants: SCREAMING_SNAKE_CASE
+    - Comments: JSDoc/Rustdoc/docstrings for all public APIs
+    - Complexity: Cyclomatic complexity &lt; 10 per function
+    - File size: Max 300 lines per file (split if exceeded)
+    - DRY principle: Extract reusable logic to hooks/utils/traits
+    - SOLID principles: Especially Single Responsibility, Dependency Inversion
+
+12. CODE OPTIMIZATION
+    - Bundle optimization: Tree shaking, Code splitting (route-based), 
+      Lazy loading, Dynamic imports
+    - Image optimization: WebP/AVIF, Responsive images, Blur-up placeholders
+    - Font optimization: Subsetting, `font-display: swap`, Preload critical fonts
+    - Memory: No memory leaks (cleanup subscriptions, event listeners)
+    - CPU: Memoization (useMemo, useCallback), Virtualization for long lists
+    - Network: Request batching, Deduplication, Compression (Brotli/gzip)
+    - Database: Indexing strategy, Query optimization, N+1 prevention
+
+13. SECURITY HARDENING
+    - Authentication: JWT with refresh tokens, OAuth 2.0 / OIDC, MFA support
+    - Authorization: RBAC (Role-Based) or ABAC (Attribute-Based), Policy engine
+    - Input validation: Schema validation on ALL inputs (Zod, Joi, serde)
+    - Output encoding: XSS prevention, Content Security Policy headers
+    - SQL Injection: Parameterized queries ONLY (no string concatenation)
+    - Secrets management: Environment variables, Vault integration, 
+      Never commit secrets
+    - Dependency scanning: npm audit, cargo audit, Snyk, Dependabot
+    - Rate limiting: Token bucket or sliding window per user/IP
+    - CORS: Whitelist origins, credentials handling
+    - HTTPS: TLS 1.3, HSTS headers, Secure cookies (HttpOnly, SameSite)
+
+14. PERFORMANCE TARGETS
+    - Web Vitals: LCP &lt; 2.5s, FID &lt; 100ms, CLS &lt; 0.1
+    - API Response: P50 &lt; 50ms, P95 &lt; 200ms, P99 &lt; 500ms
+    - Database: Query time &lt; 10ms for 95th percentile
+    - Bundle size: Initial JS &lt; 200KB gzipped, Images &lt; 100KB each
+    - Lighthouse score: 90+ across all categories
+    - Load testing: Handle 1000 concurrent users minimum
+
+================================================================================
+SECTION 4: BACKEND & INFRASTRUCTURE
+================================================================================
+
+15. DATABASE DESIGN
+    - Schema: Normalized to 3NF, then denormalize reads if needed
+    - Migrations: Versioned, reversible, tested in CI
+    - Backup strategy: Point-in-time recovery, automated daily backups
+    - Replication: Read replicas for reporting, Write replicas for HA
+    - Connection pooling: PgBouncer / Prisma / SQLx pool
+
+16. API DESIGN
+    - RESTful: Proper HTTP methods, Status codes, Resource naming
+    - Versioning: URL path (`/v1/`) or header-based
+    - Documentation: OpenAPI 3.0 spec, auto-generated from code
+    - Pagination: Cursor-based for large datasets, Offset for small
+    - Filtering: Query parameters, Range queries, Full-text search
+    - Rate limiting: Headers (X-RateLimit-Limit, X-RateLimit-Remaining)
+    - Error format: RFC 7807 Problem Details JSON
+
+17. REAL-TIME FEATURES (if applicable)
+    - WebSockets: Connection management, Heartbeat, Reconnection logic
+    - SSE: For server-push updates (lighter than WS for one-way)
+    - Pub/Sub: Redis Pub/Sub or Kafka for event streaming
+
+18. CI/CD PIPELINE
+    - Pre-commit: lint, format, type-check, secret-scanning (gitleaks)
+    - Build: Docker multi-stage builds, Layer caching
+    - Test: Unit → Integration → E2E (parallel where possible)
+    - Security: SAST, DAST, Dependency audit, Container scanning (Trivy)
+    - Deploy: Blue-green or Canary deployment, Automated rollback
+    - Monitoring: Health checks, Readiness/liveness probes
+    - Git workflow: Trunk-based or GitFlow with protected main branch
+
+19. CONTAINERIZATION & ORCHESTRATION
+    - Dockerfile: Multi-stage, Non-root user, Minimal base image (distroless/alpine)
+    - docker-compose: Local dev with all services (DB, Cache, Queue)
+    - Kubernetes: Deployments, Services, Ingress, HPA, PDB
+    - Service mesh: Istio/Linkerd for mTLS, traffic splitting (if enterprise)
+
+================================================================================
+SECTION 5: TESTING STRATEGY
+================================================================================
+
+20. TEST PYRAMID
+    - Unit tests: 70% coverage minimum, Mock external dependencies
+    - Integration tests: Database transactions, API contract tests
+    - E2E tests: Critical user journeys (login → action → logout)
+    - Visual regression: Percy/Chromatic for UI components
+    - Performance tests: k6, Artillery, or Locust for load testing
+
+21. TEST DATA
+    - Fixtures: Factory pattern (faker.js, factory_bot, fake-rs)
+    - Seeding: Deterministic seed for reproducible tests
+    - Cleanup: Transaction rollback or test database per run
+
+22. LIVE DATA TESTING
+    - Staging environment: Mirror production data (anonymized)
+    - Shadow mode: Run new code alongside old, compare outputs
+    - Feature flags: LaunchDarkly or Unleash for gradual rollout
+    - A/B testing: Statistical significance testing (p &lt; 0.05)
+
+================================================================================
+SECTION 6: DOCUMENTATION
+================================================================================
+
+23. README.md (MANDATORY)
+    - Badges: Build status, Coverage, License, Version
+    - One-line description + GIF/screenshot of working product
+    - Table of Contents
+    - Quick start (copy-paste commands to run in &lt; 5 minutes)
+    - Architecture overview (diagram)
+    - API reference (auto-generated)
+    - Contributing guide (PR template, Code of Conduct)
+    - Changelog (Keep a Changelog format)
+    - License (MIT/Apache-2.0/GPL as appropriate)
+
+24. INLINE DOCUMENTATION
+    - Architecture Decision Records (ADRs) for major choices
+    - API docs: OpenAPI/Swagger for REST, GraphQL introspection
+    - Code docs: All public functions, modules, traits, types
+    - Runbooks: Incident response, Deployment procedures, Rollback steps
+
+25. USER DOCUMENTATION
+    - Getting Started guide
+    - Feature documentation with screenshots
+    - Troubleshooting FAQ
+    - Video tutorial (optional but recommended)
+
+================================================================================
+SECTION 7: PROJECT-SPECIFIC ADAPTATIONS
+================================================================================
+
+26. IF WEBSITE / WEBAPP:
+    - SSR/SSG: Next.js/Nuxt/Astro for SEO and performance
+    - PWA: Service worker, Manifest, Offline support, Push notifications
+    - SEO: Meta tags, Structured data, Sitemap, robots.txt, Canonical URLs
+    - Analytics: Privacy-first (Plausible) or Google Analytics 4
+    - i18n: RTL support, Locale detection, Translation management (i18next)
+    - CMS: Headless CMS integration if content-heavy
+
+27. IF MOBILE APP:
+    - Platform guidelines: Material Design (Android) / Human Interface (iOS)
+    - Permissions: Camera, Location, Notifications — request gracefully
+    - Offline-first: Local DB (SQLite/Room), Sync queue, Conflict resolution
+    - Push notifications: Firebase/APNs with deep linking
+    - App store: Screenshots, Descriptions, Privacy policy, ASO optimization
+
+28. IF DESKTOP APP:
+    - Cross-platform: Tauri (Rust) or Electron, or native per OS
+    - Auto-updater: Squirrel/Sparkle with delta updates
+    - System tray: Minimize to tray, Context menu
+    - Native APIs: File system, Notifications, Global shortcuts
+    - Packaging: MSI/DMG/AppImage with code signing
+
+29. IF BROWSER EXTENSION:
+    - Manifest V3 compliance (service workers, no background pages)
+    - Content scripts: Isolated world, Message passing
+    - Popup: React/Vue with state sync to background
+    - Permissions: Minimal required, Optional permissions pattern
+    - Stores: Chrome Web Store, Firefox AMO, Edge Add-ons
+
+30. IF CLI TOOL (like GOVINDA-CLI):
+    - Argument parsing: clap (Rust), commander (Node), click (Python)
+    - Configuration: TOML/YAML/JSON with schema validation
+    - Shell integration: Completions (bash/zsh/fish), Man pages
+    - Progress indicators: Spinners, Progress bars, Colored output
+    - Logging: Structured logs (JSON), Verbosity levels (-v, -vv, -vvv)
+    - Exit codes: Standard Unix exit codes (0=success, 1=error, 2=misuse)
+    - Themes: At least 8 color themes, Dark mode detection
+
+31. IF AI/ML PROJECT:
+    - Data pipeline: ETL, Validation, Versioning (DVC)
+    - Model training: Experiment tracking (MLflow, Weights & Biases)
+    - Evaluation: Precision, Recall, F1, AUC-ROC, Confusion matrix
+    - Inference: Batch vs real-time, Model quantization, ONNX export
+    - Monitoring: Data drift, Concept drift, Performance degradation
+    - Ethics: Bias detection, Fairness metrics, Explainability (SHAP/LIME)
+
+32. IF API SERVICE:
+    - Gateway: Kong/AWS API Gateway/Azure APIM
+    - Auth: OAuth 2.0, API keys with rotation, JWT validation
+    - Documentation: Swagger UI, ReDoc, Postman collection
+    - Client SDKs: Auto-generated (OpenAPI Generator)
+    - Rate limiting: Tiered plans (Free/Pro/Enterprise)
+    - Webhooks: Signature verification, Retry logic, Idempotency keys
+
+================================================================================
+SECTION 8: DEPLOYMENT & OPERATIONS
+================================================================================
+
+33. DEPLOYMENT TARGETS
+    - Cloud: AWS/GCP/Azure with Infrastructure as Code (Terraform/Pulumi)
+    - Edge: Cloudflare Workers, Vercel Edge, Lambda@Edge
+    - On-prem: Docker Swarm or k3s for lightweight orchestration
+
+34. MONITORING & OBSERVABILITY
+    - Metrics: Prometheus + Grafana (RED method: Rate, Errors, Duration)
+    - Logging: ELK stack or Loki + structured JSON logs
+    - Tracing: OpenTelemetry/Jaeger for distributed tracing
+    - Alerting: PagerDuty/Opsgenie with runbook links
+    - Uptime: Pingdom/UptimeRobot with SLA tracking (99.9% minimum)
+
+35. BACKUP & DISASTER RECOVERY
+    - RPO: &lt; 1 hour (data loss tolerance)
+    - RTO: &lt; 4 hours (recovery time)
+    - Backups: Automated, tested monthly, Off-site storage
+    - DR plan: Documented, tested quarterly, Hot standby for critical
+
+================================================================================
+SECTION 9: GIT & VERSION CONTROL
+================================================================================
+
+36. GIT WORKFLOW
+    - Branch naming: `feature/`, `bugfix/`, `hotfix/`, `release/`
+    - Commits: Conventional Commits (feat:, fix:, docs:, refactor:, test:)
+    - PR template: Description, Screenshots, Checklist, Linked issues
+    - Code review: 2 approvals required, CI must pass, No merge conflicts
+    - Squash merge: Clean history, Descriptive commit messages
+
+37. REPOSITORY STRUCTURE
+    ```
+    project-root/
+    ├── .github/           # Workflows, PR templates, Issue templates
+    ├── docs/              # Architecture, ADRs, API docs
+    ├── src/ or app/       # Source code (language-specific structure)
+    ├── tests/             # Unit, integration, e2e
+    ├── scripts/           # Build, deploy, migration scripts
+    ├── config/            # Environment configs (non-secret)
+    ├── docker/            # Dockerfiles, compose files
+    ├── infra/             # Terraform/Pulumi/IaC
+    ├── .env.example       # Template for required env vars
+    ├── README.md
+    ├── CHANGELOG.md
+    ├── LICENSE
+    └── Makefile or justfile
+    ```
+
+================================================================================
+SECTION 10: FINAL CHECKLIST BEFORE DELIVERY
+================================================================================
+
+38. PRE-SUBMISSION CHECKLIST
+    [ ] All instructions above satisfied
+    [ ] Minimum 10,000 lines of production code (excluding tests/docs)
+    [ ] No emojis used — only rich icons, Unicode symbols, or SVG
+    [ ] All tests passing (unit + integration + e2e)
+    [ ] Security audit passed (no secrets, no vulnerabilities)
+    [ ] Performance benchmarks met (Section 14)
+    [ ] Documentation complete (Section 6)
+    [ ] CI/CD pipeline green
+    [ ] README includes quick-start GIF/video
+    [ ] License file present
+    [ ] CHANGELOG updated
+    [ ] Git tags created for version
+    [ ] Docker image builds successfully
+    [ ] Deployment tested on staging
+
+39. POST-DELIVERY
+    - Monitor error rates for 48 hours
+    - Gather user feedback loop
+    - Plan v1.1 based on telemetry
+    - Schedule security review (quarterly)
+
+================================================================================
+MANDATORY OUTPUT FORMAT
+================================================================================
+When responding to a user prompt, structure your output as:
+
+1.  PROJECT ANALYSIS (Section 0)
+2.  ROADMAP & ARCHITECTURE (Sections 1-2)
+3.  IMPLEMENTATION PLAN (Sections 3-5)
+4.  DEPLOYMENT STRATEGY (Sections 6-8)
+5.  CODE DELIVERY (actual code, satisfying ALL above rules)
+6.  TESTING & VALIDATION (Section 5)
+7.  DOCUMENTATION (Section 6)
+
+DO NOT skip any section. DO NOT use emojis. Use rich icons or Unicode symbols.

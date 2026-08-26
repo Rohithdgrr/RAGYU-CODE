@@ -98,6 +98,64 @@ impl ProjectMemory {
     }
 }
 
+/// Free-function wrappers that operate on the process current working
+/// directory. Used by the `remember` / `forget` tools so the agent can
+/// curate the project memory without going through the slash command.
+pub fn append_note(note: &str) {
+    if let Ok(cwd) = std::env::current_dir() {
+        let _ = ProjectMemory::append_note(&cwd, note);
+    }
+}
+
+/// Removes all sections of `.govinda/memory.md` whose body (case-insensitive)
+/// contains `needle`. Returns the number of sections removed.
+pub fn remove_note(needle: &str) -> usize {
+    let Ok(cwd) = std::env::current_dir() else { return 0 };
+    let path = cwd.join(".govinda").join("memory.md");
+    let Ok(content) = std::fs::read_to_string(&path) else { return 0 };
+    let lower = needle.to_lowercase();
+    let mut kept = Vec::new();
+    let mut removed = 0usize;
+    // Sections are separated by `## YYYY-MM-DD HH:MM` headers.
+    let mut current: Vec<&str> = Vec::new();
+    let mut current_matches = false;
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            // Flush the previous section.
+            if !current.is_empty() {
+                if current_matches {
+                    removed += 1;
+                } else {
+                    kept.extend(current.iter().copied());
+                    kept.push(""); // blank between sections
+                }
+            }
+            current.clear();
+            current.push(line);
+            current_matches = line.to_lowercase().contains(&lower);
+        } else {
+            if !current.is_empty() {
+                current.push(line);
+                if !current_matches && line.to_lowercase().contains(&lower) {
+                    current_matches = true;
+                }
+            } else {
+                kept.push(line);
+            }
+        }
+    }
+    if !current.is_empty() {
+        if current_matches {
+            removed += 1;
+        } else {
+            kept.extend(current.iter().copied());
+        }
+    }
+    let new_content = kept.join("\n");
+    let _ = std::fs::write(&path, new_content);
+    removed
+}
+
 /// Loads a single memory file from the workspace, returning `None` if missing.
 fn load_memory_file(workspace: &Path, relative: &str) -> Option<String> {
     let path = workspace.join(relative);

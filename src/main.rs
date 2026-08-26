@@ -367,6 +367,7 @@ fn parse_args() -> Result<Args> {
     let mut query = None;
     let mut build = None;
     let mut completion = None;
+    let mut enforce = false;
     let mut force_repl = false;
     let mut force_tui = false;
     let mut separated = false; // after `--`, treat remaining as values
@@ -413,12 +414,18 @@ fn parse_args() -> Result<Args> {
             }
             "--tui" => force_tui = true,
             "--repl" => force_repl = true,
+            "--enforce" | "-E" => enforce = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
             }
             other => anyhow::bail!("unknown argument '{other}' — try --help"),
         }
+    }
+    // Stash the enforce flag in an env var so the config layer can pick it
+    // up via env_override(). No mutation of `config` happens here yet.
+    if enforce {
+        unsafe { std::env::set_var("GOVINDA_ENFORCE_PROTOCOL", "1"); }
     }
     // TUI is the default for interactive sessions; --repl forces the legacy
     // REPL, --query/-q and --build/-b imply non-TUI, and piped stdout always
@@ -440,7 +447,7 @@ fn parse_args() -> Result<Args> {
 
 fn print_usage() {
     println!(
-        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --query, -q <prompt> one-shot mode: answer and exit; piped stdin is appended\n                       to the prompt, e.g. cat file.rs | govinda -q \"review\"\n  --build, -b <prompt> one-prompt pipeline: plan phases (docs → code → deps →\n                       run → preview → verify), confirm once, then execute\n                       autonomously; exit code reflects verification\n  --repl               use the legacy plain-text REPL instead of the rich TUI\n  --completion <shell> print a completion script (bash, zsh, fish, powershell)\n  --help, -h           show this help\n\nthe rich TUI launches by default in interactive terminals.",
+        "{}\n\nusage: govinda [options]\n\noptions:\n  --resume, -r <name>  continue a saved session (see /sessions)\n  --query, -q <prompt> one-shot mode: answer and exit; piped stdin is appended\n                       to the prompt, e.g. cat file.rs | govinda -q \"review\"\n  --build, -b <prompt> one-prompt pipeline: plan phases (docs → code → deps →\n                       run → preview → verify), confirm once, then execute\n                       autonomously; exit code reflects verification\n  --enforce, -E         force the GOVINDA Protocol on for this session\n                        (default honors `enforce_protocol` in config.toml)\n  --repl               use the legacy plain-text REPL instead of the rich TUI\n  --completion <shell> print a completion script (bash, zsh, fish, powershell)\n  --help, -h           show this help\n\nthe rich TUI launches by default in interactive terminals.",
         paint(
             format!("govinda-cli v{}", env!("CARGO_PKG_VERSION")),
             accent()

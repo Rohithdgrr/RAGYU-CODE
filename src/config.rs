@@ -47,6 +47,20 @@ struct FileConfig {
     timeout_secs: Option<u64>,
     /// Response size cap in MB (1-64).
     limit_mb: Option<u64>,
+    /// GOVINDA Protocol enforcement mechanism (v7.0 "No Shortcuts").
+    /// When true, the master system prompt and per-turn header are
+    /// injected, and the model is required to call `quality_gate_check`
+    /// before claiming completion.
+    enforce_protocol: Option<bool>,
+    /// Hard-fail line-count threshold for the FINAL phase.
+    protocol_min_lines: Option<usize>,
+    /// Maximum rounds granted to a single turn when the protocol is on.
+    protocol_max_turns: Option<usize>,
+    /// Whether the quality-gate tool scans delivered files for emoji.
+    protocol_emoji_scan: Option<bool>,
+    /// Whether the model must call `quality_gate_check` before claiming
+    /// completion.
+    protocol_require_gates: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -71,6 +85,8 @@ pub struct Config {
     pub timeout_secs: u64,
     /// Response size cap in MB, clamped 1-64.
     pub limit_mb: u64,
+    /// GOVINDA Protocol settings — see `govinda_protocol::ProtocolConfig`.
+    pub protocol: crate::govinda_protocol::ProtocolConfig,
 }
 
 impl Config {
@@ -173,6 +189,16 @@ impl Config {
             .clamp(1, 600);
         let limit_mb = file.limit_mb.unwrap_or(DEFAULT_LIMIT_MB).clamp(1, 64);
 
+        let protocol = crate::govinda_protocol::ProtocolConfig::from_overrides(
+            env_override("GOVINDA_ENFORCE_PROTOCOL")
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .or(file.enforce_protocol),
+            file.protocol_min_lines,
+            file.protocol_max_turns,
+            file.protocol_emoji_scan,
+            file.protocol_require_gates,
+        );
+
         Ok(Self {
             api_key,
             model,
@@ -187,6 +213,7 @@ impl Config {
             theme: file.theme,
             timeout_secs,
             limit_mb,
+            protocol,
         })
     }
 
@@ -272,6 +299,23 @@ mod tests {
         assert_eq!(cfg.temperature, Some(0.2));
         assert_eq!(cfg.render_markdown, Some(false));
         assert_eq!(cfg.system_prompt.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn protocol_overrides_parse_from_toml() {
+        let raw = r#"
+enforce_protocol = true
+protocol_min_lines = 5000
+protocol_max_turns = 25
+protocol_emoji_scan = false
+protocol_require_gates = false
+"#;
+        let cfg: FileConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.enforce_protocol, Some(true));
+        assert_eq!(cfg.protocol_min_lines, Some(5000));
+        assert_eq!(cfg.protocol_max_turns, Some(25));
+        assert_eq!(cfg.protocol_emoji_scan, Some(false));
+        assert_eq!(cfg.protocol_require_gates, Some(false));
     }
 
     #[test]
