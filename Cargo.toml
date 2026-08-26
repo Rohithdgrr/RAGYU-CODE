@@ -17,9 +17,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 termimad = "0.35.2"
 tiktoken-rs = { version = "0.12.0", default-features = false }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "process", "net", "io-util"] }
 toml = "0.8"
 unicode-width = "0.2"
+url = "2"
+urlencoding = "2"
 zeroize = "1.9.0"
 
 [dev-dependencies]
@@ -29,5 +31,5 @@ wiremock = "0.6"
 rust_2018_idioms = "warn"
 
 [lints.clippy]
-unwrap_used = "warn"
-expect_used = "warn"
+unwrap_used = "deny"
+expect_used = "deny"

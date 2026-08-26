@@ -2,11 +2,9 @@
 //! agent's surgical tools (`edit_file`, `insert_after`, `insert_before`)
 //! have queued. Nothing touches the disk until `/apply`.
 
-use super::{App, dim, err, ok, paint};
-use crate::render::{accent, dim_color, err_color, ok_color};
+use super::{App, dim, err, info, ok};
 use crate::tools::{EditOp, PendingEdits, apply_ops_to_content, resolve_in, staged_diff};
 use anyhow::Context as _;
-use crossterm::style::Color;
 
 /// `/diff` — show the unified diff of everything staged.
 pub(super) fn view(app: &App) {
@@ -20,40 +18,28 @@ pub(super) fn view(app: &App) {
         return;
     };
     for (i, op) in ops.iter().enumerate() {
-        println!(
-            "{}",
-            paint(format!("  {}. {}", i + 1, op.describe()), dim_color())
-        );
+        dim(format!("  {}. {}", i + 1, op.describe()));
     }
     match staged_diff(&cwd, &ops) {
         Ok(diff) if diff.trim().is_empty() => dim("(edits cancel out — empty diff)"),
-        Ok(diff) => println!("{diff}"),
-        Err(e) => err(&format!("cannot build diff: {e:#}")),
+        Ok(diff) => info(diff),
+        Err(e) => err(format!("cannot build diff: {e:#}")),
     }
 }
 
 /// `/apply` — validate every staged edit against current file contents,
 /// then write all files atomically: any validation failure aborts the whole
-/// batch with the queue intact.
-pub(super) fn apply(app: &mut App) {
+/// batch with the queue intact. Returns `true` when all edits were written.
+pub(super) fn apply(app: &mut App) -> bool {
     let ops = snapshot(app);
     if ops.is_empty() {
         dim("no staged edits to apply.");
-        return;
+        return false;
     }
 
-    println!(
-        "{}",
-        paint(
-            format!("applying {} staged edit(s):", ops.len()),
-            Color::Yellow
-        )
-    );
+    ok(format!("applying {} staged edit(s):", ops.len()));
     for (i, op) in ops.iter().enumerate() {
-        println!(
-            "{}",
-            paint(format!("  {}. {}", i + 1, op.describe()), dim_color())
-        );
+        dim(format!("  {}. {}", i + 1, op.describe()));
     }
 
     // Group by target path, preserving first-seen order.
@@ -70,15 +56,15 @@ pub(super) fn apply(app: &mut App) {
     let mut writes: Vec<(std::path::PathBuf, String)> = Vec::new();
     let Ok(cwd) = std::env::current_dir() else {
         err("cannot resolve working directory.");
-        return;
+        return false;
     };
     for (path, group) in &grouped {
         let outcome = transform_file(&cwd, path, group).map(|updated| {
             writes.push((resolve_in(&cwd, path).unwrap_or_default(), updated));
         });
         if let Err(e) = outcome {
-            err(&format!("apply aborted (nothing written): {e:#}"));
-            return;
+            err(format!("apply aborted (nothing written): {e:#}"));
+            return false;
         }
     }
 
@@ -87,27 +73,22 @@ pub(super) fn apply(app: &mut App) {
     for (full, content) in &writes {
         if let Err(e) = std::fs::write(full, content) {
             failed = true;
-            eprintln!(
-                "{}",
-                paint(
-                    format!("write failed for {}: {e}", full.display()),
-                    err_color()
-                )
-            );
+            err(format!("write failed for {}: {e}", full.display()));
         }
     }
     if failed {
         err("some writes failed — inspect your files before retrying.");
-        return;
+        return false;
     }
     if let Ok(mut q) = app.pending_edits.lock() {
         q.clear();
     }
-    ok(&format!(
+    ok(format!(
         "applied {} edit(s) across {} file(s).",
         ops.len(),
         grouped.len()
     ));
+    true
 }
 
 /// `/reject` — discard everything staged without touching any files.
@@ -119,7 +100,7 @@ pub(super) fn reject(app: &mut App) {
             if n == 0 {
                 dim("nothing staged to reject.");
             } else {
-                ok(&format!(
+                ok(format!(
                     "discarded {n} staged edit(s); no files were changed."
                 ));
             }
@@ -149,18 +130,7 @@ pub(super) fn review(app: &App) {
         return;
     };
 
-    println!(
-        "{}",
-        paint(
-            format!("{} file(s) modified:", grouped.len()),
-            Color::Yellow
-        )
-    );
-    let width = grouped
-        .iter()
-        .map(|(p, _)| p.chars().count())
-        .max()
-        .unwrap_or(0);
+    ok(format!("{} file(s) modified:", grouped.len()));
     let mut totals = (0usize, 0usize);
     for (path, group) in &grouped {
         let (added, removed) = {
@@ -168,34 +138,21 @@ pub(super) fn review(app: &App) {
             match staged_diff(&cwd, &owned) {
                 Ok(diff) => crate::diff::count_changes(&diff),
                 Err(e) => {
-                    err(&format!("cannot diff '{path}': {e:#}"));
+                    err(format!("cannot diff '{path}': {e:#}"));
                     continue;
                 }
             }
         };
         totals.0 += added;
         totals.1 += removed;
-        let pad = " ".repeat(width - path.chars().count());
-        println!(
-            "  {}{}  {} {}",
-            paint(path.clone(), accent()),
-            pad,
-            paint(format!("+{added}"), ok_color()),
-            paint(format!("-{removed}"), err_color())
-        );
+        ok(format!("  {path}: +{added}/-{removed}"));
     }
-    println!(
-        "{}",
-        paint(
-            format!(
-                "total: +{}/-{} across {} staged edit(s)",
-                totals.0,
-                totals.1,
-                ops.len()
-            ),
-            dim_color()
-        )
-    );
+    dim(format!(
+        "total: +{}/-{} across {} staged edit(s)",
+        totals.0,
+        totals.1,
+        ops.len()
+    ));
     dim("run /apply to confirm, /reject to discard, or /diff for full diffs.");
 }
 
@@ -251,8 +208,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_writes_files_and_clears_queue() {
+        let _guard = crate::TEST_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = TempDir::new("apply");
+        std::env::set_current_dir(&ws.0).unwrap();
+        std::fs::write(ws.0.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let mut app = smoke_app();
+        app.pending_edits = std::sync::Arc::new(std::sync::Mutex::new({
+            let mut q = PendingEdits::default();
+            q.push(EditOp::Replace {
+                path: "a.txt".into(),
+                old_string: "two".into(),
+                new_string: "TWO".into(),
+            });
+            q
+        }));
+        assert!(apply(&mut app));
+        assert_eq!(
+            std::fs::read_to_string(ws.0.join("a.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+        assert!(snapshot(&app).is_empty());
+    }
+
+    #[test]
+    fn apply_aborts_atomically_on_bad_op() {
+        let _guard = crate::TEST_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = TempDir::new("apply-abort");
+        std::env::set_current_dir(&ws.0).unwrap();
+        std::fs::write(ws.0.join("a.txt"), "content\n").unwrap();
+        let mut app = smoke_app();
+        app.pending_edits = std::sync::Arc::new(std::sync::Mutex::new({
+            let mut q = PendingEdits::default();
+            q.push(EditOp::Replace {
+                path: "a.txt".into(),
+                old_string: "missing text".into(),
+                new_string: "nope".into(),
+            });
+            q
+        }));
+        assert!(!apply(&mut app));
+        assert_eq!(
+            std::fs::read_to_string(ws.0.join("a.txt")).unwrap(),
+            "content\n",
+            "file must be untouched when an op fails validation"
+        );
+    }
+
     // Local temp-workspace helper (mirrors tools::tests::TempWs).
-    struct TempDir(std::path::PathBuf);
+    pub struct TempDir(std::path::PathBuf);
     impl TempDir {
         fn new(tag: &str) -> Self {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

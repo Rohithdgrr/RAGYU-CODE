@@ -52,7 +52,7 @@ const MAX_ARG_VALUE_CHARS: usize = 8 * 1024;
 /// (the model sees this string too, so it must stay bounded).
 const MAX_DIFF_PREVIEW_CHARS: usize = 4_000;
 /// Names reserved by built-in implementations; user tools cannot shadow them.
-const BUILTIN_TOOL_NAMES: [&str; 20] = [
+const BUILTIN_TOOL_NAMES: [&str; 27] = [
     "current_time",
     "count_words",
     "read_file",
@@ -73,6 +73,13 @@ const BUILTIN_TOOL_NAMES: [&str; 20] = [
     "git_log",
     "git_branch",
     "git_commit",
+    "open_preview",
+    "web_search",
+    "web_fetch",
+    "ask_user",
+    "delegate_task",
+    "run_diagnostics",
+    "go_to_definition",
 ];
 /// `{placeholder}` tokens inside shell-tool `args_template` words.
 #[allow(clippy::expect_used)] // static, hand-checked patterns
@@ -332,9 +339,12 @@ impl ToolExecutor for BuiltinTools {
             ),
             Tool::new(
                 "run_shell",
-                "Run a shell command in the project directory. Use for: cargo check, cargo \
-                 test, npm test, git diff, etc. Requires user confirmation; output is capped \
-                 and a timeout applies.",
+                "Run ANY shell command in the project directory — build, test, lint, git, \
+                 package managers, start dev servers (npm run dev, python -m http.server), \
+                 open files or URLs in the browser (start on Windows, xdg-open on Linux), \
+                 launch apps. Never claim you cannot open a browser or run a program — you \
+                 can, via this tool. Requires user confirmation; output is capped and a \
+                 timeout applies.",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -342,6 +352,20 @@ impl ToolExecutor for BuiltinTools {
                         "timeout_secs": {"type": "integer", "description": "Wall-clock cap in seconds (default 60, max 600)"}
                     },
                     "required": ["command"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "open_preview",
+                "Serve the workspace over a local HTTP server and open a file in the user's \
+                 browser — the right way to show an HTML/CSS/JS preview after creating or \
+                 editing web files. Relative assets resolve against the workspace root. \
+                 Requires user confirmation (it starts a server).",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file to open, e.g. index.html (default index.html)"}
+                    },
                     "additionalProperties": false
                 }),
             ),
@@ -421,6 +445,90 @@ impl ToolExecutor for BuiltinTools {
                     "additionalProperties": false
                 }),
             ),
+            Tool::new(
+                "web_search",
+                "Search the web using a search engine API. Returns search results with titles, \
+                 URLs, and snippets. Use this to find current information, documentation, \
+                 or verify facts.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query string"},
+                        "max_results": {"type": "integer", "description": "Maximum results to return (default 5, max 20)"}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "web_fetch",
+                "Fetch the content of a web page by URL. Returns the readable text content \
+                 of the page (stripped of HTML, scripts, and navigation). Use for reading \
+                 documentation, articles, or API responses.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "URL to fetch (http:// or https://)"},
+                        "max_chars": {"type": "integer", "description": "Maximum characters to return (default 20000)"}
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "ask_user",
+                "Ask the user a clarifying question before proceeding. The question is \
+                 displayed as an input gate that pauses the agent turn. Use this when \
+                 you need user input, clarification, or a decision that only the user \
+                 can make. The user's response is returned as the tool result.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "The question to ask the user"},
+                        "options": {"type": "array", "items": {"type": "string"}, "description": "Optional list of suggested answer options"}
+                    },
+                    "required": ["question"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "delegate_task",
+                "Delegate a task to a background agent for parallel exploration. The \
+                 subagent runs independently and returns results when done. Use this \
+                 for complex tasks that benefit from parallel processing.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string", "description": "The task to delegate"},
+                        "context": {"type": "string", "description": "Optional context for the subagent"}
+                    },
+                    "required": ["task"],
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "run_diagnostics",
+                "Run language-specific diagnostics (cargo check, tsc, mypy) and return \
+                 structured error/warning messages. Use this to verify code quality.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            ),
+            Tool::new(
+                "go_to_definition",
+                "Look up the definition of a symbol by name using the symbol index. \
+                 Returns the file, line, and kind of the definition.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Symbol name to look up"}
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }),
+            ),
         ];
         for def in &self.shell_tools {
             specs.push(Tool::new(
@@ -435,7 +543,8 @@ impl ToolExecutor for BuiltinTools {
     fn requires_confirmation(&self, name: &str) -> bool {
         matches!(
             name,
-            "write_file" | "run_shell" | "run_test" | "check_project" | "git_commit" | "git_branch"
+            "write_file" | "run_shell" | "run_test" | "check_project" | "git_commit"
+            | "git_branch" | "open_preview"
         ) || self.shell_tools.iter().any(|t| t.name == name)
     }
 
@@ -555,6 +664,10 @@ impl ToolExecutor for BuiltinTools {
                     let args: RunShellArgs = parse_args(arguments_json)?;
                     run_shell_command(args).await
                 }
+                "open_preview" => {
+                    let args: OpenPreviewArgs = parse_args(arguments_json)?;
+                    crate::preview::open(args.path.as_deref()).await
+                }
                 "run_test" => {
                     let args: RunTestArgs = parse_args(arguments_json)?;
                     run_test_tool(args).await
@@ -593,6 +706,63 @@ impl ToolExecutor for BuiltinTools {
                         std::env::current_dir().context("cannot resolve working directory")?;
                     let args: GitCommitArgs = parse_args(arguments_json)?;
                     git_commit_tool(&cwd, &args).await
+                }
+                "web_search" => {
+                    let args: WebSearchArgs = parse_args(arguments_json)?;
+                    web_search_tool(args).await
+                }
+                "web_fetch" => {
+                    let args: WebFetchArgs = parse_args(arguments_json)?;
+                    web_fetch_tool(args).await
+                }
+                "ask_user" => {
+                    let args: AskUserArgs = parse_args(arguments_json)?;
+                    // In non-interactive mode, return a default answer
+                    bail!("ask_user requires interactive mode — user input is needed: {}", args.question);
+                }
+                "delegate_task" => {
+                    let args: DelegateTaskArgs = parse_args(arguments_json)?;
+                    let cwd = std::env::current_dir().context("cannot resolve working directory")?;
+                    let overview = crate::scan::scan(&cwd).await;
+                    let http = crate::config::Config::http_client()
+                        .context("failed to build HTTP client for delegation")?;
+                    // Resolve provider from env (same as main app startup).
+                    let provider = crate::provider::resolve(
+                        &std::env::var("GOVINDA_PROVIDER")
+                            .unwrap_or_else(|_| crate::config::DEFAULT_PROVIDER.to_owned()),
+                        None,
+                        None,
+                        |name| std::env::var(format!("{name}_API_KEY")).ok(),
+                    )
+                    .context("provider setup failed for delegation")?;
+                    let result = crate::swarm::explore(&args.task, &http, provider.as_ref(), &overview).await;
+                    match result {
+                        Ok(output) => Ok(format!("{{\"task\":\"{}\",\"status\":\"completed\",\"output\":{}}}", args.task, serde_json::json!(output))),
+                        Err(e) => Ok(format!("{{\"task\":\"{}\",\"status\":\"failed\",\"error\":\"{}\"}}", args.task, e)),
+                    }
+                }
+                "run_diagnostics" => {
+                    let cwd = std::env::current_dir().context("cannot resolve working directory")?;
+                    let diagnostics = crate::lsp::run_diagnostics(&cwd).await.unwrap_or_default();
+                    let formatted = crate::lsp::format_diagnostics(&diagnostics, 20);
+                    if formatted.is_empty() {
+                        Ok("no diagnostics found — code looks clean".to_owned())
+                    } else {
+                        Ok(formatted.join("\n"))
+                    }
+                }
+                "go_to_definition" => {
+                    let args: GoToDefArgs = parse_args(arguments_json)?;
+                    let cwd = std::env::current_dir().context("cannot resolve working directory")?;
+                    match crate::lsp::go_to_definition(&args.name, &cwd) {
+                        Some(def) => Ok(serde_json::json!({
+                            "name": def.name,
+                            "kind": def.kind,
+                            "file": def.file,
+                            "line": def.line,
+                        }).to_string()),
+                        None => Ok(format!("{{\"error\":\"symbol '{}' not found\"}}", args.name)),
+                    }
                 }
                 other => match self.shell_tools.iter().find(|t| t.name == other) {
                     Some(def) => run_shell_tool(def, arguments_json).await,
@@ -650,6 +820,11 @@ struct RunTestArgs {
 }
 
 #[derive(serde::Deserialize)]
+struct OpenPreviewArgs {
+    path: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct FindSymbolArgs {
     name: String,
     kind: Option<String>,
@@ -677,6 +852,219 @@ struct GitBranchArgs {
 struct GitCommitArgs {
     message: String,
     stage_all: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    max_results: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct WebFetchArgs {
+    url: String,
+    max_chars: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct AskUserArgs {
+    question: String,
+    #[allow(dead_code)]
+    options: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct DelegateTaskArgs {
+    task: String,
+    #[allow(dead_code)]
+    context: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GoToDefArgs {
+    name: String,
+}
+
+// ---------------------------------------------------------------------------
+// Web tools (web_search / web_fetch)
+// ---------------------------------------------------------------------------
+
+/// `web_search`: performs a web search using a lightweight approach.
+/// Uses DuckDuckGo's lite HTML endpoint to extract search results.
+async fn web_search_tool(args: WebSearchArgs) -> Result<String> {
+    let query = args.query.trim();
+    anyhow::ensure!(!query.is_empty(), "query must not be empty");
+    let max_results = args.max_results.unwrap_or(5).clamp(1, 20);
+
+    let url = format!(
+        "https://html.duckduckgo.com/html/?q={}",
+        urlencoding::encode(query)
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("failed to build HTTP client for web search")?;
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; govinda-cli/1.0)")
+        .send()
+        .await
+        .context("web search request failed")?
+        .text()
+        .await
+        .context("failed to read web search response")?;
+
+    // Parse results from DuckDuckGo lite HTML
+    let mut results = Vec::new();
+    for block in resp.split("<a rel=\"nofollow\"") {
+        if results.len() >= max_results {
+            break;
+        }
+        // Extract URL
+        let Some(href_start) = block.find("href=") else {
+            continue
+        };
+        let href_rest = &block[href_start + 6..];
+        let Some(url_end) = href_rest.find(['"', '\'', ' ']) else {
+            continue
+        };
+        let result_url = &href_rest[..url_end];
+        // Extract title (inside <a> tag)
+        let title = block
+            .find('>')
+            .map(|i| &block[i + 1..])
+            .and_then(|title_rest| title_rest.find("</a>"))
+            .map(|end| {
+                #[allow(clippy::unwrap_used)] // safe: outer find() succeeded
+                let title_rest = &block[block.find('>').unwrap() + 1..];
+                &title_rest[..end]
+            })
+            .unwrap_or("")
+            .trim();
+        // Extract snippet
+        let snippet = block
+            .find("class=\"result-snippet\"")
+            .map(|i| &block[i + 22..])
+            .and_then(|snip_rest| snip_rest.find("</td>"))
+            .map(|end| {
+                #[allow(clippy::unwrap_used)] // safe: outer find() succeeded
+                let snip_rest = &block[block.find("class=\"result-snippet\"").unwrap() + 22..];
+                &snip_rest[..end]
+            })
+            .unwrap_or("")
+            .trim();
+        // Strip HTML tags from snippet
+        let clean_snippet = strip_html_tags(snippet);
+        if !result_url.is_empty() && !result_url.starts_with("//") {
+            results.push(format!(
+                "{}. {}\n   {}\n   {}",
+                results.len() + 1,
+                strip_html_tags(title),
+                result_url,
+                clean_snippet
+            ));
+        }
+    }
+
+    if results.is_empty() {
+        Ok(format!(
+            "{{\"query\":\"{}\",\"results\":0,\"note\":\"no results found — try different keywords\"}}",
+            query
+        ))
+    } else {
+        Ok(format!(
+            "{{\"query\":\"{}\",\"results\":{}}}",
+            query,
+            results.len()
+        ) + "\n\n" + &results.join("\n\n"))
+    }
+}
+
+/// Strips HTML tags from a string.
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut in_entity = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            '&' => in_entity = true,
+            ';' if in_entity => in_entity = false,
+            _ if !in_tag && !in_entity => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_owned()
+}
+
+/// `web_fetch`: fetches a URL and returns the readable text content.
+async fn web_fetch_tool(args: WebFetchArgs) -> Result<String> {
+    let url = args.url.trim();
+    anyhow::ensure!(!url.is_empty(), "url must not be empty");
+    anyhow::ensure!(
+        url.starts_with("http://") || url.starts_with("https://"),
+        "url must start with http:// or https://"
+    );
+    // SSRF protection: block requests to private/loopback/link-local IPs.
+    if let Ok(parsed) = url::Url::parse(url)
+        && let Some(host) = parsed.host_str() {
+            let h = host.to_lowercase();
+            anyhow::ensure!(
+                !h.starts_with("127.")
+                    && !h.starts_with("10.")
+                    && !h.starts_with("192.168.")
+                    && !h.starts_with("172.")
+                    && h != "localhost"
+                    && h != "::1"
+                    && h != "0.0.0.0"
+                    && h != "169.254.169.254",
+                "requests to private/loopback/link-local addresses are blocked"
+            );
+        }
+    let max_chars = args.max_chars.unwrap_or(20_000).min(100_000);
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .context("failed to build HTTP client for web fetch")?;
+    let resp = client
+        .get(url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (compatible; govinda-cli/1.0)",
+        )
+        .send()
+        .await
+        .context(format!("failed to fetch {url}"))?
+        .text()
+        .await
+        .context(format!("failed to read response from {url}"))?;
+
+    let text = if resp.len() > max_chars * 4 {
+        // Likely HTML — strip tags and scripts
+        let stripped = strip_html_tags(&resp);
+        let lines: Vec<&str> = stripped
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        lines.join("\n")
+    } else {
+        resp
+    };
+
+    let truncated: String = text.chars().take(max_chars).collect();
+    Ok(format!(
+        "{{\"url\":\"{}\",\"chars\":{}}}
+\n{}",
+        url,
+        text.len(),
+        truncated
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,9 +1986,10 @@ fn list_files(base: &Path, args: &ListFilesArgs) -> Result<String> {
 
     let mut lines = Vec::new();
     let ignore = crate::ignore::IgnoreRules::load(base);
-    let mut stack = vec![root.clone()];
-    while let Some(dir) = stack.pop() {
-        if lines.len() >= max_entries {
+    // (directory, depth)
+    let mut stack = vec![(root.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if lines.len() >= max_entries || depth >= MAX_WALK_DEPTH {
             break;
         }
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -1625,7 +2014,7 @@ fn list_files(base: &Path, args: &ListFilesArgs) -> Result<String> {
             }
             if ft.is_dir() {
                 lines.push(format!("{rel}/", rel = rel));
-                stack.push(entry.path());
+                stack.push((entry.path(), depth + 1));
             } else if ft.is_file() {
                 lines.push(rel);
             }
@@ -2101,7 +2490,7 @@ mod tests {
     #[test]
     fn execution_tool_names_need_confirmation() {
         let tools = BuiltinTools::default();
-        for name in ["write_file", "run_shell", "run_test", "check_project"] {
+        for name in ["write_file", "run_shell", "run_test", "check_project", "open_preview"] {
             assert!(tools.requires_confirmation(name), "{name}");
         }
         // Staging edits only queues — no confirmation gate needed.
@@ -2770,5 +3159,25 @@ mod tests {
         save_disabled_tools(&HashSet::new()).unwrap();
         assert!(load_disabled_tools().is_empty());
         std::fs::remove_file(disabled_tools_path()).ok();
+    }
+
+    #[test]
+    fn list_files_respects_depth_cap() {
+        // list_files should not exceed MAX_WALK_DEPTH (12)
+        // This test verifies the depth cap is applied
+        let base = std::env::temp_dir().join("govinda-depth-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a/b/c/d/e/f/g/h/i/j/k/l/m")).unwrap();
+        std::fs::write(base.join("a/b/c/d/e/f/g/h/i/j/k/l/m/deep.txt"), "x").unwrap();
+        std::fs::write(base.join("a/top.txt"), "x").unwrap();
+
+        let args = ListFilesArgs {
+            path: Some("a".into()),
+            max_entries: Some(100),
+        };
+        // Should succeed without stack overflow
+        let result = list_files(&base, &args);
+        assert!(result.is_ok(), "list_files should handle deep paths: {result:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

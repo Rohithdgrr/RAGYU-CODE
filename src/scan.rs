@@ -30,7 +30,7 @@ pub async fn scan(base: &Path) -> String {
     // -- Rust ---------------------------------------------------------------
     if base.join("Cargo.toml").is_file() {
         project_types.push("rust");
-        if let Ok(text) = std::fs::read_to_string(base.join("Cargo.toml")) {
+        if let Ok(text) = tokio::fs::read_to_string(base.join("Cargo.toml")).await {
             let deps = toml_deps(&text);
             if !deps.is_empty() {
                 dependencies.insert("cargo".into(), Value::Object(deps));
@@ -47,7 +47,7 @@ pub async fn scan(base: &Path) -> String {
     if base.join("package.json").is_file() {
         project_types.push("node");
         // Malformed package.json: skip silently, the type is still detected.
-        if let Ok(pkg) = std::fs::read_to_string(base.join("package.json"))
+        if let Ok(pkg) = tokio::fs::read_to_string(base.join("package.json")).await
             .map_err(anyhow::Error::from)
             .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(anyhow::Error::from))
         {

@@ -1,8 +1,8 @@
-//! Input bar — modern rich floating composer.
+//! Input bar — modern rich floating composer (frosted glass, sharp edges).
 //!
 //! Visual language:
 //! - floating card with `bg_tertiary` (white) lifting off `bg_primary`
-//! - mode-tinted rounded border + chip header
+//! - mode-tinted sharp border + chip header
 //! - layered prompt (`›`), placeholder with subtle hint, inline ghost
 //! - footer hint rail: slash commands · file refs · shortcuts + send affordance
 
@@ -11,8 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding};
 
 use super::super::app::AppMode;
-use super::super::theme;
+use super::super::{icons, theme};
 use crate::commands;
+use std::path::PathBuf;
 
 /// Returns the slash command that `input` is a prefix of, if any.
 pub fn completion(input: &str) -> Option<&'static str> {
@@ -43,9 +44,89 @@ pub fn filtered(input: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Checks if the input has an active @-mention (cursor is after @).
+/// Returns the query string after @.
+pub fn at_mention_query(input: &str, cursor: usize) -> Option<String> {
+    let text: String = input.chars().take(cursor).collect();
+    // Find the last @ that isn't inside a word (preceded by space or at start)
+    let chars: Vec<char> = text.chars().collect();
+    let mut last_at = None;
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '@' {
+            // Check if it's at start or preceded by whitespace
+            if i == 0 || chars[i - 1].is_whitespace() {
+                last_at = Some(i);
+            }
+        }
+    }
+    if let Some(at_pos) = last_at {
+        let query: String = chars[at_pos + 1..].iter().collect();
+        // Don't show picker if query contains space (user moved past the mention)
+        if !query.contains(' ') {
+            return Some(query);
+        }
+    }
+    None
+}
+
+/// Searches workspace files matching the @-mention query.
+/// Returns file paths relative to the workspace root.
+pub fn at_mention_files(query: &str) -> Vec<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let ignore = crate::ignore::IgnoreRules::load(&cwd);
+    let mut results = Vec::new();
+    let max_results = 12;
+
+    fn walk_for_at(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        ignore: &crate::ignore::IgnoreRules,
+        query: &str,
+        results: &mut Vec<String>,
+        max: usize,
+        depth: usize,
+    ) {
+        if results.len() >= max || depth > 8 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if results.len() >= max {
+                break;
+            }
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = path.is_dir();
+            // Skip hidden and common ignore dirs
+            if name.starts_with('.') || name == "target" || name == "node_modules" || name == ".git" {
+                continue;
+            }
+            let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            if ignore.matches(&rel, is_dir) {
+                continue;
+            }
+            if !is_dir && (query.is_empty() || name.to_ascii_lowercase().contains(&query.to_ascii_lowercase())) {
+                results.push(rel);
+            }
+            if is_dir {
+                walk_for_at(&path, base, ignore, query, results, max, depth + 1);
+            }
+        }
+    }
+
+    walk_for_at(&cwd, &cwd, &ignore, query, &mut results, max_results, 0);
+    results.sort();
+    results
+}
+
 /// Builds rich palette lines for dropdown — scrollable, shows all matches.
-/// `selected` is clamped and kept centered in a 12-row window.
-pub fn palette_lines(input: &str, selected: usize) -> Vec<Line<'static>> {
+/// `selected` is clamped and kept centered in a 12-row window; `hovered`
+/// (absolute index) renders with a soft sheen for mouse-over feedback.
+pub fn palette_lines(input: &str, selected: usize, hovered: Option<usize>) -> Vec<Line<'static>> {
     let t = theme::active();
     let hits = filtered(input);
     if hits.is_empty() {
@@ -70,30 +151,40 @@ pub fn palette_lines(input: &str, selected: usize) -> Vec<Line<'static>> {
     ));
     if start > 0 {
         out.push(Line::styled(
-            format!("  ↑ {} more", start),
+            format!("  {} {} more", "\u{f077}", start), // chevron-up
             Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
         ));
     }
     for (idx, cmd) in hits[start..end].iter().enumerate() {
         let global_idx = start + idx;
         let is_sel = global_idx == sel;
-        let bg = if is_sel { t.bg_hover } else { t.bg_tertiary };
+        let is_hover = hovered == Some(global_idx) && !is_sel;
+        let bg = if is_sel {
+            t.bg_hover
+        } else if is_hover {
+            t.bg_secondary
+        } else {
+            t.bg_tertiary
+        };
         let fg = if is_sel { t.accent_primary } else { t.text_secondary };
         let mut style = Style::default().fg(fg).bg(bg);
         if is_sel {
-            style = style.add_modifier(Modifier::BOLD);
+            style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         }
         let desc = describe(cmd);
+        // leading glyph: the command's own icon doubles as the pointer when selected
+        let icon = icons::command(cmd);
         let marker = if is_sel { "▸" } else { " " };
         out.push(Line::from(vec![
             Span::styled(format!("{marker} "), Style::default().fg(t.accent_primary).bg(bg)),
+            Span::styled(format!("{icon} "), Style::default().fg(if is_sel { t.accent_primary } else { t.text_muted }).bg(bg)),
             Span::styled(*cmd, style),
             Span::styled(format!("  {desc}"), Style::default().fg(t.text_muted).bg(bg)),
         ]));
     }
     if end < total {
         out.push(Line::styled(
-            format!("  ↓ {} more", total - end),
+            format!("  {} {} more", "\u{f078}", total - end), // chevron-down
             Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
         ));
     }
@@ -103,40 +194,20 @@ pub fn palette_lines(input: &str, selected: usize) -> Vec<Line<'static>> {
 pub fn describe(cmd: &str) -> &'static str {
     match cmd {
         "/help" => "show help",
-        "/exit" | "/quit" => "quit",
+        "/exit" | "/quit" | "/q" => "quit",
         "/clear" | "/reset" => "clear chat",
+        "/provider" => "switch provider",
         "/models" => "list models",
         "/model" => "switch model",
-        "/temp" => "temperature",
-        "/system" => "system prompt",
+        "/router" => "router status / failover",
         "/history" => "show history",
-        "/undo" => "undo last",
         "/retry" => "retry last",
-        "/variants" => "alternates",
-        "/pick" => "pick variant",
-        "/compact" => "compact history",
-        "/search" => "search",
         "/save" => "save session",
         "/load" => "load session",
-        "/sessions" => "list sessions",
-        "/fork" => "fork session",
-        "/export" => "export md/txt",
-        "/stats" => "session stats",
-        "/theme" => "theme",
+        "/theme" => "switch theme",
         "/tokens" => "token usage",
-        "/raw" => "toggle markdown",
-        "/config" => "show/save config",
-        "/timeout" => "request timeout",
-        "/limit" => "response cap",
-        "/tools" => "tools registry",
-        "/todo" => "task list",
-        "/diff" => "staged diff",
-        "/apply" => "apply edits",
-        "/reject" => "discard edits",
-        "/review" => "review edits",
-        "/scan" => "scan workspace",
-        "/plan" => "plan task",
-        "/project" => "project memory",
+        "/todo" => "task list (model-controllable)",
+        "/cd" | "/open" => "change folder — open workspace",
         _ => "",
     }
 }
@@ -151,10 +222,10 @@ pub fn header_line(mode: AppMode, focus_input: bool) -> Line<'static> {
         AppMode::Plan => t.accent_primary,
     };
     let (icon, label) = match mode {
-        AppMode::Normal => ("◉", " NORMAL "),
-        AppMode::Agent => ("✦", " AGENT "),
-        AppMode::Review => ("⚠", " REVIEW "),
-        AppMode::Plan => ("⬢", " PLAN "),
+        AppMode::Normal => (icons::MODE_READY, " NORMAL "),
+        AppMode::Agent => (icons::MODE_AGENT, " AGENT "),
+        AppMode::Review => (icons::MODE_REVIEW, " REVIEW "),
+        AppMode::Plan => (icons::MODE_PLAN, " PLAN "),
     };
     // chip: icon + mode label with accent background when focused, muted otherwise
     let chip_style = if focus_input {
@@ -189,7 +260,7 @@ pub fn header_suffix(pinned: usize) -> Option<Line<'static>> {
     let t = theme::active();
     Some(Line::from(vec![
         Span::styled(
-            format!(" 📎 {pinned} "),
+            format!(" {} {pinned} ", icons::PINNED),
             Style::default()
                 .fg(t.accent_secondary)
                 .bg(t.bg_tertiary)
@@ -218,7 +289,7 @@ pub fn footer_hint(has_ghost: bool, focus_input: bool, confirm_pending: bool) ->
 
     if confirm_pending {
         return Line::from(vec![
-            Span::styled(" ⚠ ", Style::default().fg(t.accent_warning).bg(t.bg_tertiary)),
+            Span::styled(format!(" {} ", icons::MODE_REVIEW), Style::default().fg(t.accent_warning).bg(t.bg_tertiary)),
             Span::styled(" y approve ", key_style),
             Span::styled(" n decline ", key_style),
             Span::styled(" a all ", key_style),
@@ -233,21 +304,12 @@ pub fn footer_hint(has_ghost: bool, focus_input: bool, confirm_pending: bool) ->
             Span::styled(" clear ", muted),
         ]);
     }
-    // default modern rail: evenly spaced affordances
+    // single shortcut entry — all other hints live in the Shortcuts modal (?)
     Line::from(vec![
-        Span::styled(" / ", key_style),
-        Span::styled("commands ", muted),
-        Span::styled("·", muted),
-        Span::styled(" @ ", key_style),
-        Span::styled("files ", muted),
-        Span::styled("·", muted),
-        Span::styled(" Esc ", key_style),
-        Span::styled("clear ", muted),
-        Span::styled("·", muted),
-        Span::styled(" ↑↓ ", key_style),
-        Span::styled("history ", muted),
+        Span::styled(" ? ", key_style),
+        Span::styled("Shortcuts ", muted),
         Span::styled("  ", muted),
-        Span::styled(" ↵ Send ", action_style),
+        Span::styled(format!(" {} Send ", icons::SEND), action_style),
         Span::styled(" ", muted),
     ])
 }
@@ -286,10 +348,10 @@ pub fn build(mode: AppMode, focus_input: bool, input: &str) -> (String, Line<'st
     spans.push(Span::styled(" ❯ ", prompt_style));
 
     if input.is_empty() && focus_input {
-        // rich placeholder: primary hint + dim secondary hint
+        // rich placeholder: higher contrast for light glass
         spans.push(Span::styled(
             "Ask me to code, debug, or explain…",
-            Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+            Style::default().fg(t.text_secondary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             "  ·  try \"/\" for commands",
@@ -353,7 +415,6 @@ pub fn block(focus_input: bool, mode: AppMode) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color).bg(t.bg_tertiary))
-        .border_type(ratatui::widgets::BorderType::Rounded)
         .style(Style::default().bg(t.bg_tertiary))
         .padding(Padding::horizontal(1))
 }
@@ -363,12 +424,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_registered_command_has_a_palette_description() {
+        for cmd in crate::commands::SLASH_COMMANDS {
+            assert!(
+                !describe(cmd).is_empty(),
+                "palette description missing for {cmd} — it would render blank in the COMMANDS panel"
+            );
+        }
+        // And no stale entries: describe() must not know erased commands.
+        assert_eq!(describe("/pty"), "", "/pty was removed from the registry");
+    }
+
+    #[test]
     fn completes_slash_prefixes() {
         assert_eq!(completion("/hel"), Some("/help"));
         assert_eq!(completion("/help"), None); // exact match → no ghost
         assert_eq!(completion("hello"), None);
         // A space means the command is already typed; no completion.
-        assert_eq!("/tools ".contains(' '), true);
+        assert!("/tools ".contains(' '));
     }
 
     #[test]

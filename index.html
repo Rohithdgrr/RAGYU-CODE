@@ -1,0 +1,1258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GOVINDA — cut glass terminal</title>
+<meta name="color-scheme" content="dark light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#ECEEF4;
+  --panel:#E0E6F1;
+  --raised:#F8FAFD;
+  --hover:#D6DEEC;
+  --edge:#BEC8DA;
+  --edge-soft:rgba(190,200,218,.72);
+  --text:#181E2C;
+  --text-2:#4E5A70;
+  --muted:#8C98AE;
+  --inverse:#F8FAFD;
+  --cobalt:#3F76E3;
+  --cobalt-2:#5894FF;
+  --violet:#7C5CFF;
+  --mint:#34D399;
+  --amber:#FBBF24;
+  --coral:#F87171;
+  --rose:#E84A4A;
+  --max:1440px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  background:var(--ink);
+  color:var(--text);
+  font-family:"DM Sans",system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+button{font:inherit}
+a{color:var(--cobalt-2)}
+/* backdrop depth — Frosted Daylight */
+.bg{
+  position:fixed; inset:0; z-index:-1;
+  background:
+    radial-gradient(900px 520px at 15% 0%, rgba(63,118,227,.12), transparent 60%),
+    radial-gradient(700px 400px at 85% 18%, rgba(124,92,255,.10), transparent 62%),
+    radial-gradient(500px 500px at 50% 100%, rgba(52,211,153,.07), transparent 70%),
+    linear-gradient(180deg, #ECEEF4 0%, #E6EAF2 55%, #DDE4EF 100%);
+}
+.grid{
+  position:fixed; inset:0; z-index:-1; opacity:.16;
+  background-image:
+    linear-gradient(rgba(190,200,218,.42) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(190,200,218,.42) 1px, transparent 1px);
+  background-size: 32px 32px;
+  mask: linear-gradient(180deg, black 60%, transparent 92%);
+}
+/* shell */
+.shell{
+  height:100dvh;
+  display:flex; flex-direction:column;
+  max-width:var(--max);
+  margin:0 auto;
+  padding:14px 14px 10px;
+  gap:10px;
+}
+/* glass primitive — solid cut glass, sharp edges — Frosted Daylight */
+.glass{
+  background: rgba(248,250,253,.78);
+  backdrop-filter: blur(22px) saturate(1.15);
+  -webkit-backdrop-filter: blur(22px) saturate(1.15);
+  border:1px solid var(--edge);
+  position:relative;
+  /* sharp */
+  border-radius:0;
+  box-shadow: 0 14px 36px rgba(24,30,44,.10), 0 2px 10px rgba(24,30,44,.06), inset 0 1px 0 rgba(255,255,255,.82);
+}
+.glass::before{
+  content:"";
+  position:absolute; left:0; right:0; top:0; height:1px;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.10), transparent);
+  pointer-events:none;
+}
+.glass.focused{
+  border-color: var(--cobalt);
+  box-shadow: 0 18px 48px rgba(0,0,0,.5), 0 0 0 1px rgba(63,118,227,.18), inset 0 1px 0 rgba(255,255,255,.08);
+}
+.glass.focused::after{
+  content:"";
+  position:absolute; top:-1px; left:12%; right:12%; height:1px;
+  background: linear-gradient(90deg, transparent, var(--cobalt), transparent);
+  opacity:.9;
+}
+/* top rail */
+.rail{
+  height:44px; display:flex; align-items:center; gap:0;
+  padding:0 0;
+  overflow:hidden;
+}
+.rail-inner{
+  display:flex; align-items:center; gap:0;
+  width:100%; height:100%;
+  padding:0 14px;
+  font-size:12.5px;
+  white-space:nowrap;
+}
+.brand{
+  display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:.02em;
+  flex-shrink:0;
+}
+.brand-mark{
+  width:28px; height:28px; display:grid; place-items:center;
+  background: var(--ink); border:1px solid var(--edge); color:var(--cobalt-2);
+  font-family:"JetBrains Mono",monospace; font-size:13px; font-weight:700;
+}
+.brand b{font-family:"Syne",sans-serif; font-weight:800; letter-spacing:-.02em; font-size:13px}
+.brand i{font-style:normal; color:var(--muted); font-weight:500; font-size:11px; letter-spacing:.06em}
+.divider{width:1px; height:18px; background:var(--edge); margin:0 12px; flex-shrink:0}
+.mode{
+  display:inline-flex; align-items:center; gap:6px;
+  padding:6px 10px; font-size:11px; font-weight:800; letter-spacing:.08em;
+  color:var(--inverse); line-height:1;
+}
+.mode.ready{background:var(--mint); color:#0B1A14}
+.mode.agent{background:var(--violet)}
+.mode.review{background:var(--amber); color:#1F1600}
+.chip{color:var(--text-2); font-size:12px}
+.chip b{color:var(--text); font-weight:700}
+.bar{
+  display:inline-flex; gap:1px; margin:0 6px; transform:translateY(1px)
+}
+.bar i{
+  display:inline-block; width:6px; height:8px; background:var(--edge);
+}
+.bar i.on{background:var(--mint)}
+.bar i.warn{background:var(--amber)}
+.tokens{color:var(--muted); font-size:12px}
+.tokens b{color:var(--text); font-family:"JetBrains Mono",monospace; font-weight:600}
+.rail-right{margin-left:auto; display:flex; align-items:center; gap:8px; flex-shrink:0}
+.pill{
+  display:inline-flex; align-items:center; gap:6px;
+  padding:6px 9px; border:1px solid var(--edge); background:rgba(13,17,27,.6);
+  font-size:11px; font-weight:700; letter-spacing:.04em; color:var(--text-2);
+}
+.pill.live{color:var(--inverse); background:var(--cobalt); border-color:var(--cobalt)}
+.pill.err{background:var(--coral); color:#fff; border-color:var(--coral)}
+.icon-btn{
+  width:32px; height:32px; display:grid; place-items:center;
+  border:1px solid var(--edge); background:rgba(13,17,27,.55); color:var(--text-2); cursor:pointer;
+}
+.icon-btn:hover{border-color:var(--cobalt); color:var(--text)}
+.icon-btn:focus-visible{outline:1px solid var(--cobalt); outline-offset:1px}
+/* body layout */
+.body{
+  flex:1; min-height:0;
+  display:grid;
+  grid-template-columns: 260px 1fr 300px;
+  gap:10px;
+}
+.pane{
+  display:flex; flex-direction:column; min-height:0; overflow:hidden;
+}
+.pane-head{
+  height:36px; display:flex; align-items:center; justify-content:space-between;
+  padding:0 12px; border-bottom:1px solid var(--edge);
+  background: rgba(236,240,247,.82);
+  font-size:11px; font-weight:800; letter-spacing:.12em; color:var(--text-2);
+}
+.pane-head b{color:var(--text); font-family:"Syne",sans-serif; letter-spacing:.06em}
+.pane-body{flex:1; min-height:0; overflow:auto; scrollbar-width:thin; scrollbar-color: var(--edge) transparent}
+.pane-body::-webkit-scrollbar{width:6px}
+.pane-body::-webkit-scrollbar-thumb{background:var(--edge)}
+
+/* tree */
+.tree{padding:8px 0}
+.row{
+  display:flex; align-items:center; gap:8px;
+  padding:6px 12px; font-size:12.5px; color:var(--text-2); cursor:pointer;
+  border-left:2px solid transparent;
+}
+.row:hover{background:var(--hover); color:var(--text)}
+.row.active{background: rgba(63,118,227,.14); border-left-color:var(--cobalt); color:var(--text)}
+.row .g{opacity:.7}
+.row small{margin-left:auto; color:var(--muted); font-family:"JetBrains Mono",monospace; font-size:10px}
+.dot{width:7px; height:7px; border-radius:50%; display:inline-block}
+.dot.g{background:var(--mint)} .dot.y{background:var(--amber)} .dot.r{background:var(--coral)}
+/* chat */
+.chat{padding:14px 14px 0; display:flex; flex-direction:column; gap:0}
+.msg{margin-bottom:14px; max-width:100%}
+.msg.you{align-self:flex-end; max-width:78%}
+.msg.gov{align-self:flex-start; max-width:92%}
+.msg.you .bubble{background: rgba(124,92,255,.08); border-color: rgba(124,92,255,.28); border-right:3px solid var(--violet)}
+.msg.gov .bubble{background: rgba(255,255,255,.86); border-color: rgba(190,200,218,.72); border-left:3px solid var(--cobalt)}
+.head{
+  display:inline-flex; align-items:center; gap:8px;
+  padding:6px 10px; font-size:11px; font-weight:800; letter-spacing:.07em;
+  border:1px solid var(--edge);
+}
+.head.you{background:var(--violet); color:#fff; border-color:var(--violet)}
+.head.gov{background:var(--cobalt); color:#fff; border-color:var(--cobalt)}
+.bubble{
+  margin-top:8px; padding:12px 14px;
+  background: rgba(255,255,255,.72);
+  border:1px solid rgba(190,200,218,.72);
+  font-size:13.5px; line-height:1.65; color:var(--text);
+}
+.bubble p{margin:0 0 10px}
+.bubble p:last-child{margin:0}
+.bubble strong{color:var(--text)}
+.bubble code{
+  font-family:"JetBrains Mono",monospace;
+  background: rgba(236,240,247,.95); border:1px solid var(--edge);
+  padding:1px 5px; font-size:12px; color: #1E3A8A;
+}
+.code-block{
+  margin:10px 0 0;
+  border:1px solid var(--edge);
+  background: rgba(248,250,253,.98);
+  overflow:hidden;
+}
+.code-top{
+  display:flex; align-items:center; justify-content:space-between;
+  padding:7px 10px; border-bottom:1px solid var(--edge);
+  background: rgba(224,230,241,.92);
+  font-family:"JetBrains Mono",monospace; font-size:11px; letter-spacing:.06em; color:var(--muted);
+}
+.code-top b{color:var(--text-2); font-weight:700}
+.code-body{
+  padding:10px 12px; font-family:"JetBrains Mono",monospace; font-size:12.5px; line-height:1.7;
+  color:var(--text); white-space:pre-wrap; word-break:break-word;
+}
+.kw{color:#C4B5FD} .fn{color:#7DD3FC} .str{color:#F9A8D4} .com{color:#6B8A6B}
+.tool-line{
+  display:flex; align-items:center; gap:8px;
+  padding:9px 11px; margin-top:10px;
+  border:1px solid var(--edge); background: rgba(236,240,247,.82);
+  font-family:"JetBrains Mono",monospace; font-size:11.5px; color:var(--text-2);
+}
+.tool-line.ok{border-left:3px solid var(--mint)}
+.tool-line.run{border-left:3px solid var(--amber); animation: pulse 1.2s infinite}
+@keyframes pulse{0%,100%{opacity:1} 50%{opacity:.72}}
+.status{width:8px; height:8px; border-radius:50%; flex-shrink:0}
+.status.ok{background:var(--mint)} .status.run{background:var(--amber)}
+.shell-out{
+  margin-top:6px; border:1px solid var(--edge); background:#0F1420; color:#C7D2FE;
+  font-family:"JetBrains Mono",monospace; font-size:11.5px; line-height:1.6; overflow:hidden;
+}
+.shell-head{display:flex; justify-content:space-between; padding:6px 10px; background:#1A2235; color:#8B9CC4; font-size:10px; letter-spacing:.06em; border-bottom:1px solid #24304D}
+.shell-body{padding:10px 12px; white-space:pre-wrap; word-break:break-word}
+.shell-body .ok{color:var(--mint)} .shell-body .err{color:var(--coral)} .shell-body .mut{color:#8B9CC4}
+.op-divider{display:flex; align-items:center; gap:8px; margin:14px 0 4px; font-size:10px; font-weight:800; letter-spacing:.14em; color:var(--muted)}
+.op-divider::before, .op-divider::after{content:""; flex:1; height:1px; background:var(--edge)}
+/* tools right */
+.tool-card{padding:10px 12px; border-bottom:1px solid rgba(52,64,92,.45)}
+.tool-card:last-child{border:0}
+.tool-card h4{
+  margin:0; display:flex; align-items:center; gap:8px;
+  font-size:12px; font-weight:700; color:var(--text);
+}
+.tool-card p{margin:6px 0 0; font-size:12px; line-height:1.5; color:var(--muted)}
+.toggle{
+  width:34px; height:20px; border:1px solid var(--edge); background:var(--ink);
+  position:relative; cursor:pointer; flex-shrink:0;
+}
+.toggle i{
+  position:absolute; top:2px; left:2px; width:14px; height:14px; background:var(--muted); transition:.18s;
+}
+.toggle.on{border-color:var(--mint)} .toggle.on i{left:16px; background:var(--mint)}
+/* todo */
+.todo-item{display:flex; align-items:center; gap:10px; padding:9px 12px; border-bottom:1px solid rgba(190,200,218,.38); font-size:13px; color:var(--text)}
+.todo-item.done{opacity:.58}
+.todo-item.done .todo-text{text-decoration:line-through; color:var(--muted)}
+.todo-check{width:18px; height:18px; border:1px solid var(--edge); background:var(--raised); display:grid; place-items:center; cursor:pointer; flex-shrink:0}
+.todo-check.on{background:var(--mint); border-color:var(--mint); color:#0B1A14; font-size:11px; font-weight:800}
+.todo-text{flex:1; line-height:1.4; word-break:break-word}
+.todo-del{width:26px; height:26px; display:grid; place-items:center; border:1px solid transparent; background:transparent; color:var(--muted); cursor:pointer; flex-shrink:0}
+.todo-del:hover{border-color:var(--edge); color:var(--coral); background:rgba(248,113,113,.08)}
+/* composer — floating cut glass */
+.composer{
+  padding:10px;
+  background: rgba(248,250,253,.88);
+  backdrop-filter: blur(22px) saturate(1.15);
+  -webkit-backdrop-filter: blur(22px) saturate(1.15);
+}
+.comp-head{
+  display:flex; align-items:center; justify-content:space-between;
+  font-size:10px; font-weight:800; letter-spacing:.12em; color:var(--muted); margin-bottom:8px;
+}
+.comp-head b{color:var(--text-2)}
+.comp-box{
+  display:flex; align-items:center; gap:10px;
+  padding:12px 12px; background: rgba(255,255,255,.92); border:1px solid var(--edge);
+}
+.comp-box:focus-within{border-color:var(--cobalt); box-shadow:0 0 0 1px rgba(63,118,227,.18)}
+.comp-box input{
+  flex:1; background:transparent; border:0; outline:0; color:var(--text);
+  font-family:"JetBrains Mono",monospace; font-size:13px;
+}
+.comp-box input::placeholder{color:var(--muted)}
+.send-btn{
+  width:36px; height:36px; display:grid; place-items:center;
+  background:var(--cobalt); border:1px solid var(--cobalt); color:#fff; cursor:pointer; flex-shrink:0;
+}
+.send-btn:hover{background:var(--cobalt-2); border-color:var(--cobalt-2)}
+.comp-foot{
+  display:flex; align-items:center; gap:10px; margin-top:8px;
+  font-size:11px; color:var(--muted); flex-wrap:wrap;
+}
+.comp-foot kbd{
+  display:inline-flex; align-items:center; padding:2px 6px;
+  border:1px solid var(--edge); background:var(--ink); font-family:"JetBrains Mono",monospace; font-size:10px; color:var(--text-2);
+}
+.live-chip{
+  display:inline-flex; align-items:center; gap:6px;
+  padding:4px 8px; background:var(--cobalt); color:#fff; font-size:10px; font-weight:800; letter-spacing:.08em;
+}
+/* palette */
+.palette{
+  position:absolute; bottom:100%; left:10px; right:10px; margin-bottom:8px;
+  background: rgba(21,27,42,.96); border:1px solid var(--edge);
+  box-shadow: 0 16px 40px rgba(0,0,0,.5); display:none; overflow:hidden;
+  z-index:30;
+}
+.palette.open{display:block}
+.pal-head{padding:8px 10px; border-bottom:1px solid var(--edge); font-size:10px; font-weight:800; letter-spacing:.12em; color:var(--muted)}
+.pal-list{max-height:240px; overflow:auto}
+.pal-item{
+  display:flex; align-items:center; gap:10px;
+  padding:9px 12px; cursor:pointer; border-left:2px solid transparent;
+}
+.pal-item:hover, .pal-item.active{background:rgba(63,118,227,.12); border-left-color:var(--cobalt); color:var(--text)}
+.pal-item b{font-size:12.5px; color:var(--text); min-width:110px}
+.pal-item span{font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+/* @ picker */
+.at-picker{
+  position:absolute; bottom:100%; left:10px; width:360px; max-width:calc(100% - 20px);
+  background: rgba(21,27,42,.96); border:1px solid var(--violet);
+  box-shadow:0 16px 40px rgba(0,0,0,.5); display:none; z-index:30; overflow:hidden;
+}
+.at-picker.open{display:block}
+.at-item{padding:8px 12px; display:flex; gap:10px; align-items:center; font-family:"JetBrains Mono",monospace; font-size:12px; color:var(--text-2); cursor:pointer}
+.at-item.active, .at-item:hover{background:var(--hover); color:var(--text)}
+/* modal */
+.dialog{
+  position:fixed; inset:0; display:none; place-items:center; z-index:50;
+  background: rgba(3,6,14,.56); backdrop-filter: blur(6px);
+}
+.dialog.open{display:grid}
+.modal{
+  width:min(560px, calc(100% - 24px));
+  background: rgba(21,27,42,.96); border:1px solid var(--edge);
+  box-shadow: 0 24px 64px rgba(0,0,0,.6);
+}
+.modal-head{
+  padding:14px 16px; border-bottom:1px solid var(--edge);
+  display:flex; align-items:center; justify-content:space-between;
+}
+.modal-head h3{margin:0; font-family:"Syne",sans-serif; font-size:14px; font-weight:800; letter-spacing:-.02em}
+.modal-body{padding:14px 16px}
+.input{width:100%; padding:10px 12px; background:var(--ink); border:1px solid var(--edge); color:var(--text); font-family:"JetBrains Mono",monospace; outline:0}
+.input:focus{border-color:var(--cobalt)}
+.btn{
+  padding:10px 14px; border:1px solid var(--edge); background:var(--panel); color:var(--text); font-size:12px; font-weight:700; letter-spacing:.06em; cursor:pointer;
+}
+.btn.primary{background:var(--cobalt); border-color:var(--cobalt); color:#fff}
+.btn:hover{filter:brightness(1.08)}
+/* provider chips */
+.providers{display:flex; flex-wrap:wrap; gap:8px}
+.p-chip{
+  padding:7px 10px; border:1px solid var(--edge); background:rgba(13,17,27,.6);
+  font-family:"JetBrains Mono",monospace; font-size:11px; color:var(--text-2); cursor:pointer;
+}
+.p-chip.active{background:var(--cobalt); border-color:var(--cobalt); color:#fff}
+/* animations */
+@media (prefers-reduced-motion: no-preference){
+  .rail{animation: drop .5s cubic-bezier(.16,1,.3,1) both}
+  .body .pane:nth-child(1){animation: rise .6s .08s both}
+  .body .pane:nth-child(2){animation: rise .6s .14s both}
+  .body .pane:nth-child(3){animation: rise .6s .2s both}
+  .composer{animation: rise .6s .26s both}
+}
+@keyframes drop{from{opacity:0; transform:translateY(-10px)} to{opacity:1; transform:translateY(0)}}
+@keyframes rise{from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:translateY(0)}}
+/* responsive */
+@media (max-width:1100px){
+  .body{grid-template-columns: 220px 1fr 260px}
+}
+@media (max-width:860px){
+  .body{grid-template-columns: 1fr}
+  .pane.tree, .pane.tools{display:none}
+  .pane.tree.show, .pane.tools.show{display:flex}
+  .rail-inner{font-size:11px}
+  .hide-sm{display:none}
+}
+@media (max-width:520px){
+  .shell{padding:8px; gap:8px}
+  .rail{height:auto; min-height:44px}
+  .brand i{display:none}
+}
+
+/* chamfer beam — mouse follow on focused pane */
+.pane.focused::before{
+  content:""; position:absolute; top:0; left:0; right:0; height:1px;
+  background: linear-gradient(90deg, transparent 0, rgba(63,118,227,.0) 20%, rgba(63,118,227,.9) 50%, rgba(63,118,227,0) 80%, transparent 100%);
+  transform: translateX(calc(var(--mx, 50%) - 50%));
+  transition: transform .12s linear;
+  pointer-events:none;
+}
+</style>
+</head>
+<body>
+<div class="bg"></div><div class="grid"></div>
+
+<div class="shell" id="app">
+  <!-- RAIL -->
+  <div class="glass rail focused" id="rail">
+    <div class="rail-inner">
+      <div class="brand">
+        <div class="brand-mark">◆</div>
+        <b>GOVINDA</b><i>v0.1.0</i>
+      </div>
+      <div class="divider hide-sm"></div>
+      <span class="mode ready" id="modeChip">● READY</span>
+      <div class="divider hide-sm"></div>
+      <span class="chip hide-sm" id="providerChip"><span style="opacity:.6">◇</span> <b id="provName">mistral</b> <span style="opacity:.5">·</span> <span id="modelName">mistral-small-latest</span></span>
+      <div class="divider hide-sm"></div>
+      <span class="bar hide-sm" id="tokenBar" aria-hidden="true"></span>
+      <span class="tokens" id="tokenText"><b>3.7k</b> / 8.2k <b style="color:var(--mint)">45%</b></span>
+      <div class="rail-right">
+        <span class="pill hide-sm">↻ <b id="turns">7</b></span>
+        <span class="pill hide-sm">◆ 2 pinned</span>
+        <span class="pill err" id="errPill" style="display:none">✕ 0</span>
+        <span class="pill live" id="livePill" style="display:none">◉ LIVE</span>
+        <button class="icon-btn" id="costBtn" title="Usage">◍</button>
+        <button class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- BODY -->
+  <div class="body">
+    <!-- LEFT TREE -->
+    <div class="glass pane tree focused" id="paneTree" style="--mx:50%">
+      <div class="pane-head"><b>PROJECT</b> <span id="projPath" style="font-family:'JetBrains Mono',monospace; font-weight:600; letter-spacing:0; cursor:pointer" title="Click to change folder">▸ GOVINDA</span><button id="openFolderBtn" style="margin-left:auto; padding:3px 7px; border:1px solid var(--edge); background:var(--ink); color:var(--text-2); font-size:10px; font-weight:800; letter-spacing:.06em; cursor:pointer">↗ Open</button></div>
+      <div class="pane-body tree" id="tree">
+        <!-- injected by JS -->
+      </div>
+    </div>
+
+    <!-- CENTER CHAT -->
+    <div class="glass pane" id="paneChat" style="display:flex; flex-direction:column;">
+      <div class="pane-head"><b>CHAT</b> <span id="chatMeta" style="font-weight:500; letter-spacing:.04em; text-transform:none">Ctrl+K focus · / commands · @ files</span></div>
+      <div class="pane-body chat" id="chat" role="log" aria-live="polite">
+        <!-- messages injected -->
+      </div>
+    </div>
+
+    <!-- RIGHT TODO -->
+    <div class="glass pane tools" id="paneTools">
+      <div class="pane-head"><b>TODO LIST</b> <span id="todoCount" style="color:var(--muted)">3 left</span></div>
+      <div class="pane-body" id="toolsBody" style="display:flex; flex-direction:column">
+        <div style="padding:10px 12px; border-bottom:1px solid var(--edge); display:flex; gap:8px; background:rgba(255,255,255,.55)">
+          <input id="todoInput" placeholder="Add task…  Enter to add" style="flex:1; padding:9px 10px; background:var(--raised); border:1px solid var(--edge); color:var(--text); font-family:'DM Sans',sans-serif; font-size:13px; outline:0">
+          <button class="btn primary" id="todoAdd" style="padding:9px 12px">Add</button>
+        </div>
+        <div id="todoList" style="flex:1; overflow:auto; padding:6px 0"></div>
+        <div style="padding:8px 12px; border-top:1px solid var(--edge); display:flex; gap:6px; flex-wrap:wrap; align-items:center; background:rgba(236,240,247,.72)">
+          <button class="btn" style="font-size:11px; padding:6px 8px" onclick="filterTodo('all')" id="fAll">All</button>
+          <button class="btn" style="font-size:11px; padding:6px 8px" onclick="filterTodo('active')" id="fActive">Active</button>
+          <button class="btn" style="font-size:11px; padding:6px 8px" onclick="filterTodo('done')" id="fDone">Done</button>
+          <span style="flex:1"></span>
+          <button class="btn" style="font-size:11px; padding:6px 8px" onclick="clearDone()">Clear done</button>
+          <button class="btn" style="font-size:11px; padding:6px 8px" onclick="openDialog('save')">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- COMPOSER -->
+  <div class="glass composer focused" id="composer" style="position:relative">
+    <div class="comp-head">
+      <span><b id="focusHint">FOCUSED — COMPOSER</b> <span class="hide-sm" style="margin-left:8px; opacity:.6">Tab:chat · Esc clear</span></span>
+      <span class="live-chip" id="streamChip" style="display:none">◉ STREAMING</span>
+      <span id="pinnedBadge" style="font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--cobalt-2)">◆ 2 pinned</span>
+    </div>
+
+    <!-- palette -->
+    <div class="palette" id="palette">
+      <div class="pal-head">COMMANDS — ↑↓ navigate · Tab complete · Enter select</div>
+      <div class="pal-list" id="palList"></div>
+    </div>
+    <!-- @ picker -->
+    <div class="at-picker" id="atPicker">
+      <div style="padding:8px 10px; border-bottom:1px solid var(--edge); font-size:10px; font-weight:800; letter-spacing:.12em; color:var(--muted)">FILES — ↑↓ · Enter insert</div>
+      <div id="atList"></div>
+    </div>
+
+    <div class="comp-box">
+      <span style="color:var(--cobalt); font-family:'JetBrains Mono',monospace; font-weight:700">❯</span>
+      <input id="input" placeholder="Ask to code, debug, or explain…  Try / or @ " autocomplete="off" spellcheck="false">
+      <button class="send-btn" id="sendBtn" aria-label="Send">✈</button>
+    </div>
+    <div class="comp-foot">
+      <button id="shortcutsBtn" style="display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border:1px solid var(--edge); background:var(--raised); color:var(--text-2); font-size:11px; font-weight:700; cursor:pointer"><span style="width:16px; height:16px; display:grid; place-items:center; background:var(--ink); border:1px solid var(--edge); font-family:'JetBrains Mono',monospace; font-size:10px">?</span> Shortcuts</button>
+      <span style="margin-left:auto; color:var(--muted); font-size:11px">mock demo — no keys leave the browser</span>
+    </div>
+  </div>
+</div>
+
+<!-- SAVE DIALOG -->
+<div class="dialog" id="dialog">
+  <div class="modal glass">
+    <div class="modal-head">
+      <h3 id="dialogTitle">Save session</h3>
+      <button class="icon-btn" onclick="closeDialog()">✕</button>
+    </div>
+    <div class="modal-body">
+      <p id="dialogDesc" style="margin:0 0 10px; color:var(--muted); font-size:13px">Name your session JSON. Stored in <code>sessions/</code>.</p>
+      <input class="input" id="dialogInput" placeholder="my-session">
+      <div style="display:flex; gap:8px; margin-top:12px; justify-content:flex-end">
+        <button class="btn" onclick="closeDialog()">Cancel</button>
+        <button class="btn primary" onclick="confirmDialog()">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- COST -->
+<div class="dialog" id="costDialog">
+  <div class="modal glass" style="width:min(520px, calc(100% - 24px))">
+    <div class="modal-head">
+      <h3>USAGE & COST</h3>
+      <button class="icon-btn" onclick="closeCost()">✕</button>
+    </div>
+    <div class="modal-body" style="font-size:13px; line-height:1.7">
+      <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px">
+        <span style="font-weight:800; letter-spacing:.08em; color:var(--cobalt-2)">Token Usage</span>
+        <span style="margin-left:auto; font-family:'JetBrains Mono',monospace; color:var(--muted)" id="costPct">45% · 3.7k / 8.2k</span>
+      </div>
+      <div style="height:8px; background:var(--ink); border:1px solid var(--edge); display:flex">
+        <div id="costBar" style="width:45%; background:var(--mint)"></div>
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:14px; font-family:'JetBrains Mono',monospace; font-size:12px">
+        <div>Turns <b style="color:var(--text)">3</b> · Errors <b style="color:var(--coral)">0</b></div>
+        <div>Avg <b>3400ms</b> · Provider <b id="costProv">mistral</b></div>
+      </div>
+      <p style="color:var(--muted); margin:10px 0 0">Press <kbd>Esc</kbd> to close. Real app enforces 8.2k window with BPE trimming.</p>
+    </div>
+  </div>
+</div>
+
+<!-- SETTINGS -->
+<div class="dialog" id="settingsDialog">
+  <div class="modal glass" style="width:min(520px, calc(100% - 24px))">
+    <div class="modal-head">
+      <h3>SETTINGS</h3>
+      <button class="icon-btn" onclick="closeSettings()">✕</button>
+    </div>
+    <div class="modal-body" style="font-size:13px; line-height:1.7">
+      <div style="display:grid; gap:14px">
+        <div>
+          <div style="font-size:11px; font-weight:800; letter-spacing:.10em; color:var(--muted); margin-bottom:6px">THEME</div>
+          <div style="display:flex; gap:8px">
+            <button class="btn primary" id="setLight" onclick="setTheme('light')">☀ Frosted Daylight</button>
+            <button class="btn" id="setDark" onclick="setTheme('dark')">◐ Midnight Glass</button>
+          </div>
+        </div>
+        <div>
+          <div style="font-size:11px; font-weight:800; letter-spacing:.10em; color:var(--muted); margin-bottom:6px">PROVIDER</div>
+          <div style="display:flex; flex-wrap:wrap; gap:6px" id="settingsProviders"></div>
+        </div>
+        <div style="border-top:1px solid var(--edge); padding-top:10px; display:flex; gap:8px; justify-content:flex-end">
+          <button class="btn" onclick="closeSettings()">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SHORTCUTS -->
+<div class="dialog" id="shortcutsDialog">
+  <div class="modal glass" style="width:min(560px, calc(100% - 24px))">
+    <div class="modal-head">
+      <h3>SHORTCUTS</h3>
+      <button class="icon-btn" onclick="closeShortcuts()">✕</button>
+    </div>
+    <div class="modal-body" style="font-size:12.5px; line-height:1.6">
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px">
+        <div><b>/</b> <span style="color:var(--muted)">commands palette</span></div>
+        <div><b>@</b> <span style="color:var(--muted)">file mention</span></div>
+        <div><b>Tab</b> <span style="color:var(--muted)">cycle palette</span></div>
+        <div><b>↑↓</b> <span style="color:var(--muted)">history / picker</span></div>
+        <div><b>Enter</b> <span style="color:var(--muted)">send / select</span></div>
+        <div><b>Esc</b> <span style="color:var(--muted)">clear / close</span></div>
+        <div><b>Ctrl+L</b> <span style="color:var(--muted)">clear chat</span></div>
+        <div><b>Ctrl+T</b> <span style="color:var(--muted)">toggle project</span></div>
+        <div><b>Ctrl+P</b> <span style="color:var(--muted)">toggle todo</span></div>
+        <div><b>Ctrl+I</b> <span style="color:var(--muted)">usage</span></div>
+        <div><b>?</b> <span style="color:var(--muted)">this help</span></div>
+        <div><b>Click file</b> <span style="color:var(--muted)">pin to context</span></div>
+      </div>
+      <p style="margin-top:12px; color:var(--muted)">All shortcuts also work via the composer. Mock demo — no keys leave the browser.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+const providers = {
+  mistral:{model:"mistral-small-latest", accent:"#3F76E3", accent2:"#5894FF"},
+  openai:{model:"gpt-4o-mini", accent:"#10A37F", accent2:"#34D399"},
+  kimi:{model:"moonshot-v1-128k", accent:"#7C5CFF", accent2:"#A78BFA"},
+  groq:{model:"llama-3.3-70b", accent:"#F97316", accent2:"#FBBF24"},
+  ollama:{model:"llava:7b (local)", accent:"#6B7280", accent2:"#9CA3AF"},
+  deepseek:{model:"deepseek-chat", accent:"#0EA5E9", accent2:"#38BDF8"},
+  nvidia:{model:"llama-3.1-nemotron", accent:"#76B900", accent2:"#A3E635"},
+  bytez:{model:"bytez-auto", accent:"#E11D48", accent2:"#FB7185"}
+};
+const commands = [
+  ["/help","Show all commands"],["/model","Switch model"],["/provider","Switch provider"],["/theme","Color theme"],["/clear","Wipe history"],["/tokens","Token usage"],["/tools","List tools"],["/plan","Decompose task"],["/diff","Show staged edits"],["/apply","Commit edits"],["/scan","Rebuild index"],["/save","Save session"],["/load","Load session"],["/commit","Git commit"],["/pr","Branch / PR"],["/todo","Task list"],["/search","Search history"],["/retry","Regenerate"],["/undo","Remove last"],["/compact","Fold history"],["/export","Export md/txt"],["/raw","Toggle raw mode"]
+];
+const files = [
+  {name:"src/tui/theme.rs", icon:"◆", lang:"rust", dot:"g"},
+  {name:"src/tui/app.rs", icon:"◆", lang:"rust", dot:"g"},
+  {name:"src/tui/draw.rs", icon:"◆", lang:"rust", dot:"y"},
+  {name:"src/api.rs", icon:"⬡", lang:"rust", dot:"g"},
+  {name:"src/agent_loop.rs", icon:"⬡", lang:"rust", dot:"g"},
+  {name:"src/tools.rs", icon:"⬡", lang:"rust", dot:"g"},
+  {name:"Cargo.toml", icon:"⬢", lang:"toml", dot:""},
+  {name:"README.md", icon:"▭", lang:"md", dot:""},
+  {name:"docs/UI-UX-DESIGN.md", icon:"▭", lang:"md", dot:""}
+];
+const atFiles = ["src/tui/theme.rs","src/api.rs","src/agent_loop.rs","src/tools.rs","src/config.rs","Cargo.toml","README.md","docs/PRD.md"];
+
+let todos = [
+  {text:"Wire /theme preview on hover (keep sharp edges)", done:false},
+  {text:"Add staged edit queue → /diff → /apply", done:false},
+  {text:"Implement symbol index rebuild on /scan", done:true},
+  {text:"Test provider switch /provider kimi → violet glow", done:false},
+];
+let todoFilter="all";
+
+const chatData = [
+  {role:"user", text:"Add a /theme switcher that actually previews the palette on hover — keep sharp edges."},
+  {role:"op", text:"AGENT START — govinda read_file → grep → edit_file"},
+  {role:"tool", name:"read_file", args:'{"path":"src/tui/theme.rs"}', ok:true, out:"— 309 lines — outlined 12 symbols"},
+  {role:"tool", name:"grep", args:'{"pattern":"set_by_name","path":"src/tui"}', ok:true, out:"src/tui/theme.rs:224 · src/tui/app.rs:498"},
+  {role:"tool", name:"edit_file", args:'{"path":"src/tui/theme.rs","old":"LIGHT_THEME","new":"FROSTED_DAYLIGHT"}', ok:null, out:"queued — awaiting /diff"},
+  {role:"assistant", text:`Done. Every theme maps onto the two glass bases (Frosted Daylight / Midnight Glass) with its own accent set.
+
+**What changed**
+- Hover any \`/theme <name>\` row → rail glow tints live
+- \`mono\` is the light base, \`default\` is the dark base — \`toggle()\` flips between them
+- Borders use \`border_focus\` on the active pane only
+
+| Theme | Base | Accent |
+|---|---|---|
+| dracula | dark | #BD93F9 |
+| solarized | light | #B58900 |
+| catppuccin | dark | #CBA6F7 |
+
+> Tip: try \`/provider kimi\` — the cobalt beam becomes violet.
+
+\`\`\`rust
+// src/tui/theme.rs:224
+pub fn set_by_name(name: &str) -> bool {
+    let t = NAMED_THEMES.iter().find(|t| t.name==name)?;
+    set(*t); true
+}
+\`\`\``},
+  {role:"tool", name:"run_shell", args:'{"cmd":"cargo check --all-targets"}', ok:false, out:"$ cargo check\n  error[E0425]: cannot find value `GLASS_BLUE` in this scope\n   --> src/tui/theme.rs:117:42"},
+  {role:"assistant", text:"Fixing the stray constant — patching \`GLASS_BLUE → FROSTED_BLUE\` and re-checking."},
+  {role:"tool", name:"check_project", args:'{"tool":"cargo check"}', ok:true, out:"Finished `cargo check` · 0 errors · 18 warnings"},
+  {role:"user", text:"Now wire it to the web preview — @src/tui/theme.rs should tint the rail."},
+  {role:"assistant", text:"Wired. The web rail reads \`--cobalt\` live. Change provider or theme and the beam follows. Code below is the preview patch:"},
+  {role:"code", lang:"html", code:"<!-- index.html — rail tint -->\n<div class=\"glass rail focused\" style=\"--cobalt: var(--cobalt)\">\n  <span class=\"mode ready\">● READY</span>\n  <span class=\"chip\">mistral · mistral-small-latest</span>\n</div>"},
+  {role:"assistant", text:"Say **preview** and I’ll open \`index.html\` in your browser (via \`src/preview.rs:184\`)."},
+];
+
+const chatEl = document.getElementById('chat');
+const input = document.getElementById('input');
+const pal = document.getElementById('palette');
+const palList = document.getElementById('palList');
+const atPicker = document.getElementById('atPicker');
+const atList = document.getElementById('atList');
+const sendBtn = document.getElementById('sendBtn');
+
+function esc(s){return s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
+function inlineFmt(s){
+  return esc(s)
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/~~([^~]+)~~/g,'<span style="text-decoration:line-through; opacity:.8">$1</span>');
+}
+function mdBlocks(text){
+  // minimal block parser for demo: headings, hr, blockquote, table, list, code fences already handled
+  let parts = [];
+  let rest = text;
+  let codeRe = /```(\w*)\n([\s\S]*?)```/g;
+  let last=0, m;
+  while(m=codeRe.exec(text)){
+    if(m.index>last) parts.push({t:"md", v:text.slice(last,m.index)});
+    parts.push({t:"code", lang:m[1]||"code", v:m[2]});
+    last = m.index+m[0].length;
+  }
+  if(last<text.length) parts.push({t:"md", v:text.slice(last)});
+  if(parts.length===0) parts=[{t:"md", v:text}];
+  return parts;
+}
+function renderMd(md){
+  let html="";
+  let lines = md.split("\n");
+  let i=0;
+  while(i<lines.length){
+    let l = lines[i];
+    let t = l.trim();
+    if(!t){ html += "<div style='height:8px'></div>"; i++; continue; }
+    if(/^---+$/.test(t)){ html += "<div style='height:1px; background:var(--edge); margin:8px 0'></div>"; i++; continue; }
+    let hm = t.match(/^(#{1,3})\s+(.*)/);
+    if(hm){
+      let lvl = hm[1].length;
+      let txt = hm[2].replace(/^\*\*|\*\*$/g,'');
+      html += `<div style="font-family:'Syne',sans-serif; font-weight:800; letter-spacing:-.02em; color:${lvl===1?'var(--cobalt-2)':'var(--text)'}; font-size:${lvl===1?16:14}px; margin:8px 0 4px">${inlineFmt(txt)}</div>`;
+      if(lvl===1) html += `<div style="height:1px; background:var(--edge); width:120px; margin-bottom:8px"></div>`;
+      i++; continue;
+    }
+    if(t.startsWith(">")){
+      html += `<div style="border-left:2px solid var(--violet); padding:4px 10px; color:var(--text-2); font-style:italic; margin:6px 0">${inlineFmt(t.replace(/^>\s*/,'').replace(/^>\s*/,'').replace(/^>\s*/,''))}</div>`; i++; continue;
+    }
+    if(t.startsWith("|")){
+      // table
+      let rows=[];
+      while(i<lines.length && lines[i].trim().startsWith("|")){ rows.push(lines[i].trim()); i++; }
+      // drop separator row
+      let header = rows[0].split("|").filter(Boolean).map(s=>s.trim().replace(/\*\*/g,''));
+      let body = rows.slice(1).filter(r=>!/\|[\s-:|]+\|/.test(r)).map(r=>r.split("|").filter(Boolean).map(s=>s.trim()));
+      html += `<div style="border:1px solid var(--edge); overflow:hidden; margin:8px 0; background:rgba(13,17,27,.6)"><div style="display:grid; grid-template-columns:repeat(${header.length},1fr); background:rgba(52,64,92,.25); font-weight:700; font-size:12px">${header.map(h=>`<div style="padding:7px 10px; border-right:1px solid var(--edge)">${esc(h)}</div>`).join("")}</div>`;
+      body.forEach(r=>{
+        html += `<div style="display:grid; grid-template-columns:repeat(${header.length},1fr); font-size:12px; border-top:1px solid rgba(52,64,92,.35)">${r.map((c,idx)=>`<div style="padding:7px 10px; border-right:1px solid rgba(52,64,92,.25)">${inlineFmt(c)}</div>`).join("")}</div>`;
+      });
+      html += `</div>`; continue;
+    }
+    if(/^[-*]\s/.test(t)){
+      let items=[];
+      while(i<lines.length && /^[-*]\s/.test(lines[i].trim())){ items.push(lines[i].trim().slice(2)); i++; }
+      html += `<div style="margin:6px 0">${items.map(it=>`<div style="display:flex; gap:8px; padding:3px 0"><span style="color:var(--cobalt-2)">•</span><span>${inlineFmt(it)}</span></div>`).join("")}</div>`; continue;
+    }
+    // para collect
+    let para=[];
+    while(i<lines.length && lines[i].trim() && !/^(#{1,3}\s|>|\||[-*]\s|---)/.test(lines[i].trim())){ para.push(lines[i].trim()); i++; }
+    if(para.length) html += `<p>${inlineFmt(para.join(" "))}</p>`;
+  }
+  return html;
+}
+
+function renderMessage(m){
+  if(m.role==="user"){
+    return `<div class="msg"><div class="head you">● YOU</div><div class="bubble">${esc(m.text)}</div></div>`;
+  }
+  if(m.role==="op"){
+    return `<div class="op-divider">● ${esc(m.text)}</div>`;
+  }
+  if(m.role==="tool"){
+    const st = m.ok===true ? "ok" : m.ok===false ? "err" : "run";
+    const label = m.ok===true ? "ok" : m.ok===false ? "error" : "running…";
+    const color = m.ok===true ? "var(--mint)" : m.ok===false ? "var(--coral)" : "var(--amber)";
+    let shell = "";
+    if(m.out){
+      const isErr = m.ok===false;
+      shell = `<div class="shell-out"><div class="shell-head"><span>▶ ${esc(m.name)}</span><span style="color:${color}">${label}</span></div><div class="shell-body ${isErr?'err':''}">${esc(m.out)}</div></div>`;
+    }
+    return `<div style="margin:8px 0"><div class="tool-line ${m.ok?'ok':'run'}"><span class="status ${m.ok?'ok':'run'}"></span><b style="color:var(--text)">${esc(m.name)}</b><span style="opacity:.6">${esc(m.args)}</span><span style="margin-left:auto; color:${color}">${label}</span></div>${shell}</div>`;
+  }
+  if(m.role==="code"){
+    return `<div class="code-block"><div class="code-top"><b>⬢ ${esc(m.lang||"code")}</b><span style="opacity:.6">copied</span></div><div class="code-body">${esc(m.code).split("\n").map((line,idx)=>`<div><span style="color:var(--muted); user-select:none; margin-right:12px">${String(idx+1).padStart(2," ")}</span>${esc(line)}</div>`).join("")}</div></div>`;
+  }
+  if(m.role==="user"){
+    let parts = mdBlocks(m.text);
+    let html = `<div class="msg you"><div class="head you">● YOU</div><div class="bubble">`;
+    parts.forEach(p=>{
+      if(p.t==="code"){
+        let isShell = /^(sh|bash|zsh|shell|console|ps1|powershell)$/.test((p.lang||"").toLowerCase());
+        html += `<div class="code-block"><div class="code-top"><b>${isShell?'▶':'⬢'} ${esc(p.lang||"code")}</b><span style="opacity:.6">copied</span></div><div class="code-body">${p.v.split("\n").map((line,idx)=>`<div><span style="color:var(--muted); user-select:none; margin-right:12px">${String(idx+1).padStart(2," ")}</span>${esc(line).replace(/\/\/.*$/,'<span class="com">$&</span>')}</div>`).join("")}</div></div>`;
+      } else { html += renderMd(p.v); }
+    });
+    html += `</div></div>`;
+    return html;
+  }
+  // assistant
+  let parts = mdBlocks(m.text);
+  let html = `<div class="msg gov"><div class="head gov">◆ GOVINDA</div><div class="bubble">`;
+  parts.forEach(p=>{
+    if(p.t==="code"){
+      let isShell = /^(sh|bash|zsh|shell|console|ps1|powershell)$/.test((p.lang||"").toLowerCase());
+      html += `<div class="code-block"><div class="code-top"><b>${isShell?'▶':'⬢'} ${esc(p.lang||"code")}</b><span style="opacity:.6">copied</span></div><div class="code-body">${p.v.split("\n").map((line,idx)=>`<div><span style="color:var(--muted); user-select:none; margin-right:12px">${String(idx+1).padStart(2," ")}</span>${esc(line).replace(/\/\/.*$/,'<span class="com">$&</span>')}</div>`).join("")}</div></div>`;
+    } else {
+      html += renderMd(p.v);
+    }
+  });
+  html += `</div></div>`;
+  return html;
+}
+function renderChat(){
+  chatEl.innerHTML = chatData.map(renderMessage).join("") + `<div id="streamAnchor"></div>`;
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+renderChat();
+
+// tree
+const treeEl = document.getElementById('tree');
+function renderTree(){
+  treeEl.innerHTML = files.map((f,i)=>`
+    <div class="row ${i===0?'active':''}" data-file="${f.name}">
+      <span class="g">${f.icon}</span>
+      <span>${esc(f.name)}</span>
+      ${f.dot?`<span class="dot ${f.dot}"></span>`:""}
+      ${f.lang?`<small>${f.lang}</small>`:""}
+    </div>
+  `).join("");
+}
+renderTree();
+treeEl.addEventListener('click', e=>{
+  const r = e.target.closest('.row');
+  if(!r) return;
+  const name = r.dataset.file;
+  const inputVal = input.value;
+  const atIdx = inputVal.lastIndexOf("@");
+  // pin behavior: if input has @, complete; else pin
+  if(document.activeElement===input && atIdx!==-1){
+    insertAt(name);
+  } else {
+    input.value = (input.value ? input.value+" " : "") + "@" + name + " ";
+    input.focus();
+    updateAt();
+    // visual pin toast
+    pushNotice(`◆ pinned ${name} to context`);
+  }
+});
+function openFolderPrompt(){
+  const cur = document.getElementById('projPath')?.textContent?.replace('▸','').trim() || 'GOVINDA';
+  const next = prompt(`Open folder — enter path:\nCurrent: ${cur}\nExamples: . , .. , C:\\projects\\myapp , ~/code`, cur);
+  if(next && next.trim()){
+    const p = next.trim();
+    document.getElementById('projPath').textContent = `▸ ${p}`;
+    pushNotice(`opened: ${p} — (mock) ${files.length} files · use /open in TUI for real FS`);
+    // mock refresh tree with new prefix
+    treeEl.innerHTML = files.map((f,i)=>`
+      <div class="row ${i===0?'active':''}" data-file="${p.replace(/\\$/,'')}/${f.name}">
+        <span class="g">${f.icon}</span>
+        <span>${esc(f.name)}</span>
+        ${f.dot?`<span class="dot ${f.dot}"></span>`:""}
+        <small>${p.split('/').pop()||'root'}</small>
+      </div>
+    `).join("");
+  }
+}
+document.getElementById('openFolderBtn')?.addEventListener('click', openFolderPrompt);
+document.getElementById('projPath')?.addEventListener('click', openFolderPrompt);
+
+// todo list
+function renderTodo(){
+  const list=document.getElementById('todoList');
+  const count=document.getElementById('todoCount');
+  const left=todos.filter(t=>!t.done).length;
+  count.textContent= left===0 ? "all done ✓" : `${left} left`;
+  count.style.color = left===0 ? "var(--mint)" : "var(--muted)";
+  let items=todos;
+  if(todoFilter==="active") items=todos.filter(t=>!t.done);
+  if(todoFilter==="done") items=todos.filter(t=>t.done);
+  list.innerHTML = items.length ? items.map((t,idx)=>{
+    const realIdx=todos.indexOf(t);
+    return `<div class="todo-item ${t.done?'done':''}">
+      <button class="todo-check ${t.done?'on':''}" onclick="toggleTodo(${realIdx})" aria-label="toggle">${t.done?'✓':''}</button>
+      <span class="todo-text">${esc(t.text)}</span>
+      <button class="todo-del" onclick="removeTodo(${realIdx})" aria-label="delete">✕</button>
+    </div>`;
+  }).join("") : `<div style="padding:18px 14px; color:var(--muted); font-size:13px; text-align:center">${todoFilter==="done" ? "No completed tasks" : todoFilter==="active" ? "No active tasks — add one above" : "No tasks — add your first"}</div>`;
+  ["fAll","fActive","fDone"].forEach(id=>document.getElementById(id)?.classList.remove('primary'));
+  const activeId = todoFilter==="all" ? "fAll" : todoFilter==="active" ? "fActive" : "fDone";
+  document.getElementById(activeId)?.classList.add('primary');
+}
+function addTodo(){
+  const inp=document.getElementById('todoInput');
+  const v=inp.value.trim();
+  if(!v) return;
+  todos.unshift({text:v, done:false});
+  inp.value="";
+  renderTodo();
+}
+function toggleTodo(i){ todos[i].done=!todos[i].done; renderTodo(); }
+function removeTodo(i){ todos.splice(i,1); renderTodo(); }
+function filterTodo(f){ todoFilter=f; renderTodo(); }
+function clearDone(){ todos=todos.filter(t=>!t.done); renderTodo(); }
+renderTodo();
+document.getElementById('todoAdd')?.addEventListener('click', addTodo);
+document.getElementById('todoInput')?.addEventListener('keydown', e=>{ if(e.key==="Enter") addTodo(); });
+
+// token bar
+function renderBar(pct){
+  const bar = document.getElementById('tokenBar');
+  bar.innerHTML="";
+  let filled = Math.round(pct/100*10);
+  for(let i=0;i<10;i++){
+    const el=document.createElement('i');
+    if(i<filled) el.classList.add(pct>80?'warn':'on');
+    bar.appendChild(el);
+  }
+}
+renderBar(45);
+
+// providers
+let activeProv="mistral";
+function setProvider(p){
+  if(!providers[p]) return;
+  activeProv=p;
+  const pr=providers[p];
+  document.getElementById('provName').textContent=p;
+  document.getElementById('modelName').textContent=pr.model;
+  document.getElementById('costProv').textContent=p;
+  document.documentElement.style.setProperty('--cobalt', pr.accent);
+  document.documentElement.style.setProperty('--cobalt-2', pr.accent2);
+  pushNotice(`provider → ${p} · ${pr.model} — key resolves from ${p.toUpperCase()}_API_KEY`);
+}
+function pushNotice(text){
+  const n={role:"assistant", text: `> ${text}`};
+  chatData.push(n);
+  renderChat();
+}
+
+// palette
+let palIdx=0;
+function filtered(){
+  const q = input.value.trim().toLowerCase();
+  if(!q.startsWith("/")) return [];
+  const needle = q.split(" ")[0];
+  return commands.filter(([cmd])=>cmd.startsWith(needle));
+}
+function renderPalette(){
+  const hits = filtered();
+  if(hits.length===0 || input.value.includes(" ")){ pal.classList.remove('open'); return; }
+  palList.innerHTML = hits.map(([cmd,desc],i)=>`
+    <div class="pal-item ${i===palIdx?'active':''}" data-cmd="${cmd}">
+      <span style="width:22px; text-align:center; opacity:.7">⌘</span>
+      <b>${cmd}</b><span>${desc}</span>
+    </div>
+  `).join("");
+  pal.classList.add('open');
+  // clamp idx
+  if(palIdx>=hits.length) palIdx=0;
+  [...palList.children].forEach((el,i)=> el.classList.toggle('active', i===palIdx));
+}
+palList.addEventListener('click', e=>{
+  const it=e.target.closest('.pal-item');
+  if(!it) return;
+  applyCmd(it.dataset.cmd);
+});
+function applyCmd(cmd){
+  const zero = ["/help","/clear","/tokens","/tools","/scan"];
+  if(zero.includes(cmd)){
+    handleZero(cmd);
+    input.value=""; pal.classList.remove('open'); return;
+  }
+  if(cmd==="/provider"){
+    input.value="/provider ";
+    renderPalette(); updateAt();
+    return;
+  }
+  if(cmd==="/theme"){
+    input.value="/theme ";
+    renderPalette(); return;
+  }
+  if(cmd==="/model"){
+    input.value="/model "+providers[activeProv].model;
+    pal.classList.remove('open'); input.focus(); return;
+  }
+  // default: put command and focus
+  input.value=cmd+" ";
+  pal.classList.remove('open');
+  input.focus();
+}
+function handleZero(cmd){
+  if(cmd==="/help"){
+    chatData.push({role:"assistant", text:"**Commands** — type any slash to see the palette. Every `/` is a real dispatcher from `src/commands/*`.\n\n- `/model <name>` partial match, `/provider <name>` runtime switch\n- `/diff` → `/apply` atomics, `/plan <task>` autonomous steps\n- `/theme <name>` 10 themes share two glass bases"});
+  } else if(cmd==="/clear"){
+    chatData.length=0; chatData.push({role:"assistant", text:"> cleared — *(history wiped)*"});
+  } else if(cmd==="/tokens"){
+    openCost();
+    return;
+  } else if(cmd==="/tools"){
+    document.getElementById('paneTools').scrollIntoView({behavior:"smooth", block:"center"});
+    pushNotice("tools: 18 active, 1 gated — toggle with the switches on the right");
+    return;
+  } else if(cmd==="/scan"){
+    pushNotice("scan: rebuilt symbol index — 247 symbols across 31 files");
+    return;
+  }
+  renderChat();
+}
+
+// @ picker
+function updateAt(){
+  const cur = input.selectionStart ?? input.value.length;
+  const before = input.value.slice(0,cur);
+  const m = before.match(/(?:^|\s)@([^\s]*)$/);
+  if(!m){ atPicker.classList.remove('open'); return; }
+  const q = m[1].toLowerCase();
+  const hits = atFiles.filter(f=>f.toLowerCase().includes(q)).slice(0,6);
+  if(hits.length===0){ atPicker.classList.remove('open'); return; }
+  atList.innerHTML = hits.map((f,i)=> `<div class="at-item ${i===0?'active':''}" data-file="${f}"><span style="opacity:.6">⬢</span> ${esc(f)}</div>`).join("");
+  atPicker.classList.add('open');
+  atPicker.dataset.q=q;
+}
+function insertAt(file){
+  const cur = input.selectionStart ?? input.value.length;
+  const before = input.value.slice(0,cur);
+  const after = input.value.slice(cur);
+  const m = before.match(/(?:^|\s)@([^\s]*)$/);
+  if(!m) return;
+  const start = before.lastIndexOf("@");
+  input.value = before.slice(0,start) + "@" + file + " " + after;
+  atPicker.classList.remove('open');
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+atList.addEventListener('click', e=>{
+  const it=e.target.closest('.at-item'); if(!it) return; insertAt(it.dataset.file);
+});
+
+// input events
+let hist=["Explain the token window trimming","/provider groq","Add a glass toggle for light mode"]; let histIdx=null; let draft="";
+input.addEventListener('input', ()=>{ palIdx=0; renderPalette(); updateAt(); });
+input.addEventListener('keydown', e=>{
+  const hits = filtered();
+  const atOpen = atPicker.classList.contains('open');
+  if(e.key==="Tab" && hits.length){
+    e.preventDefault();
+    palIdx = (palIdx+1)%hits.length;
+    renderPalette();
+    return;
+  }
+  if(e.key==="ArrowUp"){
+    if(atOpen){ e.preventDefault(); const items=[...atList.children]; let cur=items.findIndex(i=>i.classList.contains('active')); items[cur]?.classList.remove('active'); items[(cur-1+items.length)%items.length].classList.add('active'); return; }
+    if(hits.length && pal.classList.contains('open')){ e.preventDefault(); palIdx=(palIdx-1+hits.length)%hits.length; renderPalette(); return; }
+    // history
+    if(hist.length){ e.preventDefault(); if(histIdx===null){ draft=input.value; histIdx=hist.length-1; } else histIdx=Math.max(0,histIdx-1); input.value=hist[histIdx]; renderPalette(); }
+    return;
+  }
+  if(e.key==="ArrowDown"){
+    if(atOpen){ e.preventDefault(); const items=[...atList.children]; let cur=items.findIndex(i=>i.classList.contains('active')); items[cur]?.classList.remove('active'); items[(cur+1)%items.length].classList.add('active'); return; }
+    if(hits.length && pal.classList.contains('open')){ e.preventDefault(); palIdx=(palIdx+1)%hits.length; renderPalette(); return; }
+    if(histIdx!==null){ e.preventDefault(); if(histIdx+1<hist.length){ histIdx++; input.value=hist[histIdx]; } else { histIdx=null; input.value=draft; } renderPalette(); }
+    return;
+  }
+  if(e.key==="Enter"){
+    if(atOpen){
+      const act = atList.querySelector('.at-item.active');
+      if(act){ e.preventDefault(); insertAt(act.dataset.file); return; }
+    }
+    if(pal.classList.contains('open') && hits.length){
+      e.preventDefault();
+      const cmd = hits[palIdx][0];
+      applyCmd(cmd);
+      return;
+    }
+    e.preventDefault();
+    submit();
+  }
+  if(e.key==="Escape"){
+    pal.classList.remove('open'); atPicker.classList.remove('open');
+    if(!input.value) { pushNotice("Esc — cleared"); input.value=""; }
+    else { input.value=""; renderPalette(); }
+  }
+});
+input.addEventListener('blur', ()=> setTimeout(()=>{ pal.classList.remove('open'); },150));
+
+function submit(){
+  const raw = input.value.trim();
+  if(!raw) return;
+  hist.push(raw); histIdx=null; draft="";
+  // slash handling
+  if(raw.startsWith("/")){
+    const [cmd, ...rest] = raw.split(/\s+/);
+    const arg = rest.join(" ").trim();
+    if(cmd==="/provider"){
+      if(!arg){ chatData.push({role:"assistant", text:"Usage: `/provider <mistral|openai|kimi|groq|ollama|…>` — try `/provider kimi`"}); renderChat(); input.value=""; return; }
+      const key = arg.toLowerCase().split(/[\s\/]/)[0];
+      if(providers[key]){ setProvider(key); input.value=""; renderChat(); return; }
+      chatData.push({role:"assistant", text:`Unknown provider “${esc(arg)}” — available: ${Object.keys(providers).join(", ")}`}); renderChat(); input.value=""; return;
+    }
+    if(cmd==="/theme"){
+      if(!arg){ pushNotice("themes: default mono dracula solarized ocean nord gruvbox tokyo-night catppuccin rose — try `/theme dracula`"); input.value=""; return; }
+      // map to provider tints for demo
+      const tints={dracula:"#BD93F9", solarized:"#B58900", ocean:"#00B4D8", nord:"#88C0D0", gruvbox:"#FABD2F", "tokyo-night":"#7AA2F7", catppuccin:"#CBA6F7", rose:"#EB6F92", default:"#3F76E3", mono:"#3C3C44"};
+      const c=tints[arg.toLowerCase()]||"#3F76E3";
+      document.documentElement.style.setProperty('--cobalt', c);
+      document.documentElement.style.setProperty('--cobalt-2', c);
+      pushNotice(`theme → ${arg} · glass remapped`); input.value=""; return;
+    }
+    if(cmd==="/model"){
+      if(arg){ document.getElementById('modelName').textContent=arg; pushNotice(`model → ${arg}`); } else { pushNotice(`model is ${document.getElementById('modelName').textContent}`); }
+      input.value=""; return;
+    }
+    if(["/cd","/cwd","/folder","/open"].includes(cmd)){
+      const p = arg || ".";
+      document.getElementById('projPath').textContent = `▸ ${p}`;
+      pushNotice(`opened: ${p} — (mock) use real TUI /open for FS`);
+      input.value=""; renderChat(); return;
+    }
+    handleZero(cmd);
+    if(!["/help","/clear","/tokens","/tools","/scan"].includes(cmd)){
+      chatData.push({role:"user", text:raw});
+      streamMock(raw);
+    }
+    input.value=""; renderPalette(); updateAt(); return;
+  }
+  // normal prompt
+  chatData.push({role:"user", text:raw});
+  input.value=""; renderChat(); renderPalette(); updateAt();
+  streamMock(raw);
+}
+
+let streaming=false;
+function streamMock(prompt){
+  if(streaming) return;
+  streaming=true;
+  document.getElementById('livePill').style.display="inline-flex";
+  document.getElementById('streamChip').style.display="inline-flex";
+  const reply = `**GOVINDA** will handle “${prompt.slice(0,64)}” with the staged edit flow:\n\n1. \`read_file\` + \`grep\` to locate symbols (see left tree)\n2. \`edit_file\` queues diffs → \`/diff\` previews them\n3. \`/apply\` commits atomically + rebuilds the index\n\n> The glass stays sharp — no rounded bubbles — because cut crystal is the identity. Focused panes glow \`${document.getElementById('provName').textContent}\` so you always know which backend you are burning tokens on.`;
+  // create streaming bubble
+  const anchor = document.getElementById('streamAnchor');
+  // we append a temp msg that we will fill
+  const idx = chatData.length;
+  chatData.push({role:"assistant", text:""});
+  let pos=0;
+  const iv = setInterval(()=>{
+    pos = Math.min(reply.length, pos+ Math.ceil(Math.random()*14)+6);
+    chatData[idx].text = reply.slice(0,pos);
+    renderChat();
+    if(pos>=reply.length){
+      clearInterval(iv);
+      streaming=false;
+      document.getElementById('livePill').style.display="none";
+      document.getElementById('streamChip').style.display="none";
+      // inject occasional tool line with shell output
+      if(Math.random()>0.4){
+        chatData.splice(idx,0,{role:"tool", name:"read_file", args:'{"path":"src/tui/theme.rs"}', ok:true, out:"— 42 lines — outline: Theme, set_by_name"});
+        renderChat();
+      }
+    }
+  }, 34);
+}
+
+sendBtn.addEventListener('click', submit);
+
+// theme — Frosted Daylight (default light) ↔ Midnight Glass — controlled via Settings
+let isLight=true;
+function applyTheme(light){
+  isLight=light;
+  document.getElementById('setLight')?.classList.toggle('primary', light);
+  document.getElementById('setDark')?.classList.toggle('primary', !light);
+  if(light){
+    document.documentElement.style.setProperty('--ink','#ECEEF4');
+    document.documentElement.style.setProperty('--panel','#E0E6F1');
+    document.documentElement.style.setProperty('--raised','#F8FAFD');
+    document.documentElement.style.setProperty('--edge','#BEC8DA');
+    document.documentElement.style.setProperty('--hover','#D6DEEC');
+    document.documentElement.style.setProperty('--text','#181E2C');
+    document.documentElement.style.setProperty('--text-2','#4E5A70');
+    document.documentElement.style.setProperty('--muted','#8C98AE');
+    document.body.style.color="#181E2C";
+    document.querySelector('.bg').style.background=`radial-gradient(900px 520px at 15% 0%, rgba(63,118,227,.12), transparent 60%), radial-gradient(700px 400px at 85% 18%, rgba(124,92,255,.10), transparent 62%), radial-gradient(500px 500px at 50% 100%, rgba(52,211,153,.07), transparent 70%), linear-gradient(180deg, #ECEEF4 0%, #E6EAF2 55%, #DDE4EF 100%)`;
+    document.querySelectorAll('.glass').forEach(el=>{ el.style.background='rgba(248,250,253,.78)'; el.style.boxShadow='0 14px 36px rgba(24,30,44,.10), 0 2px 10px rgba(24,30,44,.06), inset 0 1px 0 rgba(255,255,255,.82)'; });
+  } else {
+    document.documentElement.style.setProperty('--ink','#0D111B');
+    document.documentElement.style.setProperty('--panel','#151B2A');
+    document.documentElement.style.setProperty('--raised','#1D2538');
+    document.documentElement.style.setProperty('--edge','#34405C');
+    document.documentElement.style.setProperty('--hover','#263048');
+    document.documentElement.style.setProperty('--text','#E4EAF5');
+    document.documentElement.style.setProperty('--text-2','#96A2BA');
+    document.documentElement.style.setProperty('--muted','#606C86');
+    document.body.style.color="#E4EAF5";
+    document.querySelector('.bg').style.background=`radial-gradient(900px 520px at 15% 0%, rgba(63,118,227,.16), transparent 60%), radial-gradient(700px 400px at 85% 18%, rgba(124,92,255,.14), transparent 62%), radial-gradient(500px 500px at 50% 100%, rgba(52,211,153,.06), transparent 70%), linear-gradient(180deg, #0D111B 0%, #0B0F19 100%)`;
+    document.querySelectorAll('.glass').forEach(el=>{ el.style.background='rgba(21,27,42,.78)'; el.style.boxShadow='0 18px 48px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06)'; });
+  }
+}
+function setTheme(t){ applyTheme(t==='light'); }
+
+// dialogs
+function openDialog(kind){
+  const d=document.getElementById('dialog');
+  d.classList.add('open');
+  document.getElementById('dialogTitle').textContent = kind==="save" ? "Save session" : "Export conversation";
+  document.getElementById('dialogDesc').textContent = kind==="save" ? "Name your session JSON. Stored in sessions/." : "Export as Markdown or plain text.";
+  document.getElementById('dialogInput').value = kind==="save" ? "my-session" : "export.md";
+  document.getElementById('dialogInput').focus();
+}
+function closeDialog(){ document.getElementById('dialog').classList.remove('open'); }
+function confirmDialog(){
+  const v=document.getElementById('dialogInput').value.trim()||"session";
+  closeDialog(); pushNotice(`saved → sessions/${v}.json`);
+}
+document.getElementById('dialog').addEventListener('click', e=>{ if(e.target.id==="dialog") closeDialog(); });
+function openCost(){ document.getElementById('costDialog').classList.add('open'); }
+function closeCost(){ document.getElementById('costDialog').classList.remove('open'); }
+document.getElementById('costDialog').addEventListener('click', e=>{ if(e.target.id==="costDialog") closeCost(); });
+document.getElementById('costBtn').addEventListener('click', openCost);
+function openSettings(){
+  const c=document.getElementById('settingsProviders');
+  c.innerHTML=Object.keys(providers).map(k=>`<button class="p-chip ${k===activeProv?'active':''}" data-prov="${k}">${k}</button>`).join("");
+  document.getElementById('settingsDialog').classList.add('open');
+}
+function closeSettings(){ document.getElementById('settingsDialog').classList.remove('open'); }
+document.getElementById('settingsDialog').addEventListener('click', e=>{ if(e.target.id==="settingsDialog") closeSettings(); });
+document.getElementById('settingsBtn').addEventListener('click', openSettings);
+function openShortcuts(){ document.getElementById('shortcutsDialog').classList.add('open'); }
+function closeShortcuts(){ document.getElementById('shortcutsDialog').classList.remove('open'); }
+document.getElementById('shortcutsDialog').addEventListener('click', e=>{ if(e.target.id==="shortcutsDialog") closeShortcuts(); });
+document.getElementById('shortcutsBtn').addEventListener('click', openShortcuts);
+
+// focus chamfer follow + global keys
+const panes = [...document.querySelectorAll('.pane')];
+panes.forEach(p=>{
+  p.addEventListener('mousemove', e=>{
+    const r=p.getBoundingClientRect();
+    const mx = ((e.clientX - r.left)/r.width*100).toFixed(1) + "%";
+    p.style.setProperty('--mx', mx);
+  });
+});
+document.addEventListener('keydown', e=>{
+  if(e.key==="?" && !e.ctrlKey && !e.metaKey && document.activeElement!==input){ e.preventDefault(); openShortcuts(); return; }
+  if(e.key==="Escape" && (document.getElementById('dialog').classList.contains('open') || document.getElementById('costDialog').classList.contains('open') || document.getElementById('settingsDialog').classList.contains('open') || document.getElementById('shortcutsDialog').classList.contains('open'))){
+    closeDialog(); closeCost(); closeSettings(); closeShortcuts(); return;
+  }
+  if(e.ctrlKey && e.key.toLowerCase()==="l"){ e.preventDefault(); chatData.length=0; renderChat(); pushNotice("cleared"); }
+  if(e.ctrlKey && e.key.toLowerCase()==="t"){ e.preventDefault(); document.getElementById('paneTree').classList.toggle('show'); }
+  if(e.ctrlKey && e.key.toLowerCase()==="p"){ e.preventDefault(); document.getElementById('paneTools').classList.toggle('show'); }
+  if(e.ctrlKey && e.key.toLowerCase()==="i"){ e.preventDefault(); document.getElementById('costDialog').classList.contains('open') ? closeCost() : openCost(); }
+  if(e.ctrlKey && e.key===","){ e.preventDefault(); openSettings(); }
+  // slash palette already handles /
+});
+
+// provider chips demo click (rail + settings)
+document.addEventListener('click', e=>{
+  const chip = e.target.closest('.p-chip');
+  if(chip){
+    setProvider(chip.dataset.prov);
+    // refresh settings active state
+    document.querySelectorAll('#settingsProviders .p-chip').forEach(c=> c.classList.toggle('active', c.dataset.prov===chip.dataset.prov));
+  }
+});
+
+// initial focus
+setTimeout(()=> input.focus(), 300);
+</script>
+</body>
+</html>

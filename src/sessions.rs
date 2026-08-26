@@ -90,6 +90,15 @@ struct SessionMeta {
 }
 
 fn peek(path: &Path) -> Result<(usize, Option<String>)> {
+    // Guard against very large session files.
+    const MAX_PEEK_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
+    let meta = std::fs::metadata(path)?;
+    anyhow::ensure!(
+        meta.len() <= MAX_PEEK_BYTES,
+        "session file too large ({} bytes, limit {})",
+        meta.len(),
+        MAX_PEEK_BYTES
+    );
     let raw = std::fs::read_to_string(path)?;
     let meta: SessionMeta = serde_json::from_str(&raw)?;
     Ok((meta.messages.len(), meta.updated_at))

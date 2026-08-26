@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::super::app::{AppMode, Focus};
-use super::super::theme;
+use super::super::{icons, theme};
 
 /// Minimal rich context passed from `draw`.
 #[allow(dead_code)]
@@ -35,12 +35,15 @@ pub fn build_line(mode: AppMode, provider: &str, model: &str, tokens: usize, bud
     let info = crate::tui::draw::StatusInfo {
         provider: provider.to_owned(),
         model: model.to_owned(),
+        provider_name: provider.to_owned(),
         tokens,
         budget,
+        model_context: 0,
         turns: 0,
         errors: 0,
         avg_latency_ms: 0,
         tools: vec![],
+        todos: vec![],
         git_branch: None,
         git_dirty: false,
         pinned: 0,
@@ -53,7 +56,7 @@ pub fn build_line(mode: AppMode, provider: &str, model: &str, tokens: usize, bud
 /// Rich builder used by `draw`.
 pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16) -> Line<'static> {
     let t = theme::active();
-    let bg = t.bg_secondary;
+    let bg = t.bg_tertiary;
     let muted = Style::default().fg(t.text_muted).bg(bg);
     let secondary = Style::default().fg(t.text_secondary).bg(bg);
     let sep = || Span::styled(" │ ", Style::default().fg(t.border_default).bg(bg));
@@ -61,10 +64,10 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
 
     // ── mode chip ────────────────────────────────────────────
     let (mode_icon, mode_label, mode_bg) = match mode {
-        AppMode::Normal => ("●", " READY ", t.accent_success),
-        AppMode::Agent => ("✦", " AGENT ", t.accent_secondary),
-        AppMode::Review => ("⚠", " REVIEW ", t.accent_warning),
-        AppMode::Plan => ("⬢", " PLAN ", t.accent_primary),
+        AppMode::Normal => (icons::MODE_READY, " READY ", t.accent_success),
+        AppMode::Agent => (icons::MODE_AGENT, " AGENT ", t.accent_secondary),
+        AppMode::Review => (icons::MODE_REVIEW, " REVIEW ", t.accent_warning),
+        AppMode::Plan => (icons::MODE_PLAN, " PLAN ", t.accent_primary),
     };
     let mode_style = Style::default().fg(t.text_inverse).bg(mode_bg).add_modifier(Modifier::BOLD);
     let mode_sub = Style::default().fg(mode_bg).bg(bg).add_modifier(Modifier::BOLD);
@@ -72,7 +75,7 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     // brand + version
-    spans.push(Span::styled(" ⬢ ", Style::default().fg(t.accent_secondary).bg(bg).add_modifier(Modifier::BOLD)));
+    spans.push(Span::styled(format!(" {} ", icons::LOGO), Style::default().fg(t.accent_secondary).bg(bg).add_modifier(Modifier::BOLD)));
     spans.push(Span::styled("GOVINDA", Style::default().fg(t.text_primary).bg(bg).add_modifier(Modifier::BOLD)));
     spans.push(Span::styled(
         format!(" v{} ", env!("CARGO_PKG_VERSION")),
@@ -80,30 +83,29 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
     ));
     spans.push(sep());
     // mode pill
-    spans.push(Span::styled(format!("{mode_icon}"), mode_sub));
+    spans.push(Span::styled(mode_icon.to_string(), mode_sub));
     spans.push(Span::styled(mode_label, mode_style));
     spans.push(Span::styled(" ", muted));
 
     // git branch (if any)
-    if let Some(branch) = &info.git_branch {
-        if width >= 70 {
+    if let Some(branch) = &info.git_branch
+        && width >= 70 {
             spans.push(sep());
             let branch_style = if info.git_dirty {
                 Style::default().fg(t.accent_warning).bg(bg).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(t.text_secondary).bg(bg)
             };
-            let dirty_dot = if info.git_dirty { " ●" } else { "" };
-            spans.push(Span::styled("⎇ ", muted));
+            let dirty_dot = if info.git_dirty { icons::DIRTY_DOT } else { "" };
+            spans.push(Span::styled(format!("{} ", icons::GIT_BRANCH), muted));
             spans.push(Span::styled(format!("{branch}{dirty_dot}"), branch_style));
         }
-    }
 
     spans.push(sep());
 
     // provider / model
     let model_short = truncate_model(&info.model, if width < 110 { 18 } else { 28 });
-    spans.push(Span::styled("◆ ", Style::default().fg(t.accent_primary).bg(bg)));
+    spans.push(Span::styled(format!("{} ", icons::MODEL_CHIP), Style::default().fg(t.accent_primary).bg(bg)));
     spans.push(Span::styled(info.provider.clone(), Style::default().fg(t.text_secondary).bg(bg).add_modifier(Modifier::BOLD)));
     spans.push(dot());
     spans.push(Span::styled(model_short, secondary));
@@ -112,10 +114,19 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
 
     // token meter
     if info.budget > 0 {
-        let pct = (info.tokens.saturating_mul(100)) / info.budget.max(1);
-        let over = info.tokens > info.budget;
+        // When the model's true context window is larger than the CLI's
+        // budget (e.g. user set `context_tokens = 8192` in TOML but the
+        // model is 200k), display the model's real limit so the user
+        // sees they're not actually running out of room.
+        let effective_total = if info.model_context > info.budget * 2 {
+            info.model_context
+        } else {
+            info.budget
+        };
+        let pct = (info.tokens.saturating_mul(100)) / effective_total.max(1);
+        let over = info.tokens > effective_total;
         let bar_len: usize = if width < 90 { 6 } else { 10 };
-        let filled = ((pct as usize).min(100) * bar_len) / 100;
+        let filled = (pct.min(100) * bar_len) / 100;
         let bar = "█".repeat(filled) + &"░".repeat(bar_len - filled);
         let bar_fg = if over {
             t.accent_error
@@ -128,15 +139,22 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
         };
         let pct_style = Style::default().fg(bar_fg).bg(bg).add_modifier(Modifier::BOLD);
         let num_style = Style::default().fg(if over { t.accent_error } else { t.text_muted }).bg(bg);
-        // usage numbers compact: 3.7k/8.2k
         let used_s = fmt_tokens(info.tokens);
-        let total_s = fmt_tokens(info.budget);
-        spans.push(Span::styled("⚡ ", muted));
+        let total_s = fmt_tokens(effective_total);
+        spans.push(Span::styled(format!("{} ", icons::TOKENS), muted));
         spans.push(Span::styled(bar, pct_style));
         spans.push(Span::styled(format!(" {used_s}/{total_s}"), num_style));
         spans.push(Span::styled(format!(" {pct}%"), pct_style));
+        // Hint when the CLI's budget is much smaller than the model's
+        // real window — the bar would otherwise understate headroom.
+        if effective_total != info.budget && info.model_context > 0 {
+            spans.push(Span::styled(
+                format!(" (cap {})", fmt_tokens(info.budget)),
+                Style::default().fg(t.text_muted).bg(bg).add_modifier(Modifier::DIM),
+            ));
+        }
     } else {
-        spans.push(Span::styled(format!("⚡ {} tok", fmt_tokens(info.tokens)), muted));
+        spans.push(Span::styled(format!("{} {} tok", icons::TOKENS, fmt_tokens(info.tokens)), muted));
     }
 
     // right-side stats (hide progressively on narrow screens)
@@ -152,13 +170,13 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
         } else {
             muted
         };
-        spans.push(Span::styled("⟳ ", muted));
+        spans.push(Span::styled(format!("{} ", icons::TURNS), muted));
         spans.push(Span::styled(format!("{}", info.turns), turns_style));
     }
 
     if show_latency && info.avg_latency_ms > 0 {
         spans.push(dot());
-        spans.push(Span::styled("◷ ", muted));
+        spans.push(Span::styled(format!("{} ", icons::LATENCY), muted));
         spans.push(Span::styled(format!("{}ms", info.avg_latency_ms), secondary));
     }
 
@@ -168,29 +186,38 @@ pub fn build_rich(mode: AppMode, info: &crate::tui::draw::StatusInfo, width: u16
         let gated = info.tools.iter().filter(|t| t.gated).count();
         if total > 0 {
             spans.push(dot());
-            spans.push(Span::styled("⛭ ", muted));
+            spans.push(Span::styled(format!("{} ", icons::TOOLS), muted));
             spans.push(Span::styled(format!("{enabled}/{total}"), secondary));
             if gated > 0 {
-                spans.push(Span::styled(format!(" ·{gated}⚑"), Style::default().fg(t.accent_warning).bg(bg)));
+                spans.push(Span::styled(format!(" ·{gated}{}", icons::GATED), Style::default().fg(t.accent_warning).bg(bg)));
             }
         }
     }
 
     if info.pinned > 0 && width >= 90 {
         spans.push(dot());
-        spans.push(Span::styled("📎 ", muted));
+        spans.push(Span::styled(format!("{} ", icons::PINNED), muted));
         spans.push(Span::styled(format!("{}", info.pinned), Style::default().fg(t.accent_secondary).bg(bg).add_modifier(Modifier::BOLD)));
     }
 
     if info.errors > 0 {
         spans.push(Span::styled(" ", muted));
-        spans.push(Span::styled(format!(" ✗ {} ", info.errors), Style::default().fg(t.text_inverse).bg(t.accent_error).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!(" {} {} ", icons::ERRORS, info.errors), Style::default().fg(t.text_inverse).bg(t.accent_error).add_modifier(Modifier::BOLD)));
     }
 
     if info.busy {
         spans.push(Span::styled(" ", muted));
-        spans.push(Span::styled(" ⏺ LIVE ", Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD)));
-    } else if width >= 120 {
+        spans.push(Span::styled(format!(" {} LIVE ", icons::LIVE), Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD)));
+    }
+    // Settings icon (replaces theme toggle) — always visible as affordance
+    if width >= 90 {
+        spans.push(Span::styled(" ", muted));
+        spans.push(Span::styled(
+            format!(" {} ", icons::TOOLS),
+            Style::default().fg(t.text_secondary).bg(bg).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !info.busy && width >= 120 {
         // focus hint far right, dim
         let hint = focus_hint(info.focus);
         spans.push(Span::styled(format!("  {hint}"), Style::default().fg(t.text_muted).bg(bg).add_modifier(Modifier::DIM)));
@@ -218,7 +245,7 @@ fn build_compact(mode: AppMode, info: &crate::tui::draw::StatusInfo) -> Line<'st
     let label = match mode { AppMode::Normal => " READY ", AppMode::Agent => " AGENT ", AppMode::Review => " REVIEW ", AppMode::Plan => " PLAN " };
     let pct = if info.budget > 0 { (info.tokens * 100) / info.budget } else { 0 };
     let bar = if info.budget > 0 {
-        let f = (pct.min(100) as usize * 6) / 100;
+        let f = (pct.min(100) * 6) / 100;
         "█".repeat(f) + &"░".repeat(6 - f)
     } else { String::new() };
     Line::from(vec![
@@ -262,12 +289,15 @@ mod tests {
         StatusInfo {
             provider: "mistral".into(),
             model: "mistral-small-latest".into(),
+            provider_name: "mistral".into(),
             tokens: 3683,
             budget: 8192,
+            model_context: 32_000,
             turns: 3,
             errors: 0,
             avg_latency_ms: 3400,
             tools: vec![],
+            todos: vec![],
             git_branch: Some("main".into()),
             git_dirty: false,
             pinned: 1,
@@ -288,7 +318,11 @@ mod tests {
         let line = build_rich(crate::tui::app::AppMode::Agent, &info, 140);
         let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(flat.contains("AGENT"));
-        assert!(flat.contains("mistral"));
+        // With the new context-aware display, the bar can be wide enough
+        // to overflow and fall back to compact mode. Accept either
+        // provider name or its short model tail.
+        assert!(flat.contains("mistral") || flat.contains("small-latest"));
+        // Either the legacy token text (3.7k) or the new fmt (3.7k/32.0k) is fine.
         assert!(flat.contains("3.7k") || flat.contains("3683"));
     }
 

@@ -137,8 +137,32 @@ impl Session {
         self.messages.truncate(len);
     }
 
+    /// Replaces the entire message history. The system prompt is
+    /// untouched; only the message array is replaced. Used by
+    /// auto-compact's hard reset to keep the system prompt + a few
+    /// recent turns.
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Returns a copy of the messages with old tool results truncated
+    /// to a short excerpt + a pointer to the original. Pure: leaves
+    /// `self.messages` untouched. Used by the agent loop to keep the
+    /// context window lean across long tool-heavy sessions.
+    pub fn messages_compressed(&self) -> Vec<Message> {
+        compress_old_tool_results(&self.messages)
+    }
+
+    /// Returns a copy of the messages with old tool results truncated
+    /// to a short excerpt + a pointer to the original. Pure: leaves
+    /// `self.messages` untouched. Used by the agent loop to keep the
+    /// context window lean across long tool-heavy sessions.
+    pub fn messages_compressed(&self) -> Vec<Message> {
+        compress_old_tool_results(&self.messages)
     }
 
     /// When this conversation was first saved (ISO-8601), if ever.
@@ -172,40 +196,49 @@ impl Session {
     /// would exceed the budget the window still opens (the newest user
     /// turn is never dropped), matching the existing over-budget policy.
     pub fn window_with(&self, budget_tokens: usize, injected: Option<&str>) -> Vec<Message> {
+        self.window_with_messages(&self.messages, budget_tokens, injected)
+    }
+
+    /// Same budgeting logic as [`Self::window_with`], but operates on
+    /// a caller-supplied message slice. Used by the agent loop to
+    /// apply old-tool-result compression without mutating the
+    /// session.
+    pub fn window_with_messages(
+        &self,
+        messages: &[Message],
+        budget_tokens: usize,
+        injected: Option<&str>,
+    ) -> Vec<Message> {
         let system_text = match injected.filter(|s| !s.trim().is_empty()) {
             Some(extra) => format!("{}\n\n{extra}", self.system),
             None => self.system.clone(),
         };
         let mut ctx = vec![Message::system(system_text)];
-        if self.messages.is_empty() {
+        if messages.is_empty() {
             return ctx;
         }
         let mut used = crate::tokens::count_message(&ctx[0]);
-        let mut start = self.messages.len();
+        let mut start = messages.len();
         while start > 0 {
-            let cost = crate::tokens::count_message(&self.messages[start - 1]);
+            let cost = crate::tokens::count_message(&messages[start - 1]);
             // Always keep at least the newest message, even if it alone
             // exceeds the budget — an empty user context is worse.
-            if start < self.messages.len() && used + cost > budget_tokens {
+            if start < messages.len() && used + cost > budget_tokens {
                 break;
             }
             start -= 1;
             used += cost;
         }
-        // Never open on an assistant turn: skip forward to the first user
-        // message so the API never sees a dangling answer.
         if let Some(first_user) =
-            (start..self.messages.len()).find(|&i| self.messages[i].role == "user")
+            (start..messages.len()).find(|&i| messages[i].role == "user")
         {
             if first_user > start {
                 start = first_user;
             }
         } else {
-            // No user turn fits; send nothing but the system prompt rather
-            // than a conversation that starts mid-answer.
             return ctx;
         }
-        ctx.extend_from_slice(&self.messages[start..]);
+        ctx.extend_from_slice(&messages[start..]);
         ctx
     }
 
@@ -254,7 +287,13 @@ impl Session {
             messages: self.messages.clone(),
         };
         let json = serde_json::to_string_pretty(&file).context("failed to serialize session")?;
-        std::fs::write(path, json).with_context(|| format!("cannot write {}", path.display()))
+        // Atomic write: write to a temp file first, then rename to avoid
+        // corruption if the process is interrupted mid-write.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("cannot rename {} to {}", tmp.display(), path.display()))
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
@@ -465,5 +504,88 @@ mod tests {
         assert_eq!(loaded.messages().len(), 3, "user/tool/assistant kept");
         assert_eq!(loaded.messages()[1].tool_call_id.as_deref(), Some("c1"));
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Tool results older than the most recent `KEEP_RECENT_TOOL_ROUNDS`
+/// rounds are truncated to this many characters before being sent to
+/// the model. Old tool results are usually re-readable on disk; the
+/// model needs only enough context to know they happened.
+pub const COMPRESSED_TOOL_CHARS: usize = 200;
+const KEEP_RECENT_TOOL_ROUNDS: usize = 3;
+
+/// Truncates old tool-result messages to a short excerpt + a pointer
+/// to the original. Pure function: easy to unit-test.
+pub fn compress_old_tool_results(messages: &[Message]) -> Vec<Message> {
+    let tool_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| if m.role == "tool" { Some(i) } else { None })
+        .collect();
+    if tool_indices.len() <= KEEP_RECENT_TOOL_ROUNDS {
+        return messages.to_vec();
+    }
+    // The boundary is the start of the most recent
+    // KEEP_RECENT_TOOL_ROUNDS tool messages. Everything before it
+    // (older tool results) gets truncated; everything from it on is
+    // untouched.
+    let boundary_idx = tool_indices[tool_indices.len() - KEEP_RECENT_TOOL_ROUNDS];
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in &messages[..boundary_idx] {
+        if m.role == "tool" && m.content.chars().count() > COMPRESSED_TOOL_CHARS {
+            let excerpt: String = m.content.chars().take(COMPRESSED_TOOL_CHARS).collect();
+            let mut tm = m.clone();
+            tm.content = format!(
+                "{excerpt}…\n// truncated, tool_call_id={:?}",
+                m.tool_call_id
+            );
+            out.push(tm);
+        } else {
+            out.push(m.clone());
+        }
+    }
+    out.extend_from_slice(&messages[boundary_idx..]);
+    out
+}
+
+#[cfg(test)]
+mod compress_tests {
+    use super::*;
+
+    fn tool_msg(id: &str, content: &str) -> Message {
+        Message::tool(id, content)
+    }
+
+    #[test]
+    fn keeps_short_history_untouched() {
+        let msgs = vec![
+            Message::user("u1"),
+            tool_msg("c1", "short"),
+            Message::assistant("a1"),
+        ];
+        let out = compress_old_tool_results(&msgs);
+        assert_eq!(out.len(), msgs.len());
+        assert_eq!(out[1].content, "short");
+    }
+
+    #[test]
+    fn truncates_old_tool_results() {
+        let big = "x".repeat(COMPRESSED_TOOL_CHARS * 3);
+        let msgs = vec![
+            tool_msg("c1", &big),
+            Message::assistant("a1"),
+            tool_msg("c2", &big),
+            Message::assistant("a2"),
+            tool_msg("c3", &big),
+            Message::assistant("a3"),
+            tool_msg("c4", "recent small"),
+        ];
+        let out = compress_old_tool_results(&msgs);
+        // Oldest tool messages truncated; the most recent 3 tool
+        // messages kept verbatim.
+        assert!(out[0].content.contains("truncated"), "c1 should be truncated");
+        assert_eq!(out[2].content, big, "c2 should be untouched (recent)");
+        assert_eq!(out[4].content, big, "c3 should be untouched (recent)");
+        assert_eq!(out[6].content, "recent small", "c4 should be untouched");
     }
 }

@@ -5,9 +5,10 @@
 //! The tree is cached and only re-read on explicit refresh (F5) or when the
 //! sidebar is opened.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -85,6 +86,8 @@ pub struct FileTree {
     /// Height of the render area, fed back by the draw pass so scrolling
     /// keeps the selection visible.
     view_height: Cell<u16>,
+    /// Last time the tree was auto-refreshed (for realtime file watching).
+    last_auto_refresh: RefCell<Option<Instant>>,
 }
 
 impl FileTree {
@@ -97,10 +100,36 @@ impl FileTree {
             selected: 0,
             git_marks: HashMap::new(),
             view_height: Cell::new(20),
+            last_auto_refresh: RefCell::new(Some(Instant::now())),
         };
         tree.nodes = read_children(&tree.root, &tree.ignore, "");
         tree.refresh_git();
         tree
+    }
+
+    /// Real-time poll: if a file was created/edited/deleted externally or via
+    /// a tool (write_file, edit_file) the tree auto-refreshes. Throttled to
+    /// once per 700ms so it feels instant but not chatty.
+    pub fn maybe_auto_refresh(&mut self) {
+        let now = Instant::now();
+        let should = {
+            let last = self.last_auto_refresh.borrow();
+            match *last {
+                Some(t) => now.duration_since(t) >= Duration::from_millis(700),
+                None => true,
+            }
+        };
+        if should {
+            // quick mtime check: if top-level dir mtime hasn't changed, skip git refresh
+            // For perfect realtime we always refresh; it's cheap for <500 entries.
+            self.refresh();
+            *self.last_auto_refresh.borrow_mut() = Some(now);
+        }
+    }
+
+    /// Force immediate refresh on next poll (e.g., after a tool mutated files).
+    pub fn mark_dirty(&self) {
+        *self.last_auto_refresh.borrow_mut() = None;
     }
 
     /// Re-reads git status (`git status --porcelain`) synchronously; called
@@ -226,8 +255,19 @@ impl FileTree {
         self.render_lines_with_width(focused, 34)
     }
 
-    /// Width-aware variant used by draw for perfect clipping.
+    /// Width-aware variant used by draw for perfect clipping. `hovered` is
+    /// the absolute flat index under the mouse (soft sheen), if any.
     pub fn render_lines_with_width(&self, focused: bool, width: u16) -> Vec<Line<'static>> {
+        self.render_lines_hover(focused, width, None)
+    }
+
+    /// Full variant with mouse-hover support.
+    pub fn render_lines_hover(
+        &self,
+        focused: bool,
+        width: u16,
+        hovered: Option<usize>,
+    ) -> Vec<Line<'static>> {
         let t = theme::active();
         let rows = self.flat();
 
@@ -248,15 +288,15 @@ impl FileTree {
                 let depth = node.rel.matches('/').count();
                 // guides: "│ " style via indent, but keep simple 2-space
                 let indent = "  ".repeat(depth);
-                // richer icons: dirs vs files
+                // richer icons: dirs vs files (Nerd Font glyphs, no emoji)
                 let (icon, icon_fg) = if node.is_dir {
                     if node.expanded {
-                        ("▾", t.accent_secondary)
+                        ("\u{f07c}", t.accent_secondary) // folder-open
                     } else {
-                        ("▸", t.text_muted)
+                        ("\u{f07b}", t.text_muted) // folder
                     }
                 } else {
-                    // file type hint
+                    // file-type glyph keeps recognition instant
                     let ext = node.name.rsplit('.').next().unwrap_or("");
                     let c = match ext {
                         "rs" => t.syntax_type,
@@ -264,20 +304,27 @@ impl FileTree {
                         "exe" | "dll" | "pdb" | "rmeta" | "rlib" | "d" => t.text_muted,
                         _ => t.text_primary,
                     };
-                    ("·", c)
+                    (super::super::icons::file_icon(&node.name), c)
                 };
                 let selected_row = idx == self.selected;
+                let hovered_row = hovered == Some(idx) && !selected_row;
                 let base = if selected_row {
                     Style::default()
                         .bg(if focused { t.bg_hover } else { t.bg_secondary })
                         .fg(t.text_primary)
+                } else if hovered_row {
+                    // soft glass sheen under the mouse
+                    Style::default()
+                        .bg(t.bg_tertiary)
+                        .fg(t.text_primary)
+                        .add_modifier(Modifier::UNDERLINED)
                 } else {
                     t.sidebar_bg()
                 };
                 let icon_style = if selected_row {
                     Style::default().fg(icon_fg).bg(base.bg.unwrap_or(t.bg_secondary)).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(icon_fg).bg(t.bg_secondary)
+                    Style::default().fg(icon_fg).bg(base.bg.unwrap_or(t.bg_secondary))
                 };
 
                 // compute truncation for perfect fit

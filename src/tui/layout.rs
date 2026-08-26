@@ -38,9 +38,10 @@ impl PaneLayout {
         } else {
             5
         };
+        let status_rows = if area.height < 15 { 1 } else { 3 };
 
         let [status, body, input] = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(status_rows),
             Constraint::Min(1),
             Constraint::Length(input_rows),
         ])
@@ -103,7 +104,7 @@ mod tests {
         let l = PaneLayout::compute(rect(140, 40), true, true);
         assert!(l.tree.is_some());
         assert!(l.tools.is_some());
-        assert_eq!(l.status.height, 1);
+        assert_eq!(l.status.height, 3);
         assert_eq!(l.input.height, 5);
         // Chat never drops below its floor.
         assert!(l.chat.width >= 20);

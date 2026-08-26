@@ -414,10 +414,17 @@ pub async fn stream_chat_at(
 ) -> Result<()> {
     let mut body = json!({
         "model": opts.model,
-        "temperature": opts.temperature,
         "stream": true,
         "messages": history,
     });
+    // Skip the explicit `temperature` field when the user has not
+    // changed it from the OpenAI default (1.0). Most providers treat
+    // 1.0 as the default already; explicitly sending it just adds
+    // a few bytes to every request and occasionally confuses
+    // models that have a different default (e.g. reasoning models).
+    if (opts.temperature - 1.0).abs() > f32::EPSILON {
+        body["temperature"] = json!(opts.temperature);
+    }
     if !opts.tools.is_empty() {
         body["tools"] = Value::Array(opts.tools.iter().map(Tool::to_wire).collect());
     }
@@ -435,7 +442,12 @@ pub async fn stream_chat_at(
                 if sink.has_output() || attempt == MAX_RETRIES {
                     return Err(error);
                 }
-                let wait = retry_after.unwrap_or(Duration::from_millis(500 * u64::from(attempt)));
+                let wait = retry_after.unwrap_or_else(|| {
+                    // Jittered exponential backoff: base * attempt + random jitter.
+                    let base_ms = 500 * u64::from(attempt);
+                    let jitter_ms = (attempt as u64 * 73) % 200; // deterministic pseudo-jitter
+                    Duration::from_millis(base_ms + jitter_ms)
+                });
                 eprintln!(
                     "transient error ({error:#}); retrying in {:.1}s…",
                     wait.as_secs_f32()
@@ -584,6 +596,7 @@ pub async fn list_models(
     }
     let resp: Resp = req
         .header("x-request-id", next_request_id())
+        .timeout(DEFAULT_READ_TIMEOUT)
         .send()
         .await
         .context("failed to list models")?

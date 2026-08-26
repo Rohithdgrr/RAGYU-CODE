@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-pub const DEFAULT_MODEL: &str = "mistral-small-latest";
+pub const DEFAULT_PROVIDER: &str = "omniroute";
+pub const DEFAULT_MODEL: &str = "auto";
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant. Answer concisely.";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_RENDER_MARKDOWN: bool = true;
@@ -59,6 +60,9 @@ pub struct Config {
     pub provider: Arc<dyn Provider>,
     /// The config file that was read, if any (shown by `/config`).
     pub source_path: Option<PathBuf>,
+    /// True when the provider came from env/TOML rather than defaults;
+    /// gates the OpenCode auto-connect so explicit choices always win.
+    pub provider_explicit: bool,
     /// Validated user-defined shell tools from `[[tools]]` blocks.
     pub shell_tools: Vec<crate::tools::ShellToolDef>,
     /// Default theme name (applied by the caller at startup).
@@ -83,26 +87,50 @@ impl Config {
 
         let provider_name = env_override("GOVINDA_PROVIDER")
             .or(file.provider.clone())
-            .unwrap_or_else(|| "mistral".to_owned());
-        let provider = provider::resolve(
-            &provider_name,
-            file.base_url.as_deref(),
-            file.api_key_env.as_deref(),
-            env_override,
-        )
-        .context("provider setup failed")?;
+            .unwrap_or_else(|| DEFAULT_PROVIDER.to_owned());
+        // An explicit provider gates auto-connect so intentional choices win,
+        // but the default "omniroute" never counts as explicit — users who
+        // leave config empty or write only comments still get auto-connect.
+        let provider_explicit = env_override("GOVINDA_PROVIDER").is_some()
+            || file
+                .provider
+                .as_deref()
+                .is_some_and(|p| p != DEFAULT_PROVIDER);
+
+        // A saved OpenCode-backed provider (`opencode-<pid>` + base_url)
+        // reloads through the bridge, pulling its key from OpenCode's own
+        // credential store instead of the environment.
+        let provider: Arc<dyn Provider> = if provider_name.starts_with(crate::opencode::KEY_PREFIX) {
+            let base_url = file.base_url.as_deref().with_context(|| {
+                format!(
+                    "saved provider '{provider_name}' needs a base_url in config.toml — run '/opencode connect' to repair"
+                )
+            })?;
+            crate::opencode::resolve_saved(&provider_name, base_url)?
+        } else {
+            provider::resolve(
+                &provider_name,
+                file.base_url.as_deref(),
+                file.api_key_env.as_deref(),
+                env_override,
+            )
+            .context("provider setup failed")?
+        };
         let api_key = Arc::new(Zeroizing::new(
             provider.auth().token().unwrap_or_default().to_owned(),
         ));
 
-        let model = env_override("MISTRAL_MODEL")
+        let model = env_override("GOVINDA_MODEL")
+            .or_else(|| env_override("MISTRAL_MODEL"))
             .or(file.model)
             .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
 
-        let temperature = match env_override("MISTRAL_TEMPERATURE") {
+        let temperature = match env_override("GOVINDA_TEMPERATURE")
+            .or_else(|| env_override("MISTRAL_TEMPERATURE"))
+        {
             Some(raw) => parse_temperature(&raw).unwrap_or_else(|| {
                 eprintln!(
-                    "warning: MISTRAL_TEMPERATURE='{raw}' is not a number in 0.0-1.0; using {DEFAULT_TEMPERATURE}"
+                    "warning: GOVINDA_TEMPERATURE='{raw}' is not a number in 0.0-1.0; using {DEFAULT_TEMPERATURE}"
                 );
                 DEFAULT_TEMPERATURE
             }),
@@ -111,7 +139,26 @@ impl Config {
             }),
         };
 
-        let context_tokens = provider::clamp_context_tokens(file.context_tokens);
+        // Resolve context budget in priority order:
+        //   1. Explicit `context_tokens` in TOML (clamped to sane range)
+        //   2. Static registry lookup for the chosen model (`context_window_for`)
+        //   3. Provider default for the preset family
+        //   4. DEFAULT_CONTEXT_TOKENS (128k)
+        // The model's *actual* limit is much larger for modern backends
+        // (Gemini 1M, Claude 200k, OpenCode 200k+, etc.) so we no longer
+        // silently cap at 8k.
+        let provider_id = provider.key();
+        let context_tokens = match file.context_tokens {
+            Some(v) => provider::clamp_context_tokens(Some(v)),
+            None => {
+                let from_registry = provider::context_window_for(&provider_id, &model);
+                if from_registry > 0 {
+                    from_registry
+                } else {
+                    provider::DEFAULT_CONTEXT_TOKENS
+                }
+            }
+        };
 
         let render_markdown = file.render_markdown.unwrap_or(DEFAULT_RENDER_MARKDOWN);
         let system_prompt = file
@@ -135,11 +182,22 @@ impl Config {
             context_tokens,
             provider,
             source_path,
+            provider_explicit,
             shell_tools: file.tools,
             theme: file.theme,
             timeout_secs,
             limit_mb,
         })
+    }
+
+    /// Swaps the active backend and re-derives the cached key from it.
+    /// Used by OpenCode connect/auto-connect (the `/provider` path replaces
+    /// the whole `Config`'s provider field directly).
+    pub fn adopt_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.api_key = Arc::new(Zeroizing::new(
+            provider.auth().token().unwrap_or_default().to_owned(),
+        ));
+        self.provider = provider;
     }
 
     /// Reads and parses the TOML file. A missing file is normal (no config);

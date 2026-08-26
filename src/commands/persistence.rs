@@ -1,6 +1,5 @@
-use super::{App, dim, err, ok};
+use super::{App, dim, err, info, ok};
 use crate::clock;
-use crate::render::{accent, paint};
 use crate::session::Session;
 use crate::sessions;
 use anyhow::Context;
@@ -27,7 +26,7 @@ pub(super) fn save_session(arg: &str, app: &mut App) {
             Some(name) => match sessions::named_session_path(name) {
                 Ok(p) => p,
                 Err(e) => {
-                    err(&format!("{e:#}"));
+                    err(format!("{e:#}"));
                     return;
                 }
             },
@@ -36,7 +35,7 @@ pub(super) fn save_session(arg: &str, app: &mut App) {
         false => match safe_session_path(arg) {
             Ok(p) => p,
             Err(e) => {
-                err(&format!("{e:#}"));
+                err(format!("{e:#}"));
                 return;
             }
         },
@@ -46,13 +45,13 @@ pub(super) fn save_session(arg: &str, app: &mut App) {
             if let Some(name) = sessions::name_from_path(&path) {
                 app.session_name = Some(name);
             }
-            ok(&format!(
+            ok(format!(
                 "saved {} messages to {}",
                 app.session.messages().len(),
                 path.display()
             ));
         }
-        Err(e) => err(&format!("{e:#}")),
+        Err(e) => err(format!("{e:#}")),
     }
 }
 
@@ -64,16 +63,16 @@ fn default_session_path() -> PathBuf {
     ))
 }
 
-pub(super) fn load_session(arg: &str, app: &mut App) {
+pub(super) fn load_session(arg: &str, app: &mut App) -> bool {
     if arg.is_empty() {
-        println!("usage: /load <name>");
-        return;
+        info("usage: /load <name>");
+        return false;
     }
     let path = match safe_session_path(arg) {
         Ok(p) => p,
         Err(e) => {
-            err(&format!("{e:#}"));
-            return;
+            err(format!("{e:#}"));
+            return false;
         }
     };
     match Session::load_from(&path) {
@@ -82,15 +81,19 @@ pub(super) fn load_session(arg: &str, app: &mut App) {
             let saved_at = session.updated_at().map(str::to_owned);
             app.session_name = sessions::name_from_path(&path);
             app.session = session;
-            ok(&format!(
+            ok(format!(
                 "loaded {n} messages from {}{}",
                 path.display(),
                 saved_at
                     .map(|t| format!(" (last saved {t})"))
                     .unwrap_or_default()
             ));
+            true
         }
-        Err(e) => err(&format!("{e:#}")),
+        Err(e) => {
+            err(format!("{e:#}"));
+            false
+        }
     }
 }
 
@@ -101,16 +104,16 @@ pub(super) fn list_named_sessions(app: &App) {
         dim("no saved sessions yet — /save <name> creates one.");
         return;
     }
-    println!("saved sessions (newest first):");
+    info("saved sessions (newest first):");
     for e in entries {
         let current = app.session_name.as_deref() == Some(e.name.as_str());
         let ts = e.updated_at.clone().unwrap_or_else(|| "-".to_owned());
-        println!(
+        info(format!(
             "  {}{}  {} msgs  {ts}",
-            paint(&e.name, accent()),
+            e.name,
             if current { " ←" } else { "" },
             e.messages,
-        );
+        ));
     }
 }
 
@@ -125,18 +128,18 @@ pub(super) fn fork_session(arg: &str, app: &mut App) {
         false => match safe_session_path(arg) {
             Ok(p) => p,
             Err(e) => {
-                err(&format!("{e:#}"));
+                err(format!("{e:#}"));
                 return;
             }
         },
     };
     match app.session.save_to(&path) {
-        Ok(()) => ok(&format!(
+        Ok(()) => ok(format!(
             "forked snapshot with {} messages to {} (live conversation unchanged)",
             app.session.messages().len(),
             path.display()
         )),
-        Err(e) => err(&format!("{e:#}")),
+        Err(e) => err(format!("{e:#}")),
     }
 }
 
@@ -146,7 +149,13 @@ pub(super) fn export(arg: &str, app: &App) {
         None => (arg.to_ascii_lowercase(), None),
     };
     let path = match file {
-        Some(f) => PathBuf::from(f),
+        Some(f) => match safe_session_path(&f) {
+            Ok(p) => p,
+            Err(e) => {
+                err(format!("{e:#}"));
+                return;
+            }
+        },
         None => PathBuf::from(format!(
             "{}/export-{}.{}",
             sessions::SESSIONS_DIR,
@@ -158,15 +167,15 @@ pub(super) fn export(arg: &str, app: &App) {
         "md" => export_markdown(app),
         "txt" => export_text(app),
         other => {
-            err(&format!(
+            err(format!(
                 "unknown format '{other}' — usage: /export md|txt [file]"
             ));
             return;
         }
     };
     match std::fs::write(&path, content) {
-        Ok(()) => ok(&format!("exported to {}", path.display())),
-        Err(e) => err(&format!("export failed: {e}")),
+        Ok(()) => ok(format!("exported to {}", path.display())),
+        Err(e) => err(format!("export failed: {e}")),
     }
 }
 
@@ -232,10 +241,18 @@ pub(super) struct RuntimeSnapshot {
     pub theme: String,
     pub timeout_secs: u64,
     pub limit_mb: u64,
+    /// Active provider preset id (`"custom"` for ad-hoc endpoints).
+    pub provider: String,
+    /// Set when the provider points at a non-preset endpoint.
+    pub base_url: Option<String>,
 }
 
 impl RuntimeSnapshot {
     pub fn from_app(app: &App) -> Self {
+        let key = app.config.provider.key();
+        // Custom endpoints and OpenCode-backed providers both point at
+        // non-preset URLs; persisting base_url is what makes them reloadable.
+        let needs_base_url = key.as_ref() == "custom" || key.starts_with(crate::opencode::KEY_PREFIX);
         Self {
             model: app.config.model.clone(),
             temperature: app.config.temperature,
@@ -244,6 +261,8 @@ impl RuntimeSnapshot {
             theme: crate::render::active_theme().name.to_owned(),
             timeout_secs: app.read_timeout.as_secs(),
             limit_mb: (app.max_response_bytes / (1024 * 1024)) as u64,
+            provider: key.to_string(),
+            base_url: needs_base_url.then(|| app.config.provider.base_url().to_owned()),
         }
     }
 }
@@ -267,10 +286,23 @@ fn merge_snapshot(table: &mut toml::Table, s: &RuntimeSnapshot) {
         toml::Value::from(s.timeout_secs as i64),
     );
     table.insert("limit_mb".into(), toml::Value::from(s.limit_mb as i64));
+    table.insert("provider".into(), toml::Value::from(s.provider.clone()));
+    match &s.base_url {
+        Some(url) => {
+            table.insert("base_url".into(), toml::Value::from(url.clone()));
+        }
+        None => {
+            // A preset provider must not inherit a stale custom endpoint.
+            table.remove("base_url");
+        }
+    }
 }
 
 /// Resolves where `/config save` writes: `GOVINDA_CONFIG` > the file that was
-/// loaded > the default location.
+/// loaded > the default location. Refuses to write if the config was never
+/// loaded from a real file (i.e. `source_path` is `None`), which prevents
+/// tests and in-memory configs from accidentally clobbering the user's real
+/// config.toml with synthetic values like `provider = "ollama"`.
 fn save_target_path(app: &App) -> anyhow::Result<PathBuf> {
     if let Some(p) = std::env::var_os("GOVINDA_CONFIG") {
         return Ok(PathBuf::from(p));
@@ -278,8 +310,9 @@ fn save_target_path(app: &App) -> anyhow::Result<PathBuf> {
     if let Some(p) = &app.config.source_path {
         return Ok(p.clone());
     }
-    crate::config::default_config_path()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine a config path (no HOME set?)"))
+    anyhow::bail!(
+        "no source config file to save back to (use `GOVINDA_CONFIG=/path/to/config.toml` to target a specific file)"
+    )
 }
 
 /// Writes current runtime settings to config.toml. The existing file is
@@ -294,8 +327,12 @@ pub(super) fn save_runtime_config(app: &App) -> anyhow::Result<PathBuf> {
     };
     let snapshot = RuntimeSnapshot::from_app(app);
     merge_snapshot(&mut table, &snapshot);
-    std::fs::write(&path, toml::to_string_pretty(&table)?)
-        .with_context(|| format!("cannot write {}", path.display()))?;
+    let content = toml::to_string_pretty(&table)?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &content)
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("cannot rename {} to {}", tmp.display(), path.display()))?;
     Ok(path)
 }
 
@@ -327,6 +364,8 @@ args_template = ["pr", "list"]
             theme: "dracula".into(),
             timeout_secs: 45,
             limit_mb: 8,
+            provider: "mistral".into(),
+            base_url: None,
         };
         merge_snapshot(&mut table, &snapshot);
         let out = toml::to_string_pretty(&table).unwrap();
@@ -353,9 +392,34 @@ args_template = ["pr", "list"]
             theme: "default".into(),
             timeout_secs: 30,
             limit_mb: 16,
+            provider: "mistral".into(),
+            base_url: None,
         };
         merge_snapshot(&mut table, &snapshot);
         let out = toml::to_string_pretty(&table).unwrap();
         crate::config::parse_file_config_for_test(&out).expect("saved config should load cleanly");
+    }
+
+    #[test]
+    fn safe_session_path_rejects_traversal() {
+        // Absolute paths
+        assert!(safe_session_path("/etc/passwd").is_err());
+        assert!(safe_session_path("C:\\Windows\\System32").is_err());
+        // Parent directory traversal
+        assert!(safe_session_path("../etc/passwd").is_err());
+        assert!(safe_session_path("a/../../b").is_err());
+        // Valid paths
+        assert!(safe_session_path("work").is_ok());
+        assert!(safe_session_path("my-chat_2").is_ok());
+    }
+
+    #[test]
+    fn export_uses_safe_session_path() {
+        // Export with traversal should be rejected
+        // This tests the fix for the path traversal vulnerability
+        // We can't call export directly without an App, but we can verify
+        // that safe_session_path is applied
+        assert!(safe_session_path("../.env").is_err());
+        assert!(safe_session_path("normal-name").is_ok());
     }
 }

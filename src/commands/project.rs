@@ -2,9 +2,7 @@
 //! (`.govinda_project.json`): last scanned commit, preferred test and build
 //! commands. See [`crate::project`].
 
-use super::{dim, err, ok};
-use crate::render::accent;
-use crate::render::{dim_color, ok_color, paint};
+use super::{dim, err, info, ok};
 
 /// `/project [sub]`
 ///   (no args)          show current memory
@@ -19,18 +17,18 @@ pub(super) fn handle(rest: &str) {
         Some("set") => match words.next() {
             Some("test") => set_command("test", words.collect::<Vec<_>>().join(" ")),
             Some("build") => set_command("build", words.collect::<Vec<_>>().join(" ")),
-            other => err(&format!(
+            other => err(format!(
                 "unknown slot '{:?}' — use 'set test <cmd>' or 'set build <cmd>'",
                 other.unwrap_or("")
             )),
         },
         Some("clear") => match words.next() {
             Some(slot @ ("test" | "build")) => clear_command(slot),
-            other => err(&format!(
+            other => err(format!(
                 "unknown slot '{other:?}' — use 'clear test' or 'clear build'"
             )),
         },
-        Some(other) => err(&format!(
+        Some(other) => err(format!(
             "unknown subcommand '{other}' — try /project, /project set test <cmd>, /project set \
              build <cmd>, /project clear test|build"
         )),
@@ -39,15 +37,9 @@ pub(super) fn handle(rest: &str) {
 
 fn show() {
     let mem = crate::project::load();
-    println!(
-        "{}",
-        paint("project memory (.govinda_project.json)", accent())
-    );
+    info("project memory (.govinda_project.json)");
     match &mem.last_scan_commit {
-        Some(hash) => println!(
-            "  {}",
-            paint(format!("last scanned commit: {hash}"), dim_color())
-        ),
+        Some(hash) => dim(format!("last scanned commit: {hash}")),
         None => dim("last scanned commit: (never scanned — run /scan)"),
     }
     print_slot("test", mem.test_command.as_deref());
@@ -56,8 +48,8 @@ fn show() {
 
 fn print_slot(name: &str, value: Option<&str>) {
     match value {
-        Some(cmd) => println!("  {}", paint(format!("{name} command: {cmd}"), ok_color())),
-        None => dim(&format!("{name} command: (auto-detected)")),
+        Some(cmd) => ok(format!("{name} command: {cmd}")),
+        None => dim(format!("{name} command: (auto-detected)")),
     }
 }
 
@@ -77,8 +69,8 @@ fn set_command(slot: &str, command: String) {
         mem.build_command = Some(command.clone());
     }
     match crate::project::save_to(&std::env::current_dir().unwrap_or_default(), &mem) {
-        Ok(()) => ok(&format!("{slot} command saved: {command}")),
-        Err(e) => err(&format!("cannot save project memory: {e:#}")),
+        Ok(()) => ok(format!("{slot} command saved: {command}")),
+        Err(e) => err(format!("cannot save project memory: {e:#}")),
     }
 }
 
@@ -88,12 +80,12 @@ fn clear_command(slot: &str) {
         "test" => mem.test_command = None,
         "build" => mem.build_command = None,
         other => {
-            err(&format!("unknown slot '{other}'"));
+            err(format!("unknown slot '{other}'"));
             return;
         }
     }
     match crate::project::save_to(&std::env::current_dir().unwrap_or_default(), &mem) {
-        Ok(()) => ok(&format!("{slot} command cleared; auto-detection restored.")),
-        Err(e) => err(&format!("cannot save project memory: {e:#}")),
+        Ok(()) => ok(format!("{slot} command cleared; auto-detection restored.")),
+        Err(e) => err(format!("cannot save project memory: {e:#}")),
     }
 }
