@@ -232,19 +232,15 @@ pub async fn run_turn(
                 .window_with_messages(&compressed, app.config.context_tokens, injection.as_deref())
         };
         let auth = app.config.provider.auth();
-        // Cap the model's per-answer output at 25% of its true context
-        // window (clamped to [1k, 32k]). Without this, free-tier providers
-        // use their default (often 4k-8k) and the model gets cut off
-        // mid-answer with `finish_reason: "length"`.
-        let max_output = {
-            let window = crate::auto_compact::context_window_for(app);
-            let cap = (window / 4).clamp(1024, 32_768);
-            Some(cap)
-        };
+        // Don't send max_tokens by default — let the provider use its own
+        // output limit. Sending a value that exceeds the provider's actual
+        // output cap (e.g. 32k to a gateway that only allows ~9k) causes
+        // silent truncation at the provider's real limit, which is worse
+        // than the provider's own default.
         let opts = ChatOptions {
             max_response_bytes: app.max_response_bytes,
             read_timeout: app.read_timeout,
-            max_tokens: max_output,
+            max_tokens: None,
             tools: if app.tools_enabled {
                 app.tool_specs
                     .iter()
