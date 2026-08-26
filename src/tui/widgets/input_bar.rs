@@ -207,6 +207,7 @@ pub fn describe(cmd: &str) -> &'static str {
         "/theme" => "switch theme",
         "/tokens" => "token usage",
         "/todo" => "task list (model-controllable)",
+        "/plan" => "GOVINDA protocol: force planning cycle for the next prompt",
         "/cd" | "/open" => "change folder — open workspace",
         _ => "",
     }

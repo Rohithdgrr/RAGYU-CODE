@@ -14,6 +14,7 @@ use crate::api;
 /// Most steps a plan may contain.
 const MAX_STEPS: usize = 10;
 
+#[allow(dead_code)]
 const PLAN_SYSTEM: &str = "You are a planning assistant for a coding agent that can scan, read, \
 edit, and verify code in the user's workspace. Decompose the given task into short, concrete, \
 self-contained steps (at most 10), ordered so each builds on the last. Prefer steps that name \
@@ -217,6 +218,7 @@ pub async fn generate_pipeline(app: &mut App, task: &str) -> anyhow::Result<Vec<
 }
 
 /// Entry point for `/plan [task]`.
+#[allow(dead_code)]
 pub(super) async fn handle(arg: &str, app: &mut App) -> Outcome {
     let task = arg.trim();
     if task.is_empty() {

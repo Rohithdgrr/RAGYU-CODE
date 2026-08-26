@@ -35,7 +35,8 @@ pub async fn probe_active(
 ) -> ProbeResult {
     let started = Instant::now();
     let url = provider.chat_url();
-    let bearer = provider.auth().token();
+    let auth = provider.auth();
+    let bearer = auth.token();
     let body = serde_json::json!({
         "model": model,
         "temperature": 0,

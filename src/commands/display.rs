@@ -3,6 +3,7 @@ use crate::render::{self, theme_names};
 use crate::tools::save_disabled_tools;
 use std::time::Duration;
 
+#[allow(dead_code)]
 pub(super) fn set_temperature(arg: &str, app: &mut App) {
     match parse_temperature(arg) {
         Some(t) => {
@@ -16,6 +17,7 @@ pub(super) fn set_temperature(arg: &str, app: &mut App) {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn parse_temperature(arg: &str) -> Option<f32> {
     arg.trim()
         .parse::<f32>()
@@ -23,6 +25,7 @@ pub(super) fn parse_temperature(arg: &str) -> Option<f32> {
         .filter(|t| (0.0..=1.0).contains(t))
 }
 
+#[allow(dead_code)]
 pub(super) fn set_or_show_system(prompt: &str, app: &mut App) {
     if prompt.is_empty() {
         info(format!("system prompt: {}", app.session.system()));
@@ -58,6 +61,7 @@ pub(super) fn set_or_show_theme(name: &str, app: &App) {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn set_timeout(arg: &str, app: &mut App) {
     match arg
         .trim()
@@ -76,6 +80,7 @@ pub(super) fn set_timeout(arg: &str, app: &mut App) {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn set_limit(arg: &str, app: &mut App) {
     match arg
         .trim()
@@ -193,6 +198,7 @@ pub(super) fn print_history(app: &App) {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn search_history(needle: &str, app: &App) {
     if needle.is_empty() {
         info("usage: /search <text>");
@@ -210,6 +216,7 @@ pub(super) fn search_history(needle: &str, app: &App) {
     ok(format!("{} match(es).", hits.len()));
 }
 
+#[allow(dead_code)]
 pub(super) fn show_stats(app: &App) {
     let elapsed = app.stats.started.map_or(Duration::ZERO, |s| s.elapsed());
     let avg = if app.stats.turns > 0 {
@@ -228,6 +235,7 @@ pub(super) fn show_stats(app: &App) {
     ));
 }
 
+#[allow(dead_code)]
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs >= 3600 {

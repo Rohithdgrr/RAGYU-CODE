@@ -2536,6 +2536,7 @@ mod tests {
             theme: None,
             timeout_secs: 30,
             limit_mb: 16,
+            protocol: crate::govinda_protocol::ProtocolConfig::default(),
         };
         let mut app = crate::commands::App::new(
             config,
@@ -2585,6 +2586,7 @@ mod tests {
             theme: None,
             timeout_secs: 30,
             limit_mb: 16,
+            protocol: crate::govinda_protocol::ProtocolConfig::default(),
         };
         App::new(
             config,

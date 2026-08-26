@@ -157,14 +157,6 @@ impl Session {
         compress_old_tool_results(&self.messages)
     }
 
-    /// Returns a copy of the messages with old tool results truncated
-    /// to a short excerpt + a pointer to the original. Pure: leaves
-    /// `self.messages` untouched. Used by the agent loop to keep the
-    /// context window lean across long tool-heavy sessions.
-    pub fn messages_compressed(&self) -> Vec<Message> {
-        compress_old_tool_results(&self.messages)
-    }
-
     /// When this conversation was first saved (ISO-8601), if ever.
     pub fn created_at(&self) -> Option<&str> {
         self.created_at.as_deref()

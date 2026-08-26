@@ -1,7 +1,7 @@
-﻿mod display;
+mod display;
 mod edits;
 mod folder;
-mod generation;
+pub mod generation;
 pub mod output;
 mod persistence;
 mod plan;
@@ -14,7 +14,7 @@ use crate::render::{Renderer, dim_color, err_color, ok_color, paint};
 use crate::session::Session;
 use crate::tools::{BuiltinTools, PendingEdits, ToolExecutor};
 use display::{
-    print_history, set_or_show_theme, show_config, show_tools,
+    print_history, set_or_show_theme,
 };
 use generation::{compact, models, retry, set_model};
 use output::{CommandOutput, Effect};
@@ -36,7 +36,7 @@ pub use plan::{Phase, PipelineStep, generate_pipeline, parse_pipeline_steps};
 /// list had 55 entries, many of which were stubbed, broken, or duplicated
 /// TUI-only behaviour. Anything removed here is still discoverable via
 /// `/help` (which lists a short summary of each).
-pub const SLASH_COMMANDS: [&str; 14] = [
+pub const SLASH_COMMANDS: [&str; 15] = [
     "/help",
     "/exit",
     "/clear",
@@ -47,6 +47,7 @@ pub const SLASH_COMMANDS: [&str; 14] = [
     "/theme",
     "/tokens",
     "/todo",
+    "/plan",
     "/cd",
     "/save",
     "/load",
@@ -116,6 +117,18 @@ pub struct App {
     /// failures. Defaults to `true`; toggled via
     /// `/router failover on|off`.
     pub router_failover: bool,
+    /// Per-turn header prepended to the next user message by the
+    /// `/plan` command. The header is consumed (taken) by `run_turn`
+    /// so the second turn runs without it.
+    pub pending_protocol_header: Option<String>,
+    /// Tracked phase, parsed from the assistant's `[Phase N]` markers
+    /// by the agent loop. `None` until the model emits a marker.
+    pub current_phase: Option<crate::govinda_protocol::ProjectPhase>,
+    /// Running estimate of lines produced in this turn. Bumped by the
+    /// agent loop after every successful `write_file` tool call.
+    pub total_lines_emitted: usize,
+    /// Detected project type, used by the protocol header.
+    pub project_type: crate::govinda_protocol::ProjectType,
 }
 
 #[derive(Default)]
@@ -158,6 +171,7 @@ impl App {
             theme: None,
             timeout_secs: 30,
             limit_mb: 16,
+            protocol: crate::govinda_protocol::ProtocolConfig::default(),
         };
         App::new(
             config,
@@ -180,6 +194,7 @@ impl App {
         let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let project_memory = crate::memory::ProjectMemory::load(&workspace);
         let skills = crate::skills::load_skills();
+        let project_type = crate::govinda_protocol::ProjectType::Unspecified;
         Self {
             read_timeout: Duration::from_secs(config.timeout_secs),
             max_response_bytes: (config.limit_mb as usize) * 1024 * 1024,
@@ -203,6 +218,10 @@ impl App {
             auto_compact_enabled: true,
             last_auto_compact_count: 0,
             router_failover: true,
+            pending_protocol_header: None,
+            current_phase: None,
+            total_lines_emitted: 0,
+            project_type,
             config,
             http,
             session,
@@ -353,7 +372,8 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
         "/tokens" => {
             let used = app.session.approx_tokens();
             let budget = app.config.context_tokens;
-            let provider_id: &str = app.config.provider.key().as_ref();
+            let provider_key = app.config.provider.key();
+            let provider_id: &str = provider_key.as_ref();
             let model: &str = app.config.model.as_str();
             let registry_window = crate::provider::context_window_for(provider_id, model);
             let headroom = budget.saturating_sub(used);
@@ -396,6 +416,28 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
         "/todo" => {
             todo::handle(rest, app);
             Outcome::Handled
+        }
+        "/plan" => {
+            // /plan <prompt...> primes the protocol header for the next turn
+            // and re-sends the prompt through the normal agent loop. The
+            // header is consumed by run_turn exactly once.
+            if rest.trim().is_empty() {
+                dim("/plan needs a prompt, e.g. /plan build a todo list");
+                Outcome::Handled
+            } else {
+                let header = crate::govinda_protocol::build_protocol_header(
+                    rest,
+                    app.project_type,
+                );
+                app.pending_protocol_header = Some(header);
+                app.current_phase = Some(crate::govinda_protocol::ProjectPhase::InstructionIngestion);
+                app.total_lines_emitted = 0;
+                ok(format!(
+                    "GOVINDA protocol armed for next turn (project: {}).",
+                    app.project_type.as_str()
+                ));
+                Outcome::Resend(rest.to_owned())
+            }
         }
         "/cd" | "/open" => {
             return folder::handle(rest, app).await;
@@ -458,7 +500,6 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                 }
                 "/config" => {
                     dim("`/config` was removed; edit `~/.config/govinda/config.toml` directly (TOML is the source of truth).");
-                }
                 }
                 "/test" | "/setup" => {
                     dim("`/test` / `/setup` were removed; run a model call directly to verify the provider.");
@@ -531,6 +572,7 @@ pub(crate) fn todo_app_for_tools() -> App {
         theme: None,
         timeout_secs: 30,
         limit_mb: 16,
+        protocol: crate::govinda_protocol::ProtocolConfig::default(),
     };
     let mut app = App::new(
         config,
@@ -896,8 +938,48 @@ pub fn specialize_system(app: &mut App) {
                 specialized.push_str(&format!("- `{}` â€” {}{}\n", s.name, s.description, args_hint));
             }
         }
+        // GOVINDA Protocol enforcement: append the master prompt and (when
+        // present) the user's plan template + SYSTEM_INSTRUCTIONS. The
+        // master prompt is inlined so a missing file never silently
+        // disables enforcement; PLAN_TEMPLATE.md is read at runtime so
+        // users can edit it without recompiling.
+        if app.config.protocol.enforcement_mode {
+            specialized.push_str("\n\n## GOVINDA PROTOCOL (ENFORCED)\n\n");
+            specialized.push_str(crate::govinda_protocol::MASTER_SYSTEM_PROMPT);
+            if let Some(plan) = load_plan_template() {
+                specialized.push_str("\n\n## ACTIVE PLAN TEMPLATE\n\n");
+                specialized.push_str(&plan);
+            }
+            if let Some(instructions) = load_system_instructions() {
+                specialized.push_str("\n\n## ACTIVE SYSTEM INSTRUCTIONS\n\n");
+                specialized.push_str(&instructions);
+            }
+        }
         app.session.set_system(specialized);
     }
+}
+
+/// Reads PLAN_TEMPLATE.md from the workspace root, falling back to the
+/// built-in [crate::govinda_protocol::PLAN_TEMPLATE_FALLBACK] when the
+/// file is missing or unreadable. A user-edited template takes precedence.
+fn load_plan_template() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let path = cwd.join("PLAN_TEMPLATE.md");
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => Some(s),
+        _ => Some(crate::govinda_protocol::PLAN_TEMPLATE_FALLBACK.to_owned()),
+    }
+}
+
+/// Reads SYSTEM_INSTRUCTIONS.md from the workspace root. Returns
+/// None when the file is missing - the protocol's master prompt is
+/// self-contained, so a missing SYSTEM_INSTRUCTIONS.md is not an error.
+fn load_system_instructions() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let path = cwd.join("SYSTEM_INSTRUCTIONS.md");
+    std::fs::read_to_string(&path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// Dispatches with capture enabled and returns structured output for
@@ -946,6 +1028,7 @@ pub fn capabilities_summary() -> anyhow::Result<String> {
         "open_preview", "git_diff", "git_log", "git_branch", "git_commit",
         "web_search", "web_fetch", "ask_user", "delegate_task", "todo",
         "show_token_budget", "show_capabilities", "remember", "forget",
+        "quality_gate_check",
     ];
     Ok(format!(
         "cwd: {}\nmodel: {}\nprovider: {}\nenabled tools ({}):\n  {}\ndisabled tools: (use the TUI's /tools to toggle)",
@@ -1062,6 +1145,7 @@ mod tests {
             theme: None,
             timeout_secs: 30,
             limit_mb: 16,
+            protocol: crate::govinda_protocol::ProtocolConfig::default(),
         };
         App::new(
             config,

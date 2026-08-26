@@ -7,6 +7,7 @@ use crate::tools::{EditOp, PendingEdits, apply_ops_to_content, resolve_in, stage
 use anyhow::Context as _;
 
 /// `/diff` — show the unified diff of everything staged.
+#[allow(dead_code)]
 pub(super) fn view(app: &App) {
     let ops = snapshot(app);
     if ops.is_empty() {
@@ -30,6 +31,7 @@ pub(super) fn view(app: &App) {
 /// `/apply` — validate every staged edit against current file contents,
 /// then write all files atomically: any validation failure aborts the whole
 /// batch with the queue intact. Returns `true` when all edits were written.
+#[allow(dead_code)]
 pub(super) fn apply(app: &mut App) -> bool {
     let ops = snapshot(app);
     if ops.is_empty() {
@@ -92,6 +94,7 @@ pub(super) fn apply(app: &mut App) -> bool {
 }
 
 /// `/reject` — discard everything staged without touching any files.
+#[allow(dead_code)]
 pub(super) fn reject(app: &mut App) {
     let n = snapshot(app).len();
     match app.pending_edits.lock() {
@@ -111,6 +114,7 @@ pub(super) fn reject(app: &mut App) {
 
 /// `/review` — batch summary after a run of edits: per-file `+N/-M` counts
 /// computed from each file's staged unified diff.
+#[allow(dead_code)]
 pub(super) fn review(app: &App) {
     let ops = snapshot(app);
     if ops.is_empty() {
@@ -156,6 +160,7 @@ pub(super) fn review(app: &App) {
     dim("run /apply to confirm, /reject to discard, or /diff for full diffs.");
 }
 
+#[allow(dead_code)]
 fn snapshot(app: &App) -> Vec<EditOp> {
     app.pending_edits
         .lock()
@@ -163,6 +168,7 @@ fn snapshot(app: &App) -> Vec<EditOp> {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 fn transform_file(cwd: &std::path::Path, path: &str, group: &[&EditOp]) -> anyhow::Result<String> {
     let full = resolve_in(cwd, path)?;
     let bytes = std::fs::read(&full).with_context(|| format!("cannot read '{path}'"))?;

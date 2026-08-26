@@ -1,6 +1,9 @@
-//! `/cd` / `/cwd` / `/folder` / `/open` — change working directory.
+//! `/cd` / `/folder` / `/open` — change working directory.
 //! Updates process cwd, project memory, todo list, and symbol index.
 //! Used by both REPL and TUI (TUI also refreshes its FileTree).
+//!
+//! The TUI watches the slash command name after dispatch and rebuilds its
+//! file tree / pinned-file set (see `tui::app::apply_command_output`).
 
 use std::path::PathBuf;
 
@@ -62,8 +65,13 @@ pub async fn handle(arg: &str, app: &mut App) -> Outcome {
         err(format!("cd failed: {e}"));
         return Outcome::Handled;
     }
-    // Refresh state that is per-workspace
-    app.todos = crate::commands::todo::load();
+    // Refresh state that is per-workspace.
+    // Load the todo list for the new project first so a previous project's
+    // list doesn't briefly appear in the TUI. If the new project has no
+    // list, the TUI shows the welcome hint instead of an empty flicker.
+    let new_todos = crate::commands::todo::load();
+    let todo_count = new_todos.len();
+    app.todos = new_todos;
     app.project_memory = crate::memory::ProjectMemory::load(&canon);
     // Rebuild symbol index for new workspace (best-effort)
     let count = crate::symbols::rebuild(&canon);
@@ -71,9 +79,13 @@ pub async fn handle(arg: &str, app: &mut App) -> Outcome {
     if prev != canon {
         dim(format!("previous: {}", prev.display()));
     }
-    info(format!("{count} symbols indexed · {} todos", app.todos.len()));
-    // Signal TUI to rebuild tree (it watches Effect::ReloadTranscript to rebuild transcript; we use custom)
-    // For REPL, just handled. For TUI, caller will refresh FileTree via effect.
+    info(format!(
+        "{count} symbols indexed · {todo_count} todo{} loaded",
+        if todo_count == 1 { "" } else { "s" }
+    ));
+    if todo_count == 0 {
+        dim("(no todos for this project — '/todo add <text>' to create one)");
+    }
     Outcome::Handled
 }
 

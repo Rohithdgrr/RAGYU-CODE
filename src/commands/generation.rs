@@ -93,7 +93,8 @@ async fn models_top(rest: &str, app: &mut App) {
             n = v;
         }
     }
-    let provider_id: &str = app.config.provider.key().as_ref();
+    let provider_key = app.config.provider.key();
+    let provider_id: &str = provider_key.as_ref();
     let rows = crate::model_rank::top_models(provider_id, sort_key, n);
     if rows.is_empty() {
         err(format!("no registry models for '{provider_id}'"));
