@@ -678,16 +678,36 @@ fn handle_round_error(
     resume_len: usize,
     e: anyhow::Error,
 ) {
+    let error_chain: Vec<String> = e.chain().map(|c| format!("{c}")).collect();
+    let primary = error_chain.first().cloned().unwrap_or_default();
+
     if !out.is_empty() {
         let kept = format!("{out}\n\n*(interrupted)*");
         app.session.push_assistant(kept.clone());
         ui.answer(&kept);
-        ui.error(&format!("{e:#}"));
-    } else {
-        app.session.truncate_messages(resume_len);
-        app.session.pop_user();
-        ui.error(&format!("{e:#}"));
     }
+    // Build a detailed error message with context chain.
+    let mut detail = String::new();
+    if error_chain.len() > 1 {
+        detail.push_str("Caused by:\n");
+        for (i, cause) in error_chain.iter().enumerate().skip(1) {
+            detail.push_str(&format!("  {i}. {cause}\n"));
+        }
+    }
+    // Add model/provider context.
+    detail.push_str(&format!(
+        "Model: {} · Provider: {}\n",
+        app.config.model,
+        app.config.provider.key()
+    ));
+    let msg = if detail.is_empty() {
+        primary
+    } else {
+        format!("{primary}\n{detail}")
+    };
+    ui.error(&msg);
+    app.session.truncate_messages(resume_len);
+    app.session.pop_user();
 }
 
 /// Heuristic over a committed tool-result string: `error:` prefixes from

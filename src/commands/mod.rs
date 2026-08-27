@@ -230,6 +230,7 @@ impl App {
             theme: None,
             timeout_secs: 30,
             limit_mb: 16,
+            git_binary_path: None,
             protocol: crate::govinda_protocol::ProtocolConfig::default(),
         };
         App::new(
@@ -314,7 +315,7 @@ pub fn apply_pending_edits(app: &mut App) -> bool {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let pending = app.pending_edits.clone();
     let ops = {
-        let guard = pending.lock().unwrap();
+        let guard = pending.lock().unwrap_or_else(|e| e.into_inner());
         guard.ops().to_vec()
     };
     if ops.is_empty() {
@@ -322,7 +323,7 @@ pub fn apply_pending_edits(app: &mut App) -> bool {
     }
     let result = crate::tools::apply_ops_to_disk(&cwd, &ops);
     if result.is_ok() {
-        pending.lock().unwrap().clear();
+        pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
         true
     } else {
         false
@@ -671,6 +672,7 @@ pub(crate) fn todo_app_for_tools() -> App {
         theme: None,
         timeout_secs: 30,
         limit_mb: 16,
+        git_binary_path: None,
         protocol: crate::govinda_protocol::ProtocolConfig::default(),
     };
     let mut app = App::new(
@@ -1232,14 +1234,14 @@ pub fn capabilities_summary() -> anyhow::Result<String> {
 pub fn apply_pending(base: &std::path::Path, app: &App) -> anyhow::Result<String> {
     let pending = app.pending_edits.clone();
     let ops = {
-        let guard = pending.lock().unwrap();
+        let guard = pending.lock().unwrap_or_else(|e| e.into_inner());
         guard.ops().to_vec()
     };
     if ops.is_empty() {
         return Ok("nothing to apply".to_owned());
     }
     let _ = crate::tools::apply_ops_to_disk(base, &ops)?;
-    pending.lock().unwrap().clear();
+    pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
     Ok(format!("applied {} edit(s)", ops.len()))
 }
 
@@ -1338,6 +1340,7 @@ mod tests {
             theme: None,
             timeout_secs: 30,
             limit_mb: 16,
+            git_binary_path: None,
             protocol: crate::govinda_protocol::ProtocolConfig::default(),
         };
         App::new(

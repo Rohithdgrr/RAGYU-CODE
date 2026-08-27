@@ -39,7 +39,7 @@ use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use super::widgets::chat_pane::ChatEntry;
+use super::widgets::chat_pane::{ChatEntry, ErrorEntry, ErrorSeverity};
 use super::widgets::file_tree::FileTree;
 use super::{draw, icons, theme};
 use crate::api;
@@ -289,6 +289,23 @@ impl Tui {
 
     pub fn notice(&mut self, text: impl Into<String>) {
         self.push_entry(ChatEntry::Notice(text.into()));
+        self.scroll_from_bottom = 0;
+    }
+
+    /// Pushes a structured error card with severity, title, detail, and optional suggestion.
+    pub fn push_error(
+        &mut self,
+        severity: ErrorSeverity,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        suggestion: Option<String>,
+    ) {
+        self.push_entry(ChatEntry::Error(ErrorEntry {
+            severity,
+            title: title.into(),
+            detail: detail.into(),
+            suggestion,
+        }));
         self.scroll_from_bottom = 0;
     }
 
@@ -1710,13 +1727,18 @@ impl Tui {
                 }
             }
             TurnUpdate::Answer(text) => {
-                self.streaming.lock().unwrap().clear();
+                self.streaming.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 self.push_entry(ChatEntry::Assistant(text));
                 self.scroll_from_bottom = 0;
             }
             TurnUpdate::Notice(text) => self.notice(text),
             TurnUpdate::Error(text) => {
-                self.push_entry(ChatEntry::Notice(format!("error: {text}")));
+                self.push_entry(ChatEntry::Error(ErrorEntry {
+                    severity: ErrorSeverity::Error,
+                    title: "Error".to_owned(),
+                    detail: text,
+                    suggestion: None,
+                }));
                 self.scroll_from_bottom = 0;
             }
         }
@@ -1731,7 +1753,7 @@ impl Tui {
         if self.mode == AppMode::Review {
             self.mode = self.prev_mode;
         }
-        let leftover = std::mem::take(&mut *self.streaming.lock().unwrap());
+        let leftover = std::mem::take(&mut *self.streaming.lock().unwrap_or_else(|e| e.into_inner()));
         if !leftover.trim().is_empty() {
             if interrupted {
                 self.push_entry(ChatEntry::Assistant(format!(
@@ -2313,7 +2335,12 @@ fn apply_command_output(
                 tui.push_entry(ChatEntry::Assistant(msg.text.clone()));
                 tui.scroll_from_bottom = 0;
             }
-            Role::Err => tui.push_entry(ChatEntry::Notice(format!("error: {}", msg.text))),
+            Role::Err => tui.push_entry(ChatEntry::Error(ErrorEntry {
+                severity: ErrorSeverity::Error,
+                title: "Command Error".to_owned(),
+                detail: msg.text.clone(),
+                suggestion: None,
+            })),
             _ => tui.notice(msg.text.clone()),
         }
     }
@@ -2437,7 +2464,7 @@ impl crate::agent_loop::AgentUi for TuiUi {
     }
 
     fn stream_delta(&self, delta: &str) {
-        self.streaming.lock().unwrap().push_str(delta);
+        self.streaming.lock().unwrap_or_else(|e| e.into_inner()).push_str(delta);
     }
 
     fn prose(&self, text: &str) {

@@ -94,6 +94,13 @@ fn hash_entries(entries: &[ChatEntry], streaming: Option<&str>, busy: bool) -> (
                 7u8.hash(&mut h);
                 s.hash(&mut h);
             }
+            ChatEntry::Error(e) => {
+                8u8.hash(&mut h);
+                (e.severity as u8).hash(&mut h);
+                e.title.hash(&mut h);
+                e.detail.hash(&mut h);
+                e.suggestion.hash(&mut h);
+            }
         }
     }
     busy.hash(&mut h);
@@ -105,7 +112,24 @@ fn hash_entries(entries: &[ChatEntry], streaming: Option<&str>, busy: bool) -> (
     (hash, hs.finish())
 }
 
+/// Severity level for structured error display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorSeverity {
+    Info,
+    Warn,
+    Error,
+    Critical,
+}
+
+/// A structured error entry with context, severity, and actionable suggestions.
 #[derive(Debug, Clone)]
+pub struct ErrorEntry {
+    pub severity: ErrorSeverity,
+    pub title: String,
+    pub detail: String,
+    pub suggestion: Option<String>,
+}
+
 pub enum ChatEntry {
     /// A submitted user prompt (slash commands handled locally never land
     /// here).
@@ -137,6 +161,8 @@ pub enum ChatEntry {
     },
     /// Local system notices (errors, hints, command feedback).
     Notice(String),
+    /// Structured error with severity, context, and suggestions.
+    Error(ErrorEntry),
 }
 
 /// One ``` fence segment inside assistant content.
@@ -1813,6 +1839,51 @@ fn notice_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Renders a structured error card with severity icon, title, detail, and
+/// optional suggestion.
+fn error_lines(entry: &ErrorEntry, width: u16) -> Vec<Line<'static>> {
+    let t = theme::active();
+    let inner = width.saturating_sub(4) as usize;
+
+    // Severity → icon + color
+    let (icon, color) = match entry.severity {
+        ErrorSeverity::Info => (icons::INFO, t.accent_primary),
+        ErrorSeverity::Warn => (icons::WARNING, t.accent_warning),
+        ErrorSeverity::Error => (icons::ERRORS, t.accent_error),
+        ErrorSeverity::Critical => (icons::ERRORS, t.accent_error),
+    };
+
+    // ── Title line ──
+    let title_style = Style::default()
+        .fg(color)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("  {icon} "), Style::default().fg(color)),
+        Span::styled(entry.title.clone(), title_style),
+    ])];
+
+    // ── Detail lines (indented under the icon) ──
+    for l in wrap(&entry.detail, inner.saturating_sub(4)) {
+        lines.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled(l, Style::default().fg(t.text_primary)),
+        ]));
+    }
+
+    // ── Suggestion line (if present) ──
+    if let Some(ref suggestion) = entry.suggestion {
+        for l in wrap(suggestion, inner.saturating_sub(4)) {
+            lines.push(Line::from(vec![
+                Span::styled("      → ", Style::default().fg(t.accent_secondary)),
+                Span::styled(l, Style::default().fg(t.accent_secondary)),
+            ]));
+        }
+    }
+
+    lines.push(Line::default());
+    lines
+}
+
 fn op_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let t = theme::active();
     let inner = width.saturating_sub(4) as usize;
@@ -2002,6 +2073,7 @@ pub fn build_lines(
                 lines.extend(checklist_lines(title, steps, width))
             }
             ChatEntry::Notice(t) => lines.extend(notice_lines(t, width)),
+            ChatEntry::Error(e) => lines.extend(error_lines(e, width)),
         }
     }
     if let Some(partial) = streaming {

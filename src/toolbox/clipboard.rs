@@ -49,7 +49,7 @@ pub fn run(base: &std::path::Path, args: Args) -> anyhow::Result<String> {
                 .ok_or_else(|| anyhow::anyhow!("source_path required for copy"))?;
             let content = read_range(base, path, args.line_start, args.line_end)?;
             let n = content.chars().count();
-            *clipboard().lock().unwrap() = Some(content);
+            *clipboard().lock().unwrap_or_else(|e| e.into_inner()) = Some(content);
             Ok(format!(
                 "{{\"action\":\"copy\",\"source\":\"{}\",\"chars\":{}}}",
                 path, n
@@ -89,7 +89,7 @@ pub fn run(base: &std::path::Path, args: Args) -> anyhow::Result<String> {
                 .ok_or_else(|| anyhow::anyhow!("source_path required for cut"))?;
             let content = read_range(base, path, args.line_start, args.line_end)?;
             let n = content.chars().count();
-            *clipboard().lock().unwrap() = Some(content.clone());
+            *clipboard().lock().unwrap_or_else(|e| e.into_inner()) = Some(content.clone());
             // Blank the range in the source file.
             let full = std::fs::read_to_string(base.join(path))?;
             let lines: Vec<&str> = full.lines().collect();
@@ -119,7 +119,7 @@ pub fn run(base: &std::path::Path, args: Args) -> anyhow::Result<String> {
             ))
         }
         Action::View => {
-            let text = clipboard().lock().unwrap();
+            let text = clipboard().lock().unwrap_or_else(|e| e.into_inner());
             match text.as_deref() {
                 Some(t) => Ok(format!(
                     "{{\"chars\":{},\"preview\":{}}}",
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn view_reports_empty() {
-        clipboard().lock().unwrap().take();
+        clipboard().lock().unwrap_or_else(|e| e.into_inner()).take();
         let args = Args {
             action: Action::View,
             source_path: None,

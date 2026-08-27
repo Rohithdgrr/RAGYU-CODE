@@ -40,7 +40,7 @@ pub fn run(_base: &Path, args: Args) -> anyhow::Result<String> {
         "unsupported image format: {ext} (supported: png, jpg, jpeg, gif, webp, bmp)"
     );
     let bytes = std::fs::metadata(path)?.len();
-    *pending().lock().unwrap() = Some(args.path.clone());
+    *pending().lock().unwrap_or_else(|e| e.into_inner()) = Some(args.path.clone());
     Ok(format!(
         "{{\"ok\":true,\"path\":\"{}\",\"bytes\":{bytes},\"format\":\"{ext}\",\"prompt\":{}}}",
         args.path,
@@ -54,7 +54,7 @@ pub fn run(_base: &Path, args: Args) -> anyhow::Result<String> {
 /// Consume and return any pending image path set by image_view.
 /// Called by the agent loop before sending the next request.
 pub fn take_pending() -> Option<String> {
-    pending().lock().unwrap().take()
+    pending().lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 #[cfg(test)]

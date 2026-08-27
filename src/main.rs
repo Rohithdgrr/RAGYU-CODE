@@ -94,6 +94,20 @@ impl Prompt for CliPrompt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install a panic hook that restores the terminal before printing the
+    // panic message. Without this, a panic while raw-mode is active leaves
+    // the terminal permanently garbled (no echo, no line-wrapping).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen
+        );
+        default_hook(info);
+    }));
+
     let args = parse_args()?;
     if let Some(shell) = &args.completion {
         govinda_cli::completions::emit(shell)?;
@@ -349,10 +363,15 @@ async fn main() -> Result<()> {
                 match handle_line(line, &mut app).await {
                     Ok(true) => break,
                     Ok(false) => {}
-                    Err(e) => eprintln!(
-                        "{}",
-                        paint(format!("error: {e:#}"), govinda_cli::render::err_color())
-                    ),
+                    Err(e) => {
+                        eprintln!();
+                        eprintln!(
+                            "  {} {}",
+                            paint("✗", govinda_cli::render::err_color()),
+                            paint(format!("{e:#}"), govinda_cli::render::err_color())
+                        );
+                        eprintln!();
+                    }
                 }
             }
             Ok(Signal::CtrlC) => {} // clears the input line
@@ -864,10 +883,49 @@ impl govinda_cli::agent_loop::AgentUi for CliUi {
     }
 
     fn error(&self, text: &str) {
+        // Extract suggestion from error chains if present.
+        let (title, detail) = if let Some(pos) = text.find('\n') {
+            (text[..pos].to_owned(), text[pos + 1..].to_owned())
+        } else {
+            (text.to_owned(), String::new())
+        };
+        eprintln!();
         eprintln!(
-            "{}",
-            paint(format!("error: {text}"), govinda_cli::render::err_color())
+            "  {} {}",
+            paint("✗", govinda_cli::render::err_color()),
+            paint(title, govinda_cli::render::err_color())
         );
+        if !detail.is_empty() {
+            for line in detail.lines() {
+                eprintln!(
+                    "    {}",
+                    paint(line.to_owned(), govinda_cli::render::dim_color())
+                );
+            }
+        }
+        // Suggest common fixes based on error patterns.
+        let lower = text.to_lowercase();
+        let hint = if lower.contains("connection refused") || lower.contains("connect") {
+            Some("Is the OmniRoute gateway running? Start it with: omniroute")
+        } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("auth") {
+            Some("Check your API key: set OPENAI_API_KEY (or the provider's env var)")
+        } else if lower.contains("404") || lower.contains("not found") {
+            Some("Verify the model name: use /models to list available models")
+        } else if lower.contains("timeout") {
+            Some("The server took too long. Try /timeout 120 or check your network")
+        } else if lower.contains("rate") && lower.contains("limit") {
+            Some("Rate limited. Wait a moment and retry, or switch provider: /provider")
+        } else {
+            None
+        };
+        if let Some(h) = hint {
+            eprintln!(
+                "    {} {}",
+                paint("→", govinda_cli::render::dim_color()),
+                paint(h.to_owned(), govinda_cli::render::dim_color())
+            );
+        }
+        eprintln!();
     }
 
     fn timeline(&self, model: &str, elapsed: std::time::Duration) {
@@ -977,10 +1035,30 @@ async fn run_turn(app: &mut App, input: &str) {
     .await
     {
         Ok(_) => {}
-        Err(e) => eprintln!(
-            "{}",
-            paint(format!("error: {e:#}"), govinda_cli::render::err_color())
-        ),
+        Err(e) => {
+            eprintln!();
+            eprintln!(
+                "  {} {}",
+                paint("✗", govinda_cli::render::err_color()),
+                paint(format!("{e:#}"), govinda_cli::render::err_color())
+            );
+            // Suggest common fixes.
+            let msg = format!("{e:#}").to_lowercase();
+            if msg.contains("connection refused") || msg.contains("connect") {
+                eprintln!(
+ "    {} {}",
+                    paint("→", govinda_cli::render::dim_color()),
+                    paint("Is the OmniRoute gateway running? Start it with: omniroute", govinda_cli::render::dim_color())
+                );
+            } else if msg.contains("401") || msg.contains("unauthorized") {
+                eprintln!(
+                    "    {} {}",
+                    paint("→", govinda_cli::render::dim_color()),
+                    paint("Check your API key: set the provider's env var (e.g. OPENAI_API_KEY)", govinda_cli::render::dim_color())
+                );
+            }
+            eprintln!();
+        }
     }
 }
 

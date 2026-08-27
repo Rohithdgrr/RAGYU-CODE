@@ -148,7 +148,7 @@ fn render_status(f: &mut Frame<'_>, area: Rect, mode: AppMode, info: &StatusInfo
 
 fn render_chat(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
     let t = theme::active();
-    let streaming = tui.streaming.lock().unwrap().clone();
+    let streaming = tui.streaming.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let lines = chat_pane::build_lines(
         &tui.entries,
         Some(&streaming),

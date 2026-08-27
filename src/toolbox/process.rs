@@ -53,8 +53,8 @@ pub fn run(args: Args) -> anyhow::Result<String> {
             let cmd = args
                 .command
                 .ok_or_else(|| anyhow::anyhow!("command required for start"))?;
-            let mut guard = procs().lock().unwrap();
-            let mut counter = handle_counter().lock().unwrap();
+            let mut guard = procs().lock().unwrap_or_else(|e| e.into_inner());
+            let mut counter = handle_counter().lock().unwrap_or_else(|e| e.into_inner());
             *counter += 1;
             let handle = format!("p{}", *counter);
             let child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
@@ -85,7 +85,7 @@ pub fn run(args: Args) -> anyhow::Result<String> {
             let h = args
                 .handle_id
                 .ok_or_else(|| anyhow::anyhow!("handle_id required for stop"))?;
-            let mut guard = procs().lock().unwrap();
+            let mut guard = procs().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(p) = guard.get_mut(&h) {
                 if let Some(mut c) = p.child.take() {
                     let _ = c.kill();
@@ -100,7 +100,7 @@ pub fn run(args: Args) -> anyhow::Result<String> {
             }
         }
         Action::List => {
-            let guard = procs().lock().unwrap();
+            let guard = procs().lock().unwrap_or_else(|e| e.into_inner());
             let list: Vec<serde_json::Value> = guard
                 .values()
                 .map(|p| {
@@ -121,7 +121,7 @@ pub fn run(args: Args) -> anyhow::Result<String> {
                 .handle_id
                 .ok_or_else(|| anyhow::anyhow!("handle_id required for tail"))?;
             let _tail = args.tail_lines.unwrap_or(50);
-            let guard = procs().lock().unwrap();
+            let guard = procs().lock().unwrap_or_else(|e| e.into_inner());
             match guard.get(&h) {
                 Some(p) => Ok(format!(
                     "{{\"handle\":\"{}\",\"log\":{}}}",
@@ -138,7 +138,7 @@ pub fn run(args: Args) -> anyhow::Result<String> {
             let h = args
                 .handle_id
                 .ok_or_else(|| anyhow::anyhow!("handle_id required for status"))?;
-            let guard = procs().lock().unwrap();
+            let guard = procs().lock().unwrap_or_else(|e| e.into_inner());
             match guard.get(&h) {
                 Some(p) => Ok(format!(
                     "{{\"handle\":\"{}\",\"command\":\"{}\",\"running\":{}}}",

@@ -65,7 +65,7 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
                 // Acquire permit (block until one is available).
                 {
                     loop {
-                        let mut guard = sem.lock().unwrap();
+                        let mut guard = sem.lock().unwrap_or_else(|e| e.into_inner());
                         if *guard > 0 {
                             *guard -= 1;
                             break;
@@ -86,9 +86,9 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
                     }
                     None => serde_json::json!({"tool":tool, "ok":false, "error":"unknown tool"}),
                 };
-                results.lock().unwrap().push(payload.clone());
+                results.lock().unwrap_or_else(|e| e.into_inner()).push(payload.clone());
                 // Release permit.
-                *sem.lock().unwrap() += 1;
+                *sem.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                 let _ = tx.send(());
             })
         })
