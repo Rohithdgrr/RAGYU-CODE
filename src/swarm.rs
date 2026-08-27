@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::api::{self, ChatOptions, Message, StreamSink};
+use crate::tools::ToolExecutor;
 
 /// Default temperature for swarm workers. Low enough that parallel
 /// workers on the same prompt produce consistent answers.
@@ -58,6 +59,12 @@ pub fn spawn_subagent(
 }
 
 /// Runs a subagent task and returns the result.
+///
+/// Each tool call requested by the model is actually executed against the
+/// workspace using a read-only `BuiltinTools` executor. Mutating tools that
+/// require confirmation (`write_file`, `run_shell`, `apply_edits`, …) are
+/// rejected with an error result so the model can self-correct instead of
+/// silently succeeding with a fake result.
 async fn run_subagent(
     config: SubagentConfig,
     task: String,
@@ -69,17 +76,27 @@ async fn run_subagent(
 
     let mut history = vec![
         Message::system(&config.system_prompt),
-        Message::user(format!("Execute this task and return the results:\n\n{task}")),
+        Message::user(format!(
+            "Execute this task and return the results:\n\n{task}"
+        )),
     ];
 
     let mut all_output = String::new();
     let mut tools_used = Vec::new();
-    let max_rounds = 3;
+    let max_rounds = 5;
+    // Read-only executor for the subagent sandbox.
+    let executor = crate::tools::BuiltinTools::default();
 
     for round in 0..max_rounds {
         let auth = provider.auth();
+        let max_tokens = if config.max_tokens > 0 {
+            Some(config.max_tokens as u32)
+        } else {
+            Some(4096)
+        };
         let opts = ChatOptions {
-            max_response_bytes: 64 * 1024, // 64KB cap for subagents
+            max_response_bytes: 64 * 1024,
+            max_tokens,
             tools: tools.clone(),
             ..ChatOptions::new(auth.token(), &config.model, config.temperature)
         };
@@ -93,21 +110,38 @@ async fn run_subagent(
                 all_output.push_str(&sink_out);
 
                 if tool_calls.is_empty() {
-                    // No more tool calls, we're done
                     break;
                 }
 
-                // Execute tool calls
-                history.push(Message::assistant_with_tool_calls(&sink_out, tool_calls.clone()));
+                history.push(Message::assistant_with_tool_calls(
+                    &sink_out,
+                    tool_calls.clone(),
+                ));
 
                 for call in &tool_calls {
                     tools_used.push(call.function.name.clone());
-                    // For subagents, we just record the call but don't execute
-                    // (execution happens in the parent context)
-                    history.push(Message::tool(
-                        &call.id,
-                        format!("Tool '{}' called (subagent context)", call.function.name),
-                    ));
+                    let exec_result = if executor.requires_confirmation(&call.function.name) {
+                        Err(anyhow::anyhow!(
+                            "tool '{}' is not allowed in subagent (read-only sandbox — requires confirmation)",
+                            call.function.name
+                        ))
+                    } else {
+                        executor
+                            .execute(&call.function.name, &call.function.arguments)
+                            .await
+                    };
+                    let raw = match exec_result {
+                        Ok(v) => v,
+                        Err(e) => format!("error: {e:#}"),
+                    };
+                    // Cap per-tool result so one huge file doesn't blow the 128k history budget.
+                    let truncated = if raw.chars().count() > 8000 {
+                        let cut: String = raw.chars().take(8000).collect();
+                        format!("{cut}\n…(truncated at 8000 chars)")
+                    } else {
+                        raw
+                    };
+                    history.push(Message::tool(&call.id, truncated));
                 }
             }
             Err(e) => {
@@ -127,7 +161,9 @@ async fn run_subagent(
 
 /// Runs a parallel exploration task and returns the result.
 ///
-/// This is a simpler interface for the common case of exploring code.
+/// This is a simpler interface for the common case of exploring code. Unlike
+/// the previous single-shot implementation, this now loops over tool calls
+/// (read-only) so `grep`/`read_file`/`find_symbol` actually return data.
 pub async fn explore(
     task: &str,
     http: &reqwest::Client,
@@ -144,26 +180,68 @@ pub async fn explore(
          Context:\n{context}"
     );
 
-    let history = vec![
-        Message::system(&system),
-        Message::user(task.to_owned()),
-    ];
-
+    let mut history = vec![Message::system(&system), Message::user(task.to_owned())];
     let auth = provider.auth();
-    // The gateway's own routing alias keeps this working on any backend —
-    // OmniRoute's `auto` picks a healthy model; OpenAI-compatible servers
-    // without that alias fall back to their default handling of the id.
-    // Temperature stays low so concurrent swarm answers don't diverge
-    // wildly; can be overridden via `swarm_temperature` in the future.
-    let opts = ChatOptions::new(auth.token(), crate::config::DEFAULT_MODEL, SWARM_TEMPERATURE);
+    let executor = crate::tools::BuiltinTools::default();
+    // Advertise only read-only tools to the explore worker.
+    let all_specs = executor.specs();
+    let tools: Vec<api::Tool> = all_specs
+        .into_iter()
+        .filter(|t| !executor.requires_confirmation(&t.name))
+        .collect();
 
-    let mut out = String::new();
-    let mut no_calls = Vec::new();
-    let mut sink = StreamSink::new(&mut out, &mut no_calls);
+    let max_rounds = 4;
+    let mut final_out = String::new();
 
-    api::stream_chat(http, provider, &opts, &history, &mut sink, |_| {}).await?;
-
-    Ok(out)
+    for _ in 0..max_rounds {
+        let opts = ChatOptions {
+            max_response_bytes: 64 * 1024,
+            max_tokens: Some(4096),
+            tools: tools.clone(),
+            ..ChatOptions::new(
+                auth.token(),
+                crate::config::DEFAULT_MODEL,
+                SWARM_TEMPERATURE,
+            )
+        };
+        let mut out = String::new();
+        let mut pending_calls = Vec::new();
+        let mut sink = StreamSink::new(&mut out, &mut pending_calls);
+        api::stream_chat(http, provider, &opts, &history, &mut sink, |_| {}).await?;
+        final_out.push_str(&out);
+        if pending_calls.is_empty() {
+            return Ok(final_out);
+        }
+        history.push(Message::assistant_with_tool_calls(
+            &out,
+            pending_calls.clone(),
+        ));
+        for call in &pending_calls {
+            let raw = if executor.requires_confirmation(&call.function.name) {
+                format!(
+                    "error: tool '{}' not allowed in explore (read-only)",
+                    call.function.name
+                )
+            } else {
+                match executor
+                    .execute(&call.function.name, &call.function.arguments)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => format!("error: {e:#}"),
+                }
+            };
+            let truncated = if raw.chars().count() > 8000 {
+                let cut: String = raw.chars().take(8000).collect();
+                format!("{cut}\n…(truncated)")
+            } else {
+                raw
+            };
+            history.push(Message::tool(&call.id, truncated));
+        }
+        final_out.push('\n');
+    }
+    Ok(final_out)
 }
 
 #[cfg(test)]

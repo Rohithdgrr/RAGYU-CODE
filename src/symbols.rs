@@ -128,6 +128,10 @@ fn rel_path(base: &Path, p: &Path) -> String {
 // -- Global store -------------------------------------------------------------
 
 static INDEX: RwLock<Option<Arc<SymbolIndex>>> = RwLock::new(None);
+/// When the index was last rebuilt (wall time) + the max mtime of files at
+/// that moment. Used by `ensure` to avoid rebuilding when nothing changed,
+/// and to debounce rapid calls within the same turn.
+static INDEX_META: RwLock<Option<(std::time::Instant, std::time::SystemTime)>> = RwLock::new(None);
 
 /// Rebuilds the index from disk and installs it as the current snapshot.
 /// Returns the number of symbols indexed.
@@ -137,6 +141,10 @@ pub fn rebuild(base: &Path) -> usize {
     if let Ok(mut slot) = INDEX.write() {
         *slot = Some(built);
     }
+    // Record build time + current wall time for mtime checks.
+    if let Ok(mut meta) = INDEX_META.write() {
+        *meta = Some((std::time::Instant::now(), std::time::SystemTime::now()));
+    }
     n
 }
 
@@ -145,11 +153,67 @@ pub fn current() -> Option<Arc<SymbolIndex>> {
     INDEX.read().ok().and_then(|slot| slot.clone())
 }
 
+/// Returns the latest file mtime in the workspace (quick metadata walk,
+/// no file contents read). `None` if the workspace cannot be scanned.
+fn max_mtime(base: &Path) -> Option<std::time::SystemTime> {
+    let mut max: Option<std::time::SystemTime> = None;
+    for file in crate::tools::walk_files(base, base) {
+        if let Ok(meta) = std::fs::metadata(&file) {
+            if let Ok(m) = meta.modified() {
+                max = Some(match max {
+                    Some(cur) if cur >= m => cur,
+                    _ => m,
+                });
+            }
+        }
+    }
+    max
+}
+
 /// Current snapshot, building one from `base` on first use so `find_symbol`
 /// works even when no explicit scan happened yet.
+///
+/// Perf: `ensure` does not rebuild every call. It caches the last build
+/// timestamp and the max file mtime at build time. A fast metadata scan
+/// checks whether any file is newer than the cached mtime; if not, the
+/// existing index is reused. Rapid calls within 2 seconds are debounced
+/// entirely without even scanning.
 pub fn ensure(base: &Path) -> Arc<SymbolIndex> {
     if let Some(idx) = current() {
-        return idx;
+        // Debounce: if we just built, reuse without scanning.
+        let should_recheck = {
+            if let Ok(meta) = INDEX_META.read() {
+                if let Some((instant, _)) = *meta {
+                    instant.elapsed() > std::time::Duration::from_secs(2)
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        };
+        if !should_recheck {
+            return idx;
+        }
+        // Check max mtime: if no file is newer than the build time, reuse.
+        let build_time = {
+            INDEX_META
+                .read()
+                .ok()
+                .and_then(|m| m.as_ref().map(|(_, t)| *t))
+        };
+        if let Some(build_time) = build_time {
+            if let Some(max) = max_mtime(base) {
+                if max <= build_time {
+                    return idx;
+                }
+            } else {
+                // Cannot scan — be conservative and reuse.
+                return idx;
+            }
+        } else {
+            return idx;
+        }
     }
     rebuild(base);
     current().unwrap_or_default()
@@ -286,6 +350,9 @@ pub(crate) mod tests {
     pub(crate) fn reset_global() {
         if let Ok(mut slot) = INDEX.write() {
             *slot = None;
+        }
+        if let Ok(mut meta) = INDEX_META.write() {
+            *meta = None;
         }
     }
 

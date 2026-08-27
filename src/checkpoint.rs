@@ -47,11 +47,7 @@ impl CheckpointStore {
 
     /// Creates a checkpoint with the given label.
     #[allow(clippy::expect_used)] // safe: we just pushed to the vec
-    pub fn checkpoint(
-        &mut self,
-        label: &str,
-        messages: &[crate::api::Message],
-    ) -> &Checkpoint {
+    pub fn checkpoint(&mut self, label: &str, messages: &[crate::api::Message]) -> &Checkpoint {
         let cp = Checkpoint {
             id: self.next_id,
             label: label.to_owned(),
@@ -128,8 +124,7 @@ pub fn save_checkpoint(workspace: &Path, cp: &Checkpoint) -> Result<PathBuf> {
         timestamp: cp.timestamp.clone(),
         messages: cp.messages.clone(),
     };
-    let json =
-        serde_json::to_string_pretty(&data).context("failed to serialize checkpoint")?;
+    let json = serde_json::to_string_pretty(&data).context("failed to serialize checkpoint")?;
     // Atomic write to avoid corruption on crash.
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, &json)?;

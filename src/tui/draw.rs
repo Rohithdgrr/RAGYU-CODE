@@ -1,10 +1,10 @@
 //! Main render pass: status bar → chat → tree/tools sidebars → input.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Fill, Paragraph};
-use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{AppMode, Focus, Tui};
@@ -14,12 +14,12 @@ use super::widgets::{chat_pane, input_bar, status_bar, todo_panel};
 
 /// Fills an area with the backdrop color to make modals fully opaque.
 fn clear_area(f: &mut Frame<'_>, area: Rect, theme: &theme::Theme) {
+    f.render_widget(Paragraph::new(""), area);
+    // Use Fill to paint every cell with the backdrop background.
     f.render_widget(
-        Paragraph::new(""),
+        Fill::new(" ").style(Style::default().bg(theme.bg_tertiary)),
         area,
     );
-    // Use Fill to paint every cell with the backdrop background.
-    f.render_widget(Fill::new(" ").style(Style::default().bg(theme.bg_tertiary)), area);
 }
 
 /// Per-frame snapshot of session facts. Owned data so a running turn (which
@@ -66,7 +66,14 @@ pub fn draw(f: &mut Frame<'_>, tui: &Tui, info: &StatusInfo) {
     if let Some(rect) = layout.tree
         && let Some(tree) = &tui.tree
     {
-        render_tree(f, rect, tree, tui.focus == Focus::Tree, " PROJECT ", tui.tree_hover);
+        render_tree(
+            f,
+            rect,
+            tree,
+            tui.focus == Focus::Tree,
+            " PROJECT ",
+            tui.tree_hover,
+        );
     }
     if let Some(rect) = layout.tools {
         render_todo(f, rect, info, tui.focus == Focus::Tree);
@@ -120,17 +127,28 @@ fn render_status(f: &mut Frame<'_>, area: Rect, mode: AppMode, info: &StatusInfo
         f.render_widget(block, area);
         // center vertically inside 3-row rail (inner height =1)
         let y = inner.y + inner.height.saturating_sub(1) / 2;
-        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(t.bg_tertiary)), row);
+        let row = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(t.bg_tertiary)),
+            row,
+        );
     } else {
         // compact single-row fallback — still glassy
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(t.bg_tertiary)), area);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(t.bg_tertiary)),
+            area,
+        );
     }
 }
 
 fn render_chat(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
     let t = theme::active();
-    let streaming = tui.streaming.borrow().clone();
+    let streaming = tui.streaming.lock().unwrap().clone();
     let lines = chat_pane::build_lines(
         &tui.entries,
         Some(&streaming),
@@ -144,8 +162,7 @@ fn render_chat(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
     let max_scroll = lines.len().saturating_sub(visible);
     let scroll = tui.scroll_from_bottom.min(max_scroll);
     let start = lines.len().saturating_sub(visible + scroll);
-    let slice: Vec<Line<'static>> =
-        lines[start..start + visible.min(lines.len() - start)].to_vec();
+    let slice: Vec<Line<'static>> = lines[start..start + visible.min(lines.len() - start)].to_vec();
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -188,7 +205,12 @@ fn render_tree(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} {} ", super::icons::TREE_TITLE, title.trim()))
-        .title_style(Style::default().fg(t.accent_secondary).bg(t.bg_primary).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(t.accent_secondary)
+                .bg(t.bg_primary)
+                .add_modifier(Modifier::BOLD),
+        )
         .title(
             ratatui::text::Line::styled(
                 format!(" ▸ {file_count} files "),
@@ -216,7 +238,12 @@ fn render_todo(f: &mut Frame<'_>, area: Rect, info: &StatusInfo, focused: bool) 
         .borders(Borders::ALL)
         .title(format!(" {} TODO ", super::icons::TREE_TITLE))
         .border_style(t.border_style(focused))
-        .title_style(Style::default().fg(t.accent_secondary).bg(t.bg_primary).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(t.accent_secondary)
+                .bg(t.bg_primary)
+                .add_modifier(Modifier::BOLD),
+        )
         .style(t.sidebar_bg());
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -230,16 +257,36 @@ fn render_explorer_placeholder(f: &mut Frame<'_>, area: Rect) {
         .borders(Borders::ALL)
         .title(format!(" {} FILES ", super::icons::FILES_TITLE))
         .border_style(t.border_style(false))
-        .title_style(Style::default().fg(t.accent_secondary).bg(t.bg_primary).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(t.accent_secondary)
+                .bg(t.bg_primary)
+                .add_modifier(Modifier::BOLD),
+        )
         .style(t.sidebar_bg());
     let inner = block.inner(area);
     f.render_widget(block, area);
     let hint = vec![
-        Line::styled("  No files yet", Style::default().fg(t.text_muted).bg(t.bg_secondary)),
+        Line::styled(
+            "  No files yet",
+            Style::default().fg(t.text_muted).bg(t.bg_secondary),
+        ),
         Line::default(),
-        Line::styled("  Press Ctrl+P", Style::default().fg(t.text_secondary).bg(t.bg_secondary).add_modifier(Modifier::BOLD)),
-        Line::styled("  or Ctrl+T to", Style::default().fg(t.text_muted).bg(t.bg_secondary)),
-        Line::styled("  open explorer", Style::default().fg(t.text_muted).bg(t.bg_secondary)),
+        Line::styled(
+            "  Press Ctrl+P",
+            Style::default()
+                .fg(t.text_secondary)
+                .bg(t.bg_secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "  or Ctrl+T to",
+            Style::default().fg(t.text_muted).bg(t.bg_secondary),
+        ),
+        Line::styled(
+            "  open explorer",
+            Style::default().fg(t.text_muted).bg(t.bg_secondary),
+        ),
     ];
     f.render_widget(Paragraph::new(hint), inner);
 }
@@ -298,7 +345,10 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
             Line::from(vec![
                 ratatui::text::Span::styled(
                     format!("  {} streaming{dots}  ", super::icons::LIVE),
-                    Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(t.accent_primary)
+                        .bg(t.bg_tertiary)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 ratatui::text::Span::styled(
                     format!("{} {} pinned", super::icons::PINNED, tui.pinned_files.len()),
@@ -312,25 +362,76 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
             )
         } else {
             Line::from(vec![
-                Span::styled("  /", Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
-                Span::styled(" commands", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
-                Span::styled(" · @", Style::default().fg(t.accent_secondary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
-                Span::styled(" files", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
-                Span::styled(" · ? shortcuts", Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC)),
+                Span::styled(
+                    "  /",
+                    Style::default()
+                        .fg(t.accent_primary)
+                        .bg(t.bg_tertiary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " commands",
+                    Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                ),
+                Span::styled(
+                    " · @",
+                    Style::default()
+                        .fg(t.accent_secondary)
+                        .bg(t.bg_tertiary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " files",
+                    Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                ),
+                Span::styled(
+                    " · ? shortcuts",
+                    Style::default()
+                        .fg(t.text_muted)
+                        .bg(t.bg_tertiary)
+                        .add_modifier(Modifier::ITALIC),
+                ),
             ])
         };
-        f.render_widget(Paragraph::new(gutter_line).style(Style::default().bg(t.bg_tertiary)), Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 });
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(t.bg_tertiary)), Rect { x: inner.x, y: input_y, width: inner.width, height: 1 });
+        f.render_widget(
+            Paragraph::new(gutter_line).style(Style::default().bg(t.bg_tertiary)),
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(t.bg_tertiary)),
+            Rect {
+                x: inner.x,
+                y: input_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
         // bottom gutter already is the footer rail (block title), keep empty bottom line for breathing
         let bottom_gutter = Line::styled(" ", Style::default().bg(t.bg_tertiary));
-        f.render_widget(Paragraph::new(bottom_gutter), Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: 1 });
+        f.render_widget(
+            Paragraph::new(bottom_gutter),
+            Rect {
+                x: inner.x,
+                y: inner.y + 2,
+                width: inner.width,
+                height: 1,
+            },
+        );
         let _ = divider; // reserved for future separator styling
         if focus_input && !tui.confirm_pending {
             place_cursor(f, inner.x, input_y, &tui.input, tui.input_cursor);
         }
     } else {
         // Cozy single-line within 3-row card
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(t.bg_tertiary)), inner);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(t.bg_tertiary)),
+            inner,
+        );
         if focus_input && !tui.confirm_pending {
             place_cursor(f, inner.x, inner.y, &tui.input, tui.input_cursor);
         }
@@ -368,8 +469,12 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
                 let pal_inner = pal_block.inner(pal_rect);
                 f.render_widget(pal_block, pal_rect);
                 // height may be less than lines if clamped, slice
-                let slice: Vec<Line<'static>> = lines.into_iter().take(pal_inner.height as usize).collect();
-                f.render_widget(Paragraph::new(slice).style(Style::default().bg(t.bg_tertiary)), pal_inner);
+                let slice: Vec<Line<'static>> =
+                    lines.into_iter().take(pal_inner.height as usize).collect();
+                f.render_widget(
+                    Paragraph::new(slice).style(Style::default().bg(t.bg_tertiary)),
+                    pal_inner,
+                );
             }
         }
     }
@@ -380,35 +485,53 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
         let sel = tui.at_picker_selected;
         let total = files.len();
         let max_show = 8.min(total);
-        let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
+        let start = sel
+            .saturating_sub(max_show / 2)
+            .min(total.saturating_sub(max_show));
         let end = (start + max_show).min(total);
 
         let mut picker_lines: Vec<Line<'static>> = Vec::new();
         // Header
         picker_lines.push(Line::styled(
             format!(" {} file(s) matching '@{}' ", total, tui.at_picker_query),
-            Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(t.text_muted)
+                .bg(t.bg_tertiary)
+                .add_modifier(Modifier::BOLD),
         ));
         // Files
         for (idx, file) in files.iter().enumerate().take(end).skip(start) {
             let is_sel = idx == sel;
             let marker = if is_sel { "▸" } else { " " };
             let bg = if is_sel { t.bg_hover } else { t.bg_tertiary };
-            let fg = if is_sel { t.accent_primary } else { t.text_secondary };
+            let fg = if is_sel {
+                t.accent_primary
+            } else {
+                t.text_secondary
+            };
             let mut style = Style::default().fg(fg).bg(bg);
             if is_sel {
                 style = style.add_modifier(Modifier::BOLD);
             }
             picker_lines.push(Line::from(vec![
-                ratatui::text::Span::styled(format!("{marker} "), Style::default().fg(t.accent_primary).bg(bg)),
-                ratatui::text::Span::styled(format!(" {} ", super::icons::FILE_CODE), Style::default().fg(t.text_muted).bg(bg)),
+                ratatui::text::Span::styled(
+                    format!("{marker} "),
+                    Style::default().fg(t.accent_primary).bg(bg),
+                ),
+                ratatui::text::Span::styled(
+                    format!(" {} ", super::icons::FILE_CODE),
+                    Style::default().fg(t.text_muted).bg(bg),
+                ),
                 ratatui::text::Span::styled(file.clone(), style),
             ]));
         }
         if end < total {
             picker_lines.push(Line::styled(
                 format!("  {} more", total - end),
-                Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(t.text_muted)
+                    .bg(t.bg_tertiary)
+                    .add_modifier(Modifier::ITALIC),
             ));
         }
         // Render
@@ -436,8 +559,14 @@ fn render_input(f: &mut Frame<'_>, area: Rect, tui: &Tui) {
             .style(Style::default().bg(t.bg_tertiary));
         let picker_inner = picker_block.inner(picker_rect);
         f.render_widget(picker_block, picker_rect);
-        let slice: Vec<Line<'static>> = picker_lines.into_iter().take(picker_inner.height as usize).collect();
-        f.render_widget(Paragraph::new(slice).style(Style::default().bg(t.bg_tertiary)), picker_inner);
+        let slice: Vec<Line<'static>> = picker_lines
+            .into_iter()
+            .take(picker_inner.height as usize)
+            .collect();
+        f.render_widget(
+            Paragraph::new(slice).style(Style::default().bg(t.bg_tertiary)),
+            picker_inner,
+        );
     }
 }
 
@@ -445,7 +574,11 @@ fn render_slash_dialog(f: &mut Frame<'_>, area: Rect, dialog: &crate::tui::app::
     let t = theme::active();
     let has_models = !dialog.models.is_empty();
     // Dynamic height: base 9 rows + model list (up to 8 visible).
-    let model_visible = if has_models { dialog.models.len().min(8) as u16 } else { 0 };
+    let model_visible = if has_models {
+        dialog.models.len().min(8) as u16
+    } else {
+        0
+    };
     let w: u16 = 60;
     let h: u16 = if has_models { 9 + model_visible + 1 } else { 9 };
     let x = area.x + area.width.saturating_sub(w) / 2;
@@ -501,9 +634,7 @@ fn render_slash_dialog(f: &mut Frame<'_>, area: Rect, dialog: &crate::tui::app::
                 ratatui::text::Span::styled(before, base),
                 ratatui::text::Span::styled(
                     "\u{258c}",
-                    Style::default()
-                        .fg(t.accent_primary)
-                        .bg(t.bg_tertiary),
+                    Style::default().fg(t.accent_primary).bg(t.bg_tertiary),
                 ),
                 ratatui::text::Span::styled(
                     if has_models {
@@ -528,7 +659,8 @@ fn render_slash_dialog(f: &mut Frame<'_>, area: Rect, dialog: &crate::tui::app::
                 ),
                 ratatui::text::Span::styled(before, base),
                 ratatui::text::Span::styled(
-                    after.chars()
+                    after
+                        .chars()
                         .next()
                         .map(|c| c.to_string())
                         .unwrap_or_default(),
@@ -537,10 +669,7 @@ fn render_slash_dialog(f: &mut Frame<'_>, area: Rect, dialog: &crate::tui::app::
                         .bg(t.bg_hover)
                         .add_modifier(Modifier::BOLD),
                 ),
-                ratatui::text::Span::styled(
-                    after.chars().skip(1).collect::<String>(),
-                    base,
-                ),
+                ratatui::text::Span::styled(after.chars().skip(1).collect::<String>(), base),
             ])
         }
     };
@@ -554,9 +683,7 @@ fn render_slash_dialog(f: &mut Frame<'_>, area: Rect, dialog: &crate::tui::app::
         ),
         ratatui::text::Span::styled(
             " execute  ",
-            Style::default()
-                .fg(t.text_secondary)
-                .bg(t.bg_tertiary),
+            Style::default().fg(t.text_secondary).bg(t.bg_tertiary),
         ),
         ratatui::text::Span::styled(
             " Esc ",
@@ -567,12 +694,11 @@ fn render_slash_dialog(f: &mut Frame<'_>, area: Rect, dialog: &crate::tui::app::
         ),
         ratatui::text::Span::styled(
             " cancel ",
-            Style::default()
-                .fg(t.text_muted)
-                .bg(t.bg_tertiary),
+            Style::default().fg(t.text_muted).bg(t.bg_tertiary),
         ),
     ]);
-    let mut lines: Vec<Line<'static>> = vec![Line::default(), desc_line, Line::default(), input_line];
+    let mut lines: Vec<Line<'static>> =
+        vec![Line::default(), desc_line, Line::default(), input_line];
     // Model list section (scrollable, up to 8 visible rows).
     if has_models {
         let total = dialog.models.len();
@@ -630,7 +756,9 @@ fn render_slash_dialog(f: &mut Frame<'_>, area: Rect, dialog: &crate::tui::app::
             // Show [FREE] tag if this model is in the known registry as free.
             // We check all providers' known models (small constant data).
             let is_free = crate::provider::preset_names().any(|pid| {
-                crate::provider::known_models(pid).iter().any(|km| km.id == name.as_str() && km.free)
+                crate::provider::known_models(pid)
+                    .iter()
+                    .any(|km| km.id == name.as_str() && km.free)
             });
             if is_free {
                 spans.push(ratatui::text::Span::styled(
@@ -686,13 +814,23 @@ fn render_cost_dashboard(f: &mut Frame<'_>, area: Rect, info: &StatusInfo) {
     let h: u16 = 18;
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect::new(x, y, w.min(area.width.saturating_sub(2)), h.min(area.height.saturating_sub(2)));
+    let rect = Rect::new(
+        x,
+        y,
+        w.min(area.width.saturating_sub(2)),
+        h.min(area.height.saturating_sub(2)),
+    );
     clear_area(f, area, &t);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.border_focus).bg(t.bg_tertiary))
         .title(format!(" {} USAGE & COST ", super::icons::INFO))
-        .title_style(Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(t.accent_primary)
+                .bg(t.bg_tertiary)
+                .add_modifier(Modifier::BOLD),
+        )
         .style(Style::default().bg(t.bg_tertiary));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -700,32 +838,56 @@ fn render_cost_dashboard(f: &mut Frame<'_>, area: Rect, info: &StatusInfo) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let muted = Style::default().fg(t.text_muted).bg(t.bg_tertiary);
     let label = Style::default().fg(t.text_secondary).bg(t.bg_tertiary);
-    let value = Style::default().fg(t.text_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD);
-    let accent = Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD);
+    let value = Style::default()
+        .fg(t.text_primary)
+        .bg(t.bg_tertiary)
+        .add_modifier(Modifier::BOLD);
+    let accent = Style::default()
+        .fg(t.accent_primary)
+        .bg(t.bg_tertiary)
+        .add_modifier(Modifier::BOLD);
 
     // Token usage
-    lines.push(Line::from(vec![
-        Span::styled(" Token Usage", accent),
-    ]));
+    lines.push(Line::from(vec![Span::styled(" Token Usage", accent)]));
     lines.push(Line::default());
 
     let used_s = format!("{:.1}k", info.tokens as f64 / 1000.0);
     let total_s = format!("{:.1}k", info.budget as f64 / 1000.0);
-    let pct = info.tokens.checked_mul(100).and_then(|t| t.checked_div(info.budget)).unwrap_or(0);
+    let pct = info
+        .tokens
+        .checked_mul(100)
+        .and_then(|t| t.checked_div(info.budget))
+        .unwrap_or(0);
 
     lines.push(Line::from(vec![
         Span::styled("  Used:     ", label),
         Span::styled(used_s, value),
         Span::styled(" / ", muted),
         Span::styled(total_s, value),
-        Span::styled(format!(" ({pct}%)"), if pct > 80 { Style::default().fg(t.accent_error).bg(t.bg_tertiary).add_modifier(Modifier::BOLD) } else { value }),
+        Span::styled(
+            format!(" ({pct}%)"),
+            if pct > 80 {
+                Style::default()
+                    .fg(t.accent_error)
+                    .bg(t.bg_tertiary)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                value
+            },
+        ),
     ]));
 
     // Progress bar
     let bar_len = 30;
     let filled = (pct.min(100) * bar_len) / 100;
     let bar = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-    let bar_fg = if pct > 80 { t.accent_error } else if pct > 60 { t.accent_warning } else { t.accent_success };
+    let bar_fg = if pct > 80 {
+        t.accent_error
+    } else if pct > 60 {
+        t.accent_warning
+    } else {
+        t.accent_success
+    };
     lines.push(Line::from(vec![
         Span::styled("             ", label),
         Span::styled(bar, Style::default().fg(bar_fg).bg(t.bg_tertiary)),
@@ -734,9 +896,7 @@ fn render_cost_dashboard(f: &mut Frame<'_>, area: Rect, info: &StatusInfo) {
     lines.push(Line::default());
 
     // Session stats
-    lines.push(Line::from(vec![
-        Span::styled(" Session Stats", accent),
-    ]));
+    lines.push(Line::from(vec![Span::styled(" Session Stats", accent)]));
     lines.push(Line::default());
     lines.push(Line::from(vec![
         Span::styled("  Turns:     ", label),
@@ -744,7 +904,14 @@ fn render_cost_dashboard(f: &mut Frame<'_>, area: Rect, info: &StatusInfo) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("  Errors:    ", label),
-        Span::styled(format!("{}", info.errors), if info.errors > 0 { Style::default().fg(t.accent_error).bg(t.bg_tertiary) } else { value }),
+        Span::styled(
+            format!("{}", info.errors),
+            if info.errors > 0 {
+                Style::default().fg(t.accent_error).bg(t.bg_tertiary)
+            } else {
+                value
+            },
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  Avg Latency: ", label),
@@ -761,11 +928,20 @@ fn render_cost_dashboard(f: &mut Frame<'_>, area: Rect, info: &StatusInfo) {
 
     lines.push(Line::default());
     lines.push(Line::from(vec![
-        Span::styled("  Esc ", Style::default().fg(t.text_secondary).bg(t.bg_secondary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  Esc ",
+            Style::default()
+                .fg(t.text_secondary)
+                .bg(t.bg_secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" close", muted),
     ]));
 
-    f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)), inner);
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)),
+        inner,
+    );
 }
 
 fn render_settings(f: &mut Frame<'_>, area: Rect) {
@@ -774,33 +950,88 @@ fn render_settings(f: &mut Frame<'_>, area: Rect) {
     let h: u16 = 16;
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect::new(x, y, w.min(area.width.saturating_sub(2)), h.min(area.height.saturating_sub(2)));
+    let rect = Rect::new(
+        x,
+        y,
+        w.min(area.width.saturating_sub(2)),
+        h.min(area.height.saturating_sub(2)),
+    );
     clear_area(f, area, &t);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.border_focus).bg(t.bg_tertiary))
         .title(format!(" {} SETTINGS ", super::icons::TOOLS))
-        .title_style(Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(t.accent_primary)
+                .bg(t.bg_tertiary)
+                .add_modifier(Modifier::BOLD),
+        )
         .style(Style::default().bg(t.bg_tertiary));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     let muted = Style::default().fg(t.text_muted).bg(t.bg_tertiary);
     let label = Style::default().fg(t.text_secondary).bg(t.bg_tertiary);
-    let value = Style::default().fg(t.text_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD);
+    let value = Style::default()
+        .fg(t.text_primary)
+        .bg(t.bg_tertiary)
+        .add_modifier(Modifier::BOLD);
     let lines = vec![
-        Line::from(vec![Span::styled(" Theme", Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled(
+            " Theme",
+            Style::default()
+                .fg(t.accent_primary)
+                .bg(t.bg_tertiary)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::default(),
-        Line::from(vec![Span::styled("  /theme <name>  ", label), Span::styled("switch palette", muted)]),
-        Line::from(vec![Span::styled("  mono / default / dracula / nord …", value)]),
+        Line::from(vec![
+            Span::styled("  /theme <name>  ", label),
+            Span::styled("switch palette", muted),
+        ]),
+        Line::from(vec![Span::styled(
+            "  mono / default / dracula / nord …",
+            value,
+        )]),
         Line::default(),
-        Line::from(vec![Span::styled(" Provider", Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled(
+            " Provider",
+            Style::default()
+                .fg(t.accent_primary)
+                .bg(t.bg_tertiary)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::default(),
-        Line::from(vec![Span::styled("  /provider <name>  ", label), Span::styled(crate::provider::preset_names().take(4).collect::<Vec<_>>().join(" · "), muted)]),
-        Line::from(vec![Span::styled("  /model <name>  ", label), Span::styled("partial match", muted)]),
+        Line::from(vec![
+            Span::styled("  /provider <name>  ", label),
+            Span::styled(
+                crate::provider::preset_names()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                muted,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  /model <name>  ", label),
+            Span::styled("partial match", muted),
+        ]),
         Line::default(),
-        Line::from(vec![Span::styled("  Esc ", Style::default().fg(t.text_secondary).bg(t.bg_secondary).add_modifier(Modifier::BOLD)), Span::styled(" close", muted)]),
+        Line::from(vec![
+            Span::styled(
+                "  Esc ",
+                Style::default()
+                    .fg(t.text_secondary)
+                    .bg(t.bg_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" close", muted),
+        ]),
     ];
-    f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)), inner);
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)),
+        inner,
+    );
 }
 
 fn render_shortcuts(f: &mut Frame<'_>, area: Rect) {
@@ -809,20 +1040,38 @@ fn render_shortcuts(f: &mut Frame<'_>, area: Rect) {
     let h: u16 = 18;
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect::new(x, y, w.min(area.width.saturating_sub(2)), h.min(area.height.saturating_sub(2)));
+    let rect = Rect::new(
+        x,
+        y,
+        w.min(area.width.saturating_sub(2)),
+        h.min(area.height.saturating_sub(2)),
+    );
     clear_area(f, area, &t);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.border_focus).bg(t.bg_tertiary))
         .title(" ? SHORTCUTS ")
-        .title_style(Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(t.accent_primary)
+                .bg(t.bg_tertiary)
+                .add_modifier(Modifier::BOLD),
+        )
         .style(Style::default().bg(t.bg_tertiary));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     let muted = Style::default().fg(t.text_muted).bg(t.bg_tertiary);
-    let key = Style::default().fg(t.text_secondary).bg(t.bg_secondary).add_modifier(Modifier::BOLD);
+    let key = Style::default()
+        .fg(t.text_secondary)
+        .bg(t.bg_secondary)
+        .add_modifier(Modifier::BOLD);
     let val = Style::default().fg(t.text_primary).bg(t.bg_tertiary);
-    let row = |k: &str, v: &str| Line::from(vec![Span::styled(format!("  {k} "), key), Span::styled(v.to_owned(), muted)]);
+    let row = |k: &str, v: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {k} "), key),
+            Span::styled(v.to_owned(), muted),
+        ])
+    };
     let lines = vec![
         row("/", "commands palette"),
         row("@", "file mention"),
@@ -837,9 +1086,22 @@ fn render_shortcuts(f: &mut Frame<'_>, area: Rect) {
         row("Ctrl+,", "settings"),
         row("?", "this help"),
         Line::default(),
-        Line::from(vec![Span::styled("  Esc ", Style::default().fg(t.text_secondary).bg(t.bg_secondary).add_modifier(Modifier::BOLD)), Span::styled(" close", muted), Span::styled("  ·  click file to pin", val)]),
+        Line::from(vec![
+            Span::styled(
+                "  Esc ",
+                Style::default()
+                    .fg(t.text_secondary)
+                    .bg(t.bg_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" close", muted),
+            Span::styled("  ·  click file to pin", val),
+        ]),
     ];
-    f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)), inner);
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)),
+        inner,
+    );
 }
 
 /// Renders the multi-step provider setup workflow modal.
@@ -848,7 +1110,10 @@ fn render_provider_workflow(f: &mut Frame<'_>, area: Rect, wf: &super::app::Prov
     let t = theme::active();
 
     match wf {
-        ProviderWorkflow::SelectProvider { providers, selected } => {
+        ProviderWorkflow::SelectProvider {
+            providers,
+            selected,
+        } => {
             let w: u16 = 50;
             let h = (providers.len() as u16 + 6).min(area.height.saturating_sub(4));
             let x = area.x + area.width.saturating_sub(w) / 2;
@@ -859,48 +1124,93 @@ fn render_provider_workflow(f: &mut Frame<'_>, area: Rect, wf: &super::app::Prov
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(t.border_focus).bg(t.bg_tertiary))
                 .title(" \u{f013} SETUP — SELECT PROVIDER ")
-                .title_style(Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD))
+                .title_style(
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.accent_primary)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .style(Style::default().bg(t.bg_tertiary));
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             let mut lines: Vec<Line<'static>> = Vec::new();
             lines.push(Line::styled(
                 " Choose your AI provider:",
-                Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(t.text_muted)
+                    .bg(t.bg_tertiary)
+                    .add_modifier(Modifier::ITALIC),
             ));
             lines.push(Line::default());
             for (i, prov) in providers.iter().enumerate() {
                 let is_sel = i == *selected;
                 let marker = if is_sel { "\u{25b8}" } else { " " };
                 let bg = if is_sel { t.bg_hover } else { t.bg_tertiary };
-                let fg = if is_sel { t.accent_primary } else { t.text_secondary };
+                let fg = if is_sel {
+                    t.accent_primary
+                } else {
+                    t.text_secondary
+                };
                 let mut style = Style::default().fg(fg).bg(bg);
-                if is_sel { style = style.add_modifier(Modifier::BOLD); }
+                if is_sel {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
                 // Check if provider has a free tier
                 let known = crate::provider::known_models(prov);
                 let has_free = known.iter().any(|m| m.free);
                 let mut spans = vec![
-                    ratatui::text::Span::styled(format!("{marker} "), Style::default().fg(t.accent_primary).bg(bg)),
+                    ratatui::text::Span::styled(
+                        format!("{marker} "),
+                        Style::default().fg(t.accent_primary).bg(bg),
+                    ),
                     ratatui::text::Span::styled(prov.clone(), style),
                 ];
                 if has_free {
                     spans.push(ratatui::text::Span::styled(
                         "  [FREE models]",
-                        Style::default().fg(t.accent_success).bg(bg).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(t.accent_success)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
                     ));
                 }
                 lines.push(Line::from(spans));
             }
             lines.push(Line::default());
             lines.push(Line::from(vec![
-                ratatui::text::Span::styled(" Enter ", Style::default().fg(t.text_inverse).bg(t.accent_success).add_modifier(Modifier::BOLD)),
-                ratatui::text::Span::styled(" select  ", Style::default().fg(t.text_secondary).bg(t.bg_tertiary)),
-                ratatui::text::Span::styled(" Esc ", Style::default().fg(t.text_inverse).bg(t.border_default).add_modifier(Modifier::BOLD)),
-                ratatui::text::Span::styled(" cancel", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
+                ratatui::text::Span::styled(
+                    " Enter ",
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.accent_success)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::styled(
+                    " select  ",
+                    Style::default().fg(t.text_secondary).bg(t.bg_tertiary),
+                ),
+                ratatui::text::Span::styled(
+                    " Esc ",
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.border_default)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::styled(
+                    " cancel",
+                    Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                ),
             ]));
-            f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)), inner);
+            f.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)),
+                inner,
+            );
         }
-        ProviderWorkflow::EnterApiKey { provider, key_input, cursor } => {
+        ProviderWorkflow::EnterApiKey {
+            provider,
+            key_input,
+            cursor,
+        } => {
             let w: u16 = 56;
             let h: u16 = 14;
             let x = area.x + area.width.saturating_sub(w) / 2;
@@ -911,23 +1221,48 @@ fn render_provider_workflow(f: &mut Frame<'_>, area: Rect, wf: &super::app::Prov
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(t.border_focus).bg(t.bg_tertiary))
                 .title(format!(" \u{f023} SETUP — {provider} API KEY "))
-                .title_style(Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD))
+                .title_style(
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.accent_primary)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .style(Style::default().bg(t.bg_tertiary));
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             let mut lines: Vec<Line<'static>> = Vec::new();
             lines.push(Line::styled(
                 format!(" Enter your {provider} API key:"),
-                Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(t.text_muted)
+                    .bg(t.bg_tertiary)
+                    .add_modifier(Modifier::ITALIC),
             ));
             lines.push(Line::default());
             // Masked input display
             let masked: String = key_input.chars().map(|_| '\u{2022}').collect();
-            let before: String = key_input.chars().take(*cursor).map(|_| '\u{2022}').collect();
-            let after: String = key_input.chars().skip(*cursor).map(|_| '\u{2022}').collect();
+            let before: String = key_input
+                .chars()
+                .take(*cursor)
+                .map(|_| '\u{2022}')
+                .collect();
+            let after: String = key_input
+                .chars()
+                .skip(*cursor)
+                .map(|_| '\u{2022}')
+                .collect();
             lines.push(Line::from(vec![
-                ratatui::text::Span::styled(" > ", Style::default().fg(t.accent_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
-                ratatui::text::Span::styled(before, Style::default().fg(t.text_primary).bg(t.bg_tertiary)),
+                ratatui::text::Span::styled(
+                    " > ",
+                    Style::default()
+                        .fg(t.accent_primary)
+                        .bg(t.bg_tertiary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::styled(
+                    before,
+                    Style::default().fg(t.text_primary).bg(t.bg_tertiary),
+                ),
                 ratatui::text::Span::styled(
                     if after.is_empty() {
                         "\u{258c}".to_owned()
@@ -956,16 +1291,40 @@ fn render_provider_workflow(f: &mut Frame<'_>, area: Rect, wf: &super::app::Prov
             }
             lines.push(Line::styled(
                 "  Key is used only for this session. For ollama, press Esc.",
-                Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(t.text_muted)
+                    .bg(t.bg_tertiary)
+                    .add_modifier(Modifier::DIM),
             ));
             lines.push(Line::default());
             lines.push(Line::from(vec![
-                ratatui::text::Span::styled(" Enter ", Style::default().fg(t.text_inverse).bg(t.accent_success).add_modifier(Modifier::BOLD)),
-                ratatui::text::Span::styled(" continue  ", Style::default().fg(t.text_secondary).bg(t.bg_tertiary)),
-                ratatui::text::Span::styled(" Esc ", Style::default().fg(t.text_inverse).bg(t.border_default).add_modifier(Modifier::BOLD)),
-                ratatui::text::Span::styled(" cancel", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
+                ratatui::text::Span::styled(
+                    " Enter ",
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.accent_success)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::styled(
+                    " continue  ",
+                    Style::default().fg(t.text_secondary).bg(t.bg_tertiary),
+                ),
+                ratatui::text::Span::styled(
+                    " Esc ",
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.border_default)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::styled(
+                    " cancel",
+                    Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                ),
             ]));
-            f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)), inner);
+            f.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)),
+                inner,
+            );
             // cursor
             let prompt_w: u16 = 3; // "> " width
             let before_w = before_width(key_input, *cursor);
@@ -973,7 +1332,12 @@ fn render_provider_workflow(f: &mut Frame<'_>, area: Rect, wf: &super::app::Prov
             let cy = inner.y + 3;
             f.set_cursor_position((cx.min(inner.x + inner.width.saturating_sub(1)), cy));
         }
-        ProviderWorkflow::SelectModel { provider, api_key: _, models, selected } => {
+        ProviderWorkflow::SelectModel {
+            provider,
+            api_key: _,
+            models,
+            selected,
+        } => {
             let w: u16 = 56;
             let visible = models.len().min(10) as u16;
             let h = visible + 8;
@@ -985,52 +1349,99 @@ fn render_provider_workflow(f: &mut Frame<'_>, area: Rect, wf: &super::app::Prov
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(t.border_focus).bg(t.bg_tertiary))
                 .title(format!(" \u{f2db} SETUP — SELECT MODEL for {provider} "))
-                .title_style(Style::default().fg(t.text_inverse).bg(t.accent_primary).add_modifier(Modifier::BOLD))
+                .title_style(
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.accent_primary)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .style(Style::default().bg(t.bg_tertiary));
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             let mut lines: Vec<Line<'static>> = Vec::new();
             lines.push(Line::styled(
                 " Choose a model:",
-                Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(t.text_muted)
+                    .bg(t.bg_tertiary)
+                    .add_modifier(Modifier::ITALIC),
             ));
             lines.push(Line::default());
             // Windowed scroll
             let total = models.len();
             let sel = *selected;
-            let start = sel.saturating_sub(visible as usize / 2).min(total.saturating_sub(visible as usize));
+            let start = sel
+                .saturating_sub(visible as usize / 2)
+                .min(total.saturating_sub(visible as usize));
             let end = (start + visible as usize).min(total);
             for (i, name) in models.iter().enumerate().take(end).skip(start) {
                 let is_sel = i == sel;
                 let marker = if is_sel { "\u{25b8}" } else { " " };
                 let bg = if is_sel { t.bg_hover } else { t.bg_tertiary };
-                let fg = if is_sel { t.accent_primary } else { t.text_secondary };
+                let fg = if is_sel {
+                    t.accent_primary
+                } else {
+                    t.text_secondary
+                };
                 let mut style = Style::default().fg(fg).bg(bg);
-                if is_sel { style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED); }
+                if is_sel {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
                 let mut spans = vec![
-                    ratatui::text::Span::styled(format!("{marker} "), Style::default().fg(t.accent_primary).bg(bg)),
+                    ratatui::text::Span::styled(
+                        format!("{marker} "),
+                        Style::default().fg(t.accent_primary).bg(bg),
+                    ),
                     ratatui::text::Span::styled(name.clone(), style),
                 ];
                 // Show [FREE] tag
-                let is_free = crate::provider::known_models(provider).iter().any(|km| km.id == name.as_str() && km.free);
+                let is_free = crate::provider::known_models(provider)
+                    .iter()
+                    .any(|km| km.id == name.as_str() && km.free);
                 if is_free {
                     spans.push(ratatui::text::Span::styled(
                         " [FREE]",
-                        Style::default().fg(t.accent_success).bg(bg).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(t.accent_success)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
                     ));
                 }
                 lines.push(Line::from(spans));
             }
             lines.push(Line::default());
             lines.push(Line::from(vec![
-                ratatui::text::Span::styled(" Enter ", Style::default().fg(t.text_inverse).bg(t.accent_success).add_modifier(Modifier::BOLD)),
-                ratatui::text::Span::styled(" select  ", Style::default().fg(t.text_secondary).bg(t.bg_tertiary)),
-                ratatui::text::Span::styled(" Esc ", Style::default().fg(t.text_inverse).bg(t.border_default).add_modifier(Modifier::BOLD)),
-                ratatui::text::Span::styled(" cancel", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
+                ratatui::text::Span::styled(
+                    " Enter ",
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.accent_success)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::styled(
+                    " select  ",
+                    Style::default().fg(t.text_secondary).bg(t.bg_tertiary),
+                ),
+                ratatui::text::Span::styled(
+                    " Esc ",
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.border_default)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::styled(
+                    " cancel",
+                    Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                ),
             ]));
-            f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)), inner);
+            f.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(t.bg_tertiary)),
+                inner,
+            );
         }
-        ProviderWorkflow::Testing { provider, model, .. } => {
+        ProviderWorkflow::Testing {
+            provider, model, ..
+        } => {
             let w: u16 = 50;
             let h: u16 = 8;
             let x = area.x + area.width.saturating_sub(w) / 2;
@@ -1041,73 +1452,177 @@ fn render_provider_workflow(f: &mut Frame<'_>, area: Rect, wf: &super::app::Prov
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(t.accent_warning).bg(t.bg_tertiary))
                 .title(" \u{f017} TESTING CONNECTION ")
-                .title_style(Style::default().fg(t.text_inverse).bg(t.accent_warning).add_modifier(Modifier::BOLD))
+                .title_style(
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(t.accent_warning)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .style(Style::default().bg(t.bg_tertiary));
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             let frame = tick_frame(4);
             let spinner = ['\u{25f7}', '\u{25f4}', '\u{25fa}', '\u{25fb}'][frame];
-            f.render_widget(Paragraph::new(vec![
-                Line::default(),
-                Line::from(vec![
-                    ratatui::text::Span::styled(format!(" {spinner} "), Style::default().fg(t.accent_warning).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
-                    ratatui::text::Span::styled("Testing connection...", Style::default().fg(t.text_primary).bg(t.bg_tertiary)),
-                ]),
-                Line::default(),
-                Line::from(vec![
-                    ratatui::text::Span::styled("  provider: ", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
-                    ratatui::text::Span::styled(provider.clone(), Style::default().fg(t.text_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(vec![
-                    ratatui::text::Span::styled("  model:    ", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
-                    ratatui::text::Span::styled(model.clone(), Style::default().fg(t.text_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
-                ]),
-            ]).style(Style::default().bg(t.bg_tertiary)), inner);
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::default(),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            format!(" {spinner} "),
+                            Style::default()
+                                .fg(t.accent_warning)
+                                .bg(t.bg_tertiary)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        ratatui::text::Span::styled(
+                            "Testing connection...",
+                            Style::default().fg(t.text_primary).bg(t.bg_tertiary),
+                        ),
+                    ]),
+                    Line::default(),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            "  provider: ",
+                            Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                        ),
+                        ratatui::text::Span::styled(
+                            provider.clone(),
+                            Style::default()
+                                .fg(t.text_primary)
+                                .bg(t.bg_tertiary)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            "  model:    ",
+                            Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                        ),
+                        ratatui::text::Span::styled(
+                            model.clone(),
+                            Style::default()
+                                .fg(t.text_primary)
+                                .bg(t.bg_tertiary)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                ])
+                .style(Style::default().bg(t.bg_tertiary)),
+                inner,
+            );
         }
-        ProviderWorkflow::Result { provider, model, ok, message, .. } => {
+        ProviderWorkflow::Result {
+            provider,
+            model,
+            ok,
+            message,
+            ..
+        } => {
             let w: u16 = 56;
             let h: u16 = 12;
             let x = area.x + area.width.saturating_sub(w) / 2;
             let y = area.y + area.height.saturating_sub(h) / 2;
             let rect = Rect::new(x, y, w.min(area.width.saturating_sub(2)), h);
             clear_area(f, area, &t);
-            let border_color = if *ok { t.accent_success } else { t.accent_error };
-            let title = if *ok { " \u{f058} SETUP COMPLETE " } else { " \u{f057} SETUP FAILED " };
-            let title_bg = if *ok { t.accent_success } else { t.accent_error };
+            let border_color = if *ok {
+                t.accent_success
+            } else {
+                t.accent_error
+            };
+            let title = if *ok {
+                " \u{f058} SETUP COMPLETE "
+            } else {
+                " \u{f057} SETUP FAILED "
+            };
+            let title_bg = if *ok {
+                t.accent_success
+            } else {
+                t.accent_error
+            };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border_color).bg(t.bg_tertiary))
                 .title(title)
-                .title_style(Style::default().fg(t.text_inverse).bg(title_bg).add_modifier(Modifier::BOLD))
+                .title_style(
+                    Style::default()
+                        .fg(t.text_inverse)
+                        .bg(title_bg)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .style(Style::default().bg(t.bg_tertiary));
             let inner = block.inner(rect);
             f.render_widget(block, rect);
-            let status_color = if *ok { t.accent_success } else { t.accent_error };
+            let status_color = if *ok {
+                t.accent_success
+            } else {
+                t.accent_error
+            };
             let status_text = if *ok { "PASSED" } else { "FAILED" };
-            f.render_widget(Paragraph::new(vec![
-                Line::default(),
-                Line::from(vec![
-                    ratatui::text::Span::styled("  Status:  ", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
-                    ratatui::text::Span::styled(status_text, Style::default().fg(status_color).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(vec![
-                    ratatui::text::Span::styled("  Provider: ", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
-                    ratatui::text::Span::styled(provider.clone(), Style::default().fg(t.text_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(vec![
-                    ratatui::text::Span::styled("  Model:   ", Style::default().fg(t.text_muted).bg(t.bg_tertiary)),
-                    ratatui::text::Span::styled(model.clone(), Style::default().fg(t.text_primary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::default(),
-                Line::styled(
-                    format!("  {}", message),
-                    Style::default().fg(if *ok { t.text_secondary } else { t.accent_error }).bg(t.bg_tertiary),
-                ),
-                Line::default(),
-                Line::from(vec![
-                    ratatui::text::Span::styled("  Press any key to close", Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::DIM)),
-                ]),
-            ]).style(Style::default().bg(t.bg_tertiary)), inner);
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::default(),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            "  Status:  ",
+                            Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                        ),
+                        ratatui::text::Span::styled(
+                            status_text,
+                            Style::default()
+                                .fg(status_color)
+                                .bg(t.bg_tertiary)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            "  Provider: ",
+                            Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                        ),
+                        ratatui::text::Span::styled(
+                            provider.clone(),
+                            Style::default()
+                                .fg(t.text_primary)
+                                .bg(t.bg_tertiary)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            "  Model:   ",
+                            Style::default().fg(t.text_muted).bg(t.bg_tertiary),
+                        ),
+                        ratatui::text::Span::styled(
+                            model.clone(),
+                            Style::default()
+                                .fg(t.text_primary)
+                                .bg(t.bg_tertiary)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::default(),
+                    Line::styled(
+                        format!("  {}", message),
+                        Style::default()
+                            .fg(if *ok {
+                                t.text_secondary
+                            } else {
+                                t.accent_error
+                            })
+                            .bg(t.bg_tertiary),
+                    ),
+                    Line::default(),
+                    Line::from(vec![ratatui::text::Span::styled(
+                        "  Press any key to close",
+                        Style::default()
+                            .fg(t.text_muted)
+                            .bg(t.bg_tertiary)
+                            .add_modifier(Modifier::DIM),
+                    )]),
+                ])
+                .style(Style::default().bg(t.bg_tertiary)),
+                inner,
+            );
         }
     }
 }

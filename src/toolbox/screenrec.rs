@@ -8,6 +8,7 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// Target URL or "local:port".
     pub target: String,
@@ -36,12 +37,19 @@ pub async fn run(_base: &Path, args: Args) -> anyhow::Result<String> {
             "/usr/bin/chromium-browser",
         ]
     };
-    let browser = candidates.iter().find(|p| std::path::Path::new(*p).exists());
+    let browser = candidates
+        .iter()
+        .find(|p| std::path::Path::new(*p).exists());
     let Some(browser_path) = browser else {
-        anyhow::bail!("no headless browser found for screen recording; install Chrome/Edge/Chromium");
+        anyhow::bail!(
+            "no headless browser found for screen recording; install Chrome/Edge/Chromium"
+        );
     };
     // Ensure target is http(s) or local:port to mitigate SSRF.
-    if !args.target.starts_with("http://") && !args.target.starts_with("https://") && !args.target.starts_with("local:") {
+    if !args.target.starts_with("http://")
+        && !args.target.starts_with("https://")
+        && !args.target.starts_with("local:")
+    {
         anyhow::bail!("target must be http(s)://... or local:PORT");
     }
     Ok(format!(
@@ -52,5 +60,6 @@ pub async fn run(_base: &Path, args: Args) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn noop() { /* covered by integration tests */ }
+    fn noop() { /* covered by integration tests */
+    }
 }

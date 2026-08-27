@@ -8,7 +8,7 @@
 //! `git status --porcelain` spawn that fails gracefully when git is absent.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -47,7 +47,8 @@ pub async fn scan(base: &Path) -> String {
     if base.join("package.json").is_file() {
         project_types.push("node");
         // Malformed package.json: skip silently, the type is still detected.
-        if let Ok(pkg) = tokio::fs::read_to_string(base.join("package.json")).await
+        if let Ok(pkg) = tokio::fs::read_to_string(base.join("package.json"))
+            .await
             .map_err(anyhow::Error::from)
             .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(anyhow::Error::from))
         {
@@ -195,9 +196,28 @@ fn object_deps(value: Option<&Value>) -> serde_json::Map<String, Value> {
     out
 }
 
-/// Reads the current branch from `.git/HEAD`; handles detached HEAD.
+fn git_dir(base: &Path) -> Option<PathBuf> {
+    let git_path = base.join(".git");
+    if git_path.is_dir() {
+        return Some(git_path);
+    }
+    if git_path.is_file() {
+        let content = std::fs::read_to_string(&git_path).ok()?;
+        let rest = content.strip_prefix("gitdir:")?.trim();
+        let p = Path::new(rest);
+        return Some(if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base.join(p)
+        });
+    }
+    None
+}
+
+/// Reads the current branch from `.git/HEAD`; handles detached HEAD and worktrees.
 fn read_git_branch(base: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(base.join(".git").join("HEAD")).ok()?;
+    let git_dir = git_dir(base)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head = head.trim();
     if let Some(rest) = head.strip_prefix("ref: refs/heads/") {
         return (!rest.is_empty()).then(|| rest.to_owned());

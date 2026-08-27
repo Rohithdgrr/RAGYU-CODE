@@ -26,6 +26,7 @@ pub struct FileSpec {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     pub files: Vec<FileSpec>,
 }
@@ -35,7 +36,8 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
     for spec in &args.files {
         let full = base.join(&spec.path);
         match std::fs::read_to_string(&full) {
-            Err(e) => results.push(serde_json::json!({"path":spec.path, "ok":false, "error":e.to_string()})),
+            Err(e) => results
+                .push(serde_json::json!({"path":spec.path, "ok":false, "error":e.to_string()})),
             Ok(content) => {
                 let before = content.len();
                 let updated = apply_style(&content, &spec.style);
@@ -50,8 +52,12 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
         }
     }
     let n = results.len();
-    let n_ok = results.iter().filter(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)).count();
-    Ok(format!("{{\"total\":{n},\"ok\":{n_ok},\"err\":{},\"results\":{}}}",
+    let n_ok = results
+        .iter()
+        .filter(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+        .count();
+    Ok(format!(
+        "{{\"total\":{n},\"ok\":{n_ok},\"err\":{},\"results\":{}}}",
         n - n_ok,
         serde_json::to_string(&results).unwrap_or_default()
     ))
@@ -59,9 +65,15 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
 
 fn apply_style(content: &str, style: &Style) -> String {
     let mut s = content.replace("\r\n", "\n");
-    let normalized: String = s.lines().map(|l| l.trim_end().to_string()).collect::<Vec<_>>().join("\n");
+    let normalized: String = s
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     s = normalized;
-    if !s.ends_with('\n') { s.push('\n'); }
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
     match style {
         Style::Unix => s,
         Style::Windows => s.replace("\n", "\r\n"),
@@ -76,8 +88,15 @@ fn reindent(content: &str, target: usize, ch: &str) -> String {
     for line in content.lines() {
         let stripped = line.trim_start();
         let leading_ws_len = line.len() - stripped.len();
-        let leading_ws = line[..leading_ws_len].chars().filter(|c| c.is_whitespace()).count();
-        let new_indent = if leading_ws > 0 { leading_ws * target } else { 0 };
+        let leading_ws = line[..leading_ws_len]
+            .chars()
+            .filter(|c| c.is_whitespace())
+            .count();
+        let new_indent = if leading_ws > 0 {
+            leading_ws * target
+        } else {
+            0
+        };
         out_lines.push(format!("{}{}", ch.repeat(new_indent), stripped));
     }
     format!("{}\n", out_lines.join("\n"))
@@ -91,7 +110,12 @@ mod tests {
     fn normalizes_lf_and_strips_trailing_ws() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "a  \nb\nc  \n").unwrap();
-        let args = Args { files: vec![FileSpec { path: "a.txt".into(), style: Style::Unix }] };
+        let args = Args {
+            files: vec![FileSpec {
+                path: "a.txt".into(),
+                style: Style::Unix,
+            }],
+        };
         run(dir.path(), args).unwrap();
         let content = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
         assert!(!content.contains("  \n"));

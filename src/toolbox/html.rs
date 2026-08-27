@@ -15,6 +15,7 @@ pub enum Action {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     pub action: Action,
     /// Source Markdown text (for md_to_html / wrap_html).
@@ -30,41 +31,67 @@ pub struct Args {
 pub fn run(_base: &Path, args: Args) -> anyhow::Result<String> {
     match args.action {
         Action::MdToHtml => {
-            let text = args.text.ok_or_else(|| anyhow::anyhow!("text required for md_to_html"))?;
+            let text = args
+                .text
+                .ok_or_else(|| anyhow::anyhow!("text required for md_to_html"))?;
             let html = markdown_to_html(&text);
-            let out = args.output_path.ok_or_else(|| anyhow::anyhow!("output_path required"))?;
+            let out = args
+                .output_path
+                .ok_or_else(|| anyhow::anyhow!("output_path required"))?;
             std::fs::write(&out, &html)?;
-            Ok(format!("{{\"ok\":true,\"output\":\"{out}\",\"bytes\":{}}}", html.len()))
+            Ok(format!(
+                "{{\"ok\":true,\"output\":\"{out}\",\"bytes\":{}}}",
+                html.len()
+            ))
         }
         Action::WrapHtml => {
-            let text = args.text.ok_or_else(|| anyhow::anyhow!("text required for wrap_html"))?;
+            let text = args
+                .text
+                .ok_or_else(|| anyhow::anyhow!("text required for wrap_html"))?;
             let title = args.title.unwrap_or_else(|| "Document".to_string());
             let body = markdown_to_html(&text);
             let html = format!(
                 "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>{}</title><style>body{{font-family:system-ui;max-width:760px;margin:2rem auto;padding:0 1rem;line-height:1.6}}pre{{background:#f5f5f5;padding:0.75rem;border-radius:4px;overflow:auto}}code{{background:#f5f5f5;padding:0.1rem 0.3rem;border-radius:3px}}</style></head>\n<body>\n{}\n</body>\n</html>\n",
-                html_escape(&title), body
+                html_escape(&title),
+                body
             );
-            let out = args.output_path.ok_or_else(|| anyhow::anyhow!("output_path required"))?;
+            let out = args
+                .output_path
+                .ok_or_else(|| anyhow::anyhow!("output_path required"))?;
             std::fs::write(&out, &html)?;
-            Ok(format!("{{\"ok\":true,\"output\":\"{out}\",\"bytes\":{}}}", html.len()))
+            Ok(format!(
+                "{{\"ok\":true,\"output\":\"{out}\",\"bytes\":{}}}",
+                html.len()
+            ))
         }
         Action::OpenHtml => {
-            let source = args.source.ok_or_else(|| anyhow::anyhow!("source required for open_html"))?;
+            let source = args
+                .source
+                .ok_or_else(|| anyhow::anyhow!("source required for open_html"))?;
             let path = std::path::Path::new(&source);
             anyhow::ensure!(path.exists(), "file not found: {source}");
             #[cfg(windows)]
-            std::process::Command::new("cmd").args(["/C", "start", "", &source]).spawn().ok();
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "", &source])
+                .spawn()
+                .ok();
             #[cfg(target_os = "macos")]
             std::process::Command::new("open").arg(&source).spawn().ok();
             #[cfg(all(unix, not(target_os = "macos")))]
-            std::process::Command::new("xdg-open").arg(&source).spawn().ok();
+            std::process::Command::new("xdg-open")
+                .arg(&source)
+                .spawn()
+                .ok();
             Ok(format!("{{\"ok\":true,\"opened\":\"{source}\"}}"))
         }
     }
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn markdown_to_html(md: &str) -> String {
@@ -75,7 +102,10 @@ fn markdown_to_html(md: &str) -> String {
     for line in md.lines() {
         if line.starts_with("```") {
             if in_code {
-                out.push_str(&format!("<pre><code>{}</code></pre>\n", html_escape(&code_buf)));
+                out.push_str(&format!(
+                    "<pre><code>{}</code></pre>\n",
+                    html_escape(&code_buf)
+                ));
                 code_buf.clear();
             }
             in_code = !in_code;
@@ -102,28 +132,49 @@ fn markdown_to_html(md: &str) -> String {
             continue;
         }
         if let Some(rest) = line.strip_prefix("- ") {
-            if list_type != Some('-') { out.push_str("<ul>\n"); list_type = Some('-'); }
+            if list_type != Some('-') {
+                out.push_str("<ul>\n");
+                list_type = Some('-');
+            }
             out.push_str(&format!("<li>{}</li>\n", process_inline(rest)));
             continue;
         }
         if line.starts_with("1. ") || line.starts_with("2. ") || line.starts_with("3. ") {
-            if list_type != Some('1') { out.push_str("<ol>\n"); list_type = Some('1'); }
+            if list_type != Some('1') {
+                out.push_str("<ol>\n");
+                list_type = Some('1');
+            }
             let rest = &line[3..];
             out.push_str(&format!("<li>{}</li>\n", process_inline(rest)));
             continue;
         }
         if line.trim().is_empty() {
-            if list_type == Some('-') { out.push_str("</ul>\n"); list_type = None; }
-            if list_type == Some('1') { out.push_str("</ol>\n"); list_type = None; }
+            if list_type == Some('-') {
+                out.push_str("</ul>\n");
+                list_type = None;
+            }
+            if list_type == Some('1') {
+                out.push_str("</ol>\n");
+                list_type = None;
+            }
             out.push('\n');
             continue;
         }
         out.push_str(&format!("<p>{}</p>\n", process_inline(line)));
         list_type = None;
     }
-    if in_code { out.push_str(&format!("<pre><code>{}</code></pre>\n", html_escape(&code_buf))); }
-    if list_type == Some('-') { out.push_str("</ul>\n"); }
-    if list_type == Some('1') { out.push_str("</ol>\n"); }
+    if in_code {
+        out.push_str(&format!(
+            "<pre><code>{}</code></pre>\n",
+            html_escape(&code_buf)
+        ));
+    }
+    if list_type == Some('-') {
+        out.push_str("</ul>\n");
+    }
+    if list_type == Some('1') {
+        out.push_str("</ol>\n");
+    }
     out
 }
 

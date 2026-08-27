@@ -14,6 +14,7 @@ pub struct Command {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     pub commands: Vec<Command>,
     /// Run commands in parallel (default false = sequential).
@@ -24,7 +25,9 @@ pub struct Args {
     pub stop_on_error: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
     let results: Vec<serde_json::Value> = if args.parallel {
@@ -33,7 +36,10 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
         run_sequential(base, &args.commands, args.stop_on_error)
     };
     let n = results.len();
-    let n_ok = results.iter().filter(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)).count();
+    let n_ok = results
+        .iter()
+        .filter(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+        .count();
     Ok(format!(
         "{{\"total\":{n},\"ok\":{n_ok},\"err\":{},\"parallel\":{},\"results\":{}}}",
         n - n_ok,
@@ -42,13 +48,19 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
     ))
 }
 
-fn run_sequential(base: &Path, commands: &[Command], stop_on_error: bool) -> Vec<serde_json::Value> {
+fn run_sequential(
+    base: &Path,
+    commands: &[Command],
+    stop_on_error: bool,
+) -> Vec<serde_json::Value> {
     let mut results = Vec::new();
     for cmd in commands {
         let r = run_one(base, cmd);
         let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         results.push(r);
-        if !ok && stop_on_error { break; }
+        if !ok && stop_on_error {
+            break;
+        }
     }
     results
 }
@@ -59,18 +71,23 @@ fn run_parallel(base: &Path, commands: &[Command]) -> Vec<serde_json::Value> {
     let base = base.to_path_buf();
     // Clone the commands so we can move them into spawned threads.
     let owned: Vec<Command> = commands.to_vec();
-    let handles: Vec<_> = owned.into_iter().map(|cmd| {
-        let tx = tx.clone();
-        let base = base.clone();
-        std::thread::spawn(move || {
-            let r = run_one(&base, &cmd);
-            let _ = tx.send(r);
+    let handles: Vec<_> = owned
+        .into_iter()
+        .map(|cmd| {
+            let tx = tx.clone();
+            let base = base.clone();
+            std::thread::spawn(move || {
+                let r = run_one(&base, &cmd);
+                let _ = tx.send(r);
+            })
         })
-    }).collect();
+        .collect();
     drop(tx);
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(handles.len());
     for _ in 0..handles.len() {
-        if let Ok(r) = rx.recv() { results.push(r); }
+        if let Ok(r) = rx.recv() {
+            results.push(r);
+        }
     }
     results
 }
@@ -80,7 +97,11 @@ fn run_one(base: &Path, cmd: &Command) -> serde_json::Value {
     let timeout = Duration::from_secs(cmd.timeout_secs.unwrap_or(60));
     let started = std::time::Instant::now();
     let output = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-        .args(if cfg!(windows) { vec!["/C", &cmd.command] } else { vec!["-c", &cmd.command] })
+        .args(if cfg!(windows) {
+            vec!["/C", &cmd.command]
+        } else {
+            vec!["-c", &cmd.command]
+        })
         .current_dir(base)
         .output();
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -117,8 +138,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let args = Args {
             commands: vec![
-                Command { name: Some("a".into()), command: "echo a".into(), timeout_secs: Some(5) },
-                Command { name: Some("b".into()), command: "echo b".into(), timeout_secs: Some(5) },
+                Command {
+                    name: Some("a".into()),
+                    command: "echo a".into(),
+                    timeout_secs: Some(5),
+                },
+                Command {
+                    name: Some("b".into()),
+                    command: "echo b".into(),
+                    timeout_secs: Some(5),
+                },
             ],
             parallel: false,
             stop_on_error: true,
@@ -133,8 +162,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let args = Args {
             commands: vec![
-                Command { name: Some("a".into()), command: "echo a".into(), timeout_secs: Some(5) },
-                Command { name: Some("b".into()), command: "echo b".into(), timeout_secs: Some(5) },
+                Command {
+                    name: Some("a".into()),
+                    command: "echo a".into(),
+                    timeout_secs: Some(5),
+                },
+                Command {
+                    name: Some("b".into()),
+                    command: "echo b".into(),
+                    timeout_secs: Some(5),
+                },
             ],
             parallel: true,
             stop_on_error: false,

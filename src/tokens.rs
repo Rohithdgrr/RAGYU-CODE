@@ -24,6 +24,33 @@ pub fn count(text: &str) -> usize {
     }
 }
 
+/// Provider-aware scaling for non-OpenAI tokenizers. cl100k is used as the
+/// base (OpenAI) count; Gemini SentencePiece can be 1.5-2× larger, Mistral
+/// and DeepSeek are closer. Scaling is a cheap heuristic until a native
+/// tokenizer per provider is vendored.
+pub fn count_for_provider(provider: &str, text: &str) -> usize {
+    let base = count(text);
+    let factor = match provider {
+        "gemini" => 1.8,
+        "mistral" => 1.1,
+        "deepseek" | "kimi" => 1.15,
+        "ollama" => 1.05,
+        _ => 1.0,
+    };
+    ((base as f32 * factor).ceil() as usize).max(base)
+}
+
+pub fn count_message_for(provider: &str, msg: &Message) -> usize {
+    let mut tokens = count_for_provider(provider, &msg.content) + PER_MESSAGE_OVERHEAD;
+    for call in msg.tool_calls.iter().flatten() {
+        tokens += PER_TOOL_CALL_OVERHEAD
+            + count_for_provider(provider, &call.id)
+            + count_for_provider(provider, &call.function.name)
+            + count_for_provider(provider, &call.function.arguments);
+    }
+    tokens
+}
+
 /// Token cost of sending one message over the wire, framing included.
 pub fn count_message(msg: &Message) -> usize {
     let mut tokens = count(&msg.content) + PER_MESSAGE_OVERHEAD;

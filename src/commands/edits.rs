@@ -216,7 +216,9 @@ mod tests {
 
     #[test]
     fn apply_writes_files_and_clears_queue() {
-        let _guard = crate::TEST_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::TEST_CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let ws = TempDir::new("apply");
         std::env::set_current_dir(&ws.0).unwrap();
         std::fs::write(ws.0.join("a.txt"), "one\ntwo\nthree\n").unwrap();
@@ -240,7 +242,9 @@ mod tests {
 
     #[test]
     fn apply_aborts_atomically_on_bad_op() {
-        let _guard = crate::TEST_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::TEST_CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let ws = TempDir::new("apply-abort");
         std::env::set_current_dir(&ws.0).unwrap();
         std::fs::write(ws.0.join("a.txt"), "content\n").unwrap();

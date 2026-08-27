@@ -5,6 +5,7 @@
 //! apply-fixes for auto-fixable violations.
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// Scope to a file or directory.
     pub path: Option<String>,
@@ -24,7 +25,9 @@ enum Kind {
 pub fn run(base: &std::path::Path, args: Args) -> anyhow::Result<String> {
     let scope = args.path.as_deref().unwrap_or(".");
     let kind = detect_kind(base).ok_or_else(|| {
-        anyhow::anyhow!("no supported project found (Cargo.toml, package.json, pyproject.toml, go.mod)")
+        anyhow::anyhow!(
+            "no supported project found (Cargo.toml, package.json, pyproject.toml, go.mod)"
+        )
     })?;
     let (program, argv) = lint_command(kind, scope, args.fix)?;
     let output = std::process::Command::new(program)

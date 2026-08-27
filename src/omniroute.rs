@@ -8,9 +8,9 @@
 //! to come up — no manual setup.
 
 use anyhow::{Context as _, Result};
-use std::process::{Command as StdCommand, Stdio};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
 pub const BASE_URL: &str = "http://localhost:20128";
@@ -89,12 +89,9 @@ async fn npm_available() -> bool {
 }
 
 async fn omniroute_installed() -> bool {
-    run_cmd(
-        &omniroute_cli("--version"),
-        Duration::from_secs(20),
-    )
-    .await
-    .is_ok()
+    run_cmd(&omniroute_cli("--version"), Duration::from_secs(20))
+        .await
+        .is_ok()
 }
 
 /// Installs OmniRoute globally, streaming npm's own progress output to the
@@ -106,9 +103,7 @@ async fn omniroute_installed() -> bool {
 /// `--prefer-offline` reuses any cached tarballs from a prior attempt so a
 /// retry or a second machine with a warm cache installs near-instantly.
 async fn install_omniroute() -> Result<()> {
-    let argv = npm(
-        "install -g omniroute --no-audit --no-fund --no-optional --prefer-offline",
-    );
+    let argv = npm("install -g omniroute --no-audit --no-fund --no-optional --prefer-offline");
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
@@ -232,10 +227,17 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(
             npm("--version"),
-            vec!["cmd".to_owned(), "/C".to_owned(), "npm --version".to_owned()]
+            vec![
+                "cmd".to_owned(),
+                "/C".to_owned(),
+                "npm --version".to_owned()
+            ]
         );
         #[cfg(not(windows))]
-        assert_eq!(npm("--version"), vec!["npm".to_owned(), "--version".to_owned()]);
+        assert_eq!(
+            npm("--version"),
+            vec!["npm".to_owned(), "--version".to_owned()]
+        );
     }
 
     #[test]

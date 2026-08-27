@@ -11,10 +11,11 @@ use std::path::Path;
 
 /// Maximum size of a file to include in context (bytes).
 const MAX_FILE_SIZE: usize = 512 * 1024; // 512KB
-/// Default chunk size in characters.
-const DEFAULT_CHUNK_SIZE: usize = 2000;
-/// Overlap between chunks for context continuity.
-const CHUNK_OVERLAP: usize = 200;
+/// Target chunk size in tokens (was 2000 chars / 80 heuristic).
+/// 700 tokens ≈ 2800 chars of code, safely fits the model's window when
+/// several chunks are injected. The overlap is ~20% of this budget.
+const DEFAULT_CHUNK_TOKENS: usize = 700;
+const CHUNK_OVERLAP_TOKENS: usize = 140;
 
 /// A chunk of a file with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,21 +76,37 @@ pub fn chunk_file(path: &Path, base: &Path) -> Result<Vec<FileChunk>> {
     let lines: Vec<&str> = text.lines().collect();
     let mut chunks = Vec::new();
 
-    if lines.len() <= DEFAULT_CHUNK_SIZE / 80 {
-        // Small file: single chunk
+    // Fast path: short files stay as one chunk when measured in real tokens.
+    let total_tokens = crate::tokens::count(&text);
+    if total_tokens <= DEFAULT_CHUNK_TOKENS || lines.len() <= 12 {
         chunks.push(FileChunk {
             path: rel,
             start_line: 1,
-            end_line: total_lines,
+            end_line: total_lines.max(1),
             content: text,
-            total_lines,
+            total_lines: total_lines.max(1),
             language,
         });
     } else {
-        // Large file: split into chunks with overlap
-        let mut start = 0;
+        // Token-aware sliding window: grow each chunk until the token budget
+        // is hit, then rewind by overlap tokens so context is preserved.
+        let mut start = 0usize;
         while start < lines.len() {
-            let end = (start + DEFAULT_CHUNK_SIZE / 80).min(lines.len());
+            let mut tokens = 0usize;
+            let mut end = start;
+            while end < lines.len() && tokens < DEFAULT_CHUNK_TOKENS {
+                // +1 for the newline that join("\n") will insert
+                tokens += crate::tokens::count(lines[end]) + 1;
+                end += 1;
+                // If a single very long line already exceeds the budget, keep it
+                // as its own chunk to guarantee progress.
+                if end == start + 1 && tokens >= DEFAULT_CHUNK_TOKENS {
+                    break;
+                }
+            }
+            if end == start {
+                end = (start + 1).min(lines.len());
+            }
             let chunk_content: String = lines[start..end].join("\n");
             chunks.push(FileChunk {
                 path: rel.clone(),
@@ -99,8 +116,24 @@ pub fn chunk_file(path: &Path, base: &Path) -> Result<Vec<FileChunk>> {
                 total_lines,
                 language: language.clone(),
             });
-            // Move forward with overlap
-            start = end - (CHUNK_OVERLAP / 80).min(end - start);
+            if end >= lines.len() {
+                break;
+            }
+            // Rewind by overlap tokens.
+            let mut overlap_tokens = 0usize;
+            let mut overlap_start = end;
+            while overlap_start > start && overlap_tokens < CHUNK_OVERLAP_TOKENS {
+                overlap_start -= 1;
+                overlap_tokens += crate::tokens::count(lines[overlap_start]) + 1;
+            }
+            // Guarantee forward progress: at least one new line per chunk.
+            let next_start = overlap_start.max(start + 1).min(end - 1);
+            // Safety: if rewound to the same start, force advance by one chunk's end.
+            if next_start <= start {
+                start = end;
+            } else {
+                start = next_start;
+            }
             if start >= lines.len() {
                 break;
             }
@@ -155,11 +188,7 @@ pub fn format_chunks_for_prompt(chunks: &[FileChunk]) -> String {
     for chunk in chunks {
         output.push_str(&format!(
             "## {} (lines {}-{}/{})\n\n```\n{}\n```\n\n",
-            chunk.path,
-            chunk.start_line,
-            chunk.end_line,
-            chunk.total_lines,
-            chunk.content
+            chunk.path, chunk.start_line, chunk.end_line, chunk.total_lines, chunk.content
         ));
     }
 
@@ -239,7 +268,9 @@ pub fn search_files(query: &str, base: &Path, max_results: usize) -> Vec<String>
             }
             if !is_dir
                 && (query.is_empty()
-                    || name.to_ascii_lowercase().contains(&query.to_ascii_lowercase()))
+                    || name
+                        .to_ascii_lowercase()
+                        .contains(&query.to_ascii_lowercase()))
             {
                 results.push(rel);
             }

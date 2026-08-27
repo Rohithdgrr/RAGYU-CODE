@@ -6,6 +6,7 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// Regex pattern (Rust syntax). Supports named groups (?P<name>...).
     pub pattern: String,
@@ -27,17 +28,28 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
         .case_insensitive(!case_sensitive)
         .build()
         .map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?;
-    let names: Vec<String> = re.capture_names().filter_map(|n| n.map(String::from)).collect();
+    let names: Vec<String> = re
+        .capture_names()
+        .filter_map(|n| n.map(String::from))
+        .collect();
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut count = 0usize;
-        for entry in walk_files(&target)? {
-            let Some(name_os) = entry.file_name() else { continue; };
-            if let Some(globs) = &args.include_globs {
-                let name = name_os.to_string_lossy();
-                if !globs.iter().any(|g| glob_match(g, &name)) { continue; }
+    for entry in walk_files(&target)? {
+        let Some(name_os) = entry.file_name() else {
+            continue;
+        };
+        if let Some(globs) = &args.include_globs {
+            let name = name_os.to_string_lossy();
+            if !globs.iter().any(|g| glob_match(g, &name)) {
+                continue;
             }
-        let Ok(raw) = std::fs::read_to_string(&entry) else { continue; };
-        if raw.contains('\0') { continue; }
+        }
+        let Ok(raw) = std::fs::read_to_string(&entry) else {
+            continue;
+        };
+        if raw.contains('\0') {
+            continue;
+        }
         for (lineno, line) in raw.lines().enumerate() {
             if let Some(caps) = re.captures(line) {
                 let mut obj = serde_json::json!({
@@ -47,17 +59,28 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
                 });
                 for name in &names {
                     if let Some(m) = caps.name(name) {
-                        obj.as_object_mut().unwrap().insert(name.clone(), serde_json::Value::String(m.as_str().to_owned()));
+                        obj.as_object_mut().unwrap().insert(
+                            name.clone(),
+                            serde_json::Value::String(m.as_str().to_owned()),
+                        );
                     }
                 }
                 results.push(obj);
                 count += 1;
-                if count >= max { break; }
+                if count >= max {
+                    break;
+                }
             }
         }
-        if count >= max { break; }
+        if count >= max {
+            break;
+        }
     }
-    Ok(format!("{{\"count\":{},\"matches\":{}}}", results.len(), serde_json::to_string(&results).unwrap_or_default()))
+    Ok(format!(
+        "{{\"count\":{},\"matches\":{}}}",
+        results.len(),
+        serde_json::to_string(&results).unwrap_or_default()
+    ))
 }
 
 fn walk_files(target: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
@@ -66,11 +89,21 @@ fn walk_files(target: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
         out.push(target.to_path_buf());
         return Ok(out);
     }
-    let skip = [".git", "target", "node_modules", "dist", "build", ".next", "__pycache__"];
+    let skip = [
+        ".git",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        ".next",
+        "__pycache__",
+    ];
     for entry in std::fs::read_dir(target)? {
         let e = entry?;
         let name = e.file_name().to_string_lossy().to_string();
-        if skip.contains(&name.as_str()) { continue; }
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
         if e.file_type()?.is_dir() {
             out.extend(walk_files(&e.path())?);
         } else if e.file_type()?.is_file() {
@@ -95,7 +128,10 @@ fn glob_to_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
         match ch {
             '*' => r.push_str(".*"),
             '?' => r.push('.'),
-            '.' | '(' | ')' | '+' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => { r.push('\\'); r.push(ch); }
+            '.' | '(' | ')' | '+' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
+                r.push('\\');
+                r.push(ch);
+            }
             _ => r.push(ch),
         }
     }

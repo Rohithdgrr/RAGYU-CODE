@@ -21,6 +21,7 @@ pub struct FileSpec {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     pub files: Vec<FileSpec>,
 }
@@ -39,7 +40,10 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
             Ok(content) => {
                 let bytes = content.len();
                 let new_content = match spec.to {
-                    ConvertTo::Crlf => content.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n"),
+                    ConvertTo::Crlf => content
+                        .replace("\r\n", "\n")
+                        .replace("\r", "\n")
+                        .replace("\n", "\r\n"),
                     ConvertTo::Lf => content.replace("\r\n", "\n").replace("\r", "\n"),
                     ConvertTo::Cr => content.replace("\r\n", "\r").replace("\n", "\r"),
                     ConvertTo::Upper => {
@@ -69,8 +73,12 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
         }
     }
     let n = results.len();
-    let n_ok = results.iter().filter(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)).count();
-    Ok(format!("{{\"total\":{n},\"ok\":{n_ok},\"err\":{},\"results\":{}}}",
+    let n_ok = results
+        .iter()
+        .filter(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+        .count();
+    Ok(format!(
+        "{{\"total\":{n},\"ok\":{n_ok},\"err\":{},\"results\":{}}}",
         n - n_ok,
         serde_json::to_string(&results).unwrap_or_default()
     ))
@@ -84,7 +92,12 @@ mod tests {
     fn converts_lf_to_crlf() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
-        let args = Args { files: vec![FileSpec { path: "a.txt".into(), to: ConvertTo::Crlf }] };
+        let args = Args {
+            files: vec![FileSpec {
+                path: "a.txt".into(),
+                to: ConvertTo::Crlf,
+            }],
+        };
         run(dir.path(), args).unwrap();
         let content = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
         assert!(content.contains("\r\n"));

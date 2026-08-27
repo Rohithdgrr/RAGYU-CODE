@@ -135,8 +135,7 @@ impl Phase {
 
 /// Text used when the model omits a `[VERIFY]` step — the pipeline always
 /// ends in an objective check.
-const FALLBACK_VERIFY_STEP: &str =
-    "run the project's tests / checks and confirm everything passes";
+const FALLBACK_VERIFY_STEP: &str = "run the project's tests / checks and confirm everything passes";
 
 /// One planned pipeline step: its phase plus the tag-stripped description.
 pub type PipelineStep = (Phase, String);
@@ -149,10 +148,7 @@ pub fn parse_pipeline_steps(text: &str) -> Vec<PipelineStep> {
         .into_iter()
         .map(|step| {
             let (phase, rest) = split_phase_tag(&step);
-            (
-                phase.unwrap_or_else(|| Phase::infer(rest)),
-                rest.to_owned(),
-            )
+            (phase.unwrap_or_else(|| Phase::infer(rest)), rest.to_owned())
         })
         .collect();
     let needs_verify = !steps.iter().any(|(p, _)| *p == Phase::Verify);
@@ -210,9 +206,8 @@ async fn ask_planner(app: &mut App, system: &str, user: &str) -> anyhow::Result<
 pub async fn generate_pipeline(app: &mut App, task: &str) -> anyhow::Result<Vec<PipelineStep>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let overview = crate::scan::scan(&cwd).await;
-    let user = format!(
-        "Task:\n{task}\n\nWorkspace overview:\n{overview}\n\nProduce the phased plan now."
-    );
+    let user =
+        format!("Task:\n{task}\n\nWorkspace overview:\n{overview}\n\nProduce the phased plan now.");
     let raw = ask_planner(app, PIPELINE_SYSTEM, &user).await?;
     Ok(parse_pipeline_steps(&raw))
 }
@@ -236,9 +231,7 @@ pub(super) async fn handle(arg: &str, app: &mut App) -> Outcome {
     let out = match ask_planner(
         app,
         PLAN_SYSTEM,
-        &format!(
-            "Task:\n{task}\n\nWorkspace overview:\n{overview}\n\nProduce the plan now."
-        ),
+        &format!("Task:\n{task}\n\nWorkspace overview:\n{overview}\n\nProduce the plan now."),
     )
     .await
     {

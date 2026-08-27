@@ -13,9 +13,7 @@ use crate::config::Config;
 use crate::render::{Renderer, dim_color, err_color, ok_color, paint};
 use crate::session::Session;
 use crate::tools::{BuiltinTools, PendingEdits, ToolExecutor};
-use display::{
-    print_history, set_or_show_theme,
-};
+use display::{print_history, set_or_show_theme};
 use generation::{compact, models, retry, set_model};
 use output::{CommandOutput, Effect};
 use persistence::{load_session, save_session};
@@ -23,6 +21,25 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use todo::Todo;
+
+// ---------------------------------------------------------------------------
+// Coordinator type aliases — God-object mitigation for `App` (src/commands/mod.rs:58).
+//
+// `App` currently holds 30+ fields (config, session, tools, router, todos,
+// checkpoints, etc.). A full split into separate managers would touch every
+// call site. As a minimal, borrow-conflict-reducing step we expose the three
+// main coordinators as type aliases so handlers can take `&mut SessionManager`
+// or `&ToolRegistry` instead of `&mut App` where feasible. `Router` is already
+// a separate struct (`src/router.rs`); `PromptCache` is now also a dedicated
+// field below (`src/prompt_cache.rs`).
+// ---------------------------------------------------------------------------
+
+/// Session ownership and history (wraps `crate::session::Session`).
+pub type SessionManager = crate::session::Session;
+/// Advertised tool schemas (built once at startup, never mutated per-request).
+pub type ToolRegistry = Vec<crate::api::Tool>;
+/// Runtime configuration (`crate::config::Config`).
+pub type ConfigManager = crate::config::Config;
 
 /// Step parser shared with the TUI planner.
 pub use plan::parse_steps;
@@ -36,7 +53,7 @@ pub use plan::{Phase, PipelineStep, generate_pipeline, parse_pipeline_steps};
 /// list had 55 entries, many of which were stubbed, broken, or duplicated
 /// TUI-only behaviour. Anything removed here is still discoverable via
 /// `/help` (which lists a short summary of each).
-pub const SLASH_COMMANDS: [&str; 15] = [
+pub const SLASH_COMMANDS: [&str; 16] = [
     "/help",
     "/exit",
     "/clear",
@@ -44,6 +61,7 @@ pub const SLASH_COMMANDS: [&str; 15] = [
     "/model",
     "/models",
     "/router",
+    "/stats",
     "/theme",
     "/tokens",
     "/todo",
@@ -54,10 +72,43 @@ pub const SLASH_COMMANDS: [&str; 15] = [
     "/history",
 ];
 
+/// Slash commands that never take an argument — Enter on the palette or a
+/// click on the palette row runs them directly instead of opening the args
+/// dialog. Single source of truth for `tui::app::ZERO_ARG_SLASH`.
+pub const ZERO_ARG_COMMANDS: &[&str] = &[
+    "/help", "/exit", "/quit", "/q", "/clear", "/reset", "/models", "/tokens", "/stats", "/retry",
+    "/history", "/router",
+];
+
 /// Shared mutable state for the REPL and command handlers.
+///
+/// # God-object note
+///
+/// `App` currently owns 30+ fields spanning config, session, rendering,
+/// tool execution, routing, todos, checkpoints, and protocol state
+/// (`src/commands/mod.rs:58` in the original layout). This is a classic
+/// god-object: every handler takes `&mut App`, so unrelated borrows
+/// conflict and the struct is hard to test in isolation.
+///
+/// Mitigations already in place:
+/// - `crate::router::Router` — separate struct for failover / quarantine.
+/// - `crate::prompt_cache::PromptCache` — separate LRU for `/variants`.
+///
+/// Minimal further mitigation in this patch:
+/// - Expose `SessionManager`, `ToolRegistry`, `ConfigManager` type aliases
+///   so new helpers can take narrower borrows (`&mut SessionManager`).
+/// - Add a dedicated `prompt_cache` field so `/retry` / `/variants` no
+///   longer rely solely on the global `OnceLock`; handlers that need the
+///   cache can borrow `&mut App::prompt_cache` without touching `session`.
+/// - Document each field's coordinator affinity (Session / Tool / Config /
+///   Router / PromptCache) to guide future splits into `SessionManager`,
+///   `ToolRegistry`, `ConfigManager` structs.
+///
 pub struct App {
+    /// Config coordinator (see `ConfigManager` alias).
     pub config: Config,
     pub http: reqwest::Client,
+    /// Session coordinator (see `SessionManager` alias).
     pub session: Session,
     pub renderer: Renderer,
     /// Name of the current named session (drives auto-save on exit).
@@ -117,6 +168,10 @@ pub struct App {
     /// failures. Defaults to `true`; toggled via
     /// `/router failover on|off`.
     pub router_failover: bool,
+    /// Per-session router state: ordered fallbacks, strike counters,
+    /// and quarantine set. Sticky for the session so 3-strike
+    /// failover survives across turns.
+    pub router: crate::router::Router,
     /// Per-turn header prepended to the next user message by the
     /// `/plan` command. The header is consumed (taken) by `run_turn`
     /// so the second turn runs without it.
@@ -129,6 +184,10 @@ pub struct App {
     pub total_lines_emitted: usize,
     /// Detected project type, used by the protocol header.
     pub project_type: crate::govinda_protocol::ProjectType,
+    /// Dedicated per-App prompt cache (LRU, 32 entries) for `/retry` /
+    /// `/variants`. Separate from the global `prompt_cache::GLOBAL` so
+    /// borrow conflicts are reduced and tests can inject an isolated cache.
+    pub prompt_cache: crate::prompt_cache::PromptCache,
 }
 
 #[derive(Default)]
@@ -155,8 +214,8 @@ impl App {
     pub fn new_for_test() -> Self {
         use std::sync::Arc;
         use zeroize::Zeroizing;
-        let provider = crate::provider::resolve("ollama", None, None, |_| None)
-            .expect("ollama preset");
+        let provider =
+            crate::provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
         let config = Config {
             api_key: Arc::new(Zeroizing::new(String::new())),
             model: "test-model".to_owned(),
@@ -195,6 +254,8 @@ impl App {
         let project_memory = crate::memory::ProjectMemory::load(&workspace);
         let skills = crate::skills::load_skills();
         let project_type = crate::govinda_protocol::ProjectType::Unspecified;
+        let router =
+            crate::router::Router::for_active(config.provider.key().as_ref(), &config.model);
         Self {
             read_timeout: Duration::from_secs(config.timeout_secs),
             max_response_bytes: (config.limit_mb as usize) * 1024 * 1024,
@@ -218,10 +279,12 @@ impl App {
             auto_compact_enabled: true,
             last_auto_compact_count: 0,
             router_failover: true,
+            router,
             pending_protocol_header: None,
             current_phase: None,
             total_lines_emitted: 0,
             project_type,
+            prompt_cache: crate::prompt_cache::PromptCache::new(),
             config,
             http,
             session,
@@ -250,14 +313,16 @@ pub fn persist_todos(app: &mut App) {
 pub fn apply_pending_edits(app: &mut App) -> bool {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let pending = app.pending_edits.clone();
-    let mut guard = pending.lock().unwrap();
-    let ops = guard.ops().to_vec();
+    let ops = {
+        let guard = pending.lock().unwrap();
+        guard.ops().to_vec()
+    };
     if ops.is_empty() {
         return false;
     }
     let result = crate::tools::apply_ops_to_disk(&cwd, &ops);
     if result.is_ok() {
-        guard.clear();
+        pending.lock().unwrap().clear();
         true
     } else {
         false
@@ -391,7 +456,11 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                  - **model**: `{model}` ({provider_id})\n\
                  - **model limit**: {} tokens{}",
                 app.session.messages().len(),
-                if registry_window > 0 { registry_window } else { budget },
+                if registry_window > 0 {
+                    registry_window
+                } else {
+                    budget
+                },
                 if registry_window == 0 {
                     " (registry unknown -- set `context_tokens` in TOML)"
                 } else {
@@ -399,6 +468,10 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                 },
             );
             markdown(body);
+            Outcome::Handled
+        }
+        "/stats" => {
+            display::show_stats(app);
             Outcome::Handled
         }
         "/theme" => {
@@ -425,12 +498,10 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                 dim("/plan needs a prompt, e.g. /plan build a todo list");
                 Outcome::Handled
             } else {
-                let header = crate::govinda_protocol::build_protocol_header(
-                    rest,
-                    app.project_type,
-                );
+                let header = crate::govinda_protocol::build_protocol_header(rest, app.project_type);
                 app.pending_protocol_header = Some(header);
-                app.current_phase = Some(crate::govinda_protocol::ProjectPhase::InstructionIngestion);
+                app.current_phase =
+                    Some(crate::govinda_protocol::ProjectPhase::InstructionIngestion);
                 app.total_lines_emitted = 0;
                 ok(format!(
                     "GOVINDA protocol armed for next turn (project: {}).",
@@ -447,16 +518,24 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
             // Keeps muscle memory working without silently doing nothing.
             match unknown {
                 "/opencode" => {
-                    dim("`/opencode` was merged into `/provider` â€” try `/provider` to see options, or `/provider oc auto` to borrow OpenCode's connected providers.");
+                    dim(
+                        "`/opencode` was merged into `/provider` â€” try `/provider` to see options, or `/provider oc auto` to borrow OpenCode's connected providers.",
+                    );
                 }
                 "/pin" => {
-                    dim("`/pin` is a TUI-only feature â€” in the REPL, @-mention files in your prompt instead.");
+                    dim(
+                        "`/pin` is a TUI-only feature â€” in the REPL, @-mention files in your prompt instead.",
+                    );
                 }
                 "/system" => {
-                    dim("`/system` was removed; edit the system prompt in config.toml (`system_prompt = \"â€¦\"`).");
+                    dim(
+                        "`/system` was removed; edit the system prompt in config.toml (`system_prompt = \"â€¦\"`).",
+                    );
                 }
                 "/temp" => {
-                    dim("`/temp` was removed; set temperature in config.toml (`temperature = 0.3`).");
+                    dim(
+                        "`/temp` was removed; set temperature in config.toml (`temperature = 0.3`).",
+                    );
                 }
                 "/timeout" => {
                     dim("`/timeout` was removed; set in config.toml (`timeout_secs = 120`).");
@@ -465,19 +544,28 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                     dim("`/limit` was removed; set in config.toml (`limit_mb = 16`).");
                 }
                 "/raw" => {
-                    dim("`/raw` was removed; markdown rendering is controlled by the TUI/REPL mode.");
+                    dim(
+                        "`/raw` was removed; markdown rendering is controlled by the TUI/REPL mode.",
+                    );
                 }
                 "/search" => {
-                    dim("`/search` was removed; use Ctrl+R in the REPL or the history panel in the TUI.");
+                    dim(
+                        "`/search` was removed; use Ctrl+R in the REPL or the history panel in the TUI.",
+                    );
                 }
-                "/sessions" | "/fork" | "/export" | "/stats" => {
-                    dim(format!("`{unknown}` was removed; saved sessions are still readable from `sessions/` but the slash command was cut."));
+                "/sessions" | "/fork" | "/export" => {
+                    dim(format!(
+                        "`{unknown}` was removed; saved sessions are still readable from `sessions/` but the slash command was cut."
+                    ));
                 }
                 "/diff" | "/apply" | "/reject" | "/review" => {
                     dim("edit staging was removed; the model now writes directly via tools.");
                 }
-                "/scan" | "/plan" | "/project" | "/checkpoint" | "/rewind" | "/memory" | "/skills" | "/commit" | "/pr" | "/auto-compact" => {
-                    dim(format!("`{unknown}` was removed in the cleanup. Use the TUI tools panel or `run_shell` for ad-hoc tasks."));
+                "/scan" | "/plan" | "/project" | "/checkpoint" | "/rewind" | "/memory"
+                | "/skills" | "/commit" | "/pr" | "/auto-compact" => {
+                    dim(format!(
+                        "`{unknown}` was removed in the cleanup. Use the TUI tools panel or `run_shell` for ad-hoc tasks."
+                    ));
                 }
                 "/apikey" => {
                     let provider = app.config.provider.key().to_string();
@@ -487,22 +575,34 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
                     ));
                 }
                 "/undo" => {
-                    dim("`/undo` was removed; restart the chat with `/clear` if you want a fresh history.");
+                    dim(
+                        "`/undo` was removed; restart the chat with `/clear` if you want a fresh history.",
+                    );
                 }
                 "/context" => {
-                    dim("`/context` was merged into `/tokens` — run `/tokens` for the full usage report.");
+                    dim(
+                        "`/context` was merged into `/tokens` — run `/tokens` for the full usage report.",
+                    );
                 }
                 "/tools" => {
-                    dim("`/tools` was removed; tools are always available to the model unless `/router failover off` pins the active model.");
+                    dim(
+                        "`/tools` was removed; tools are always available to the model unless `/router failover off` pins the active model.",
+                    );
                 }
                 "/agent" => {
-                    dim("`/agent` was removed; function calling is on by default and toggled via `tools_enabled` in `config.toml`.");
+                    dim(
+                        "`/agent` was removed; function calling is on by default and toggled via `tools_enabled` in `config.toml`.",
+                    );
                 }
                 "/config" => {
-                    dim("`/config` was removed; edit `~/.config/govinda/config.toml` directly (TOML is the source of truth).");
+                    dim(
+                        "`/config` was removed; edit `~/.config/govinda/config.toml` directly (TOML is the source of truth).",
+                    );
                 }
                 "/test" | "/setup" => {
-                    dim("`/test` / `/setup` were removed; run a model call directly to verify the provider.");
+                    dim(
+                        "`/test` / `/setup` were removed; run a model call directly to verify the provider.",
+                    );
                 }
                 "/variants" | "/pick" => {
                     dim("variants/pick were removed; ask the model to regenerate instead.");
@@ -556,8 +656,7 @@ pub async fn dispatch(line: &str, app: &mut App) -> Outcome {
 pub(crate) fn todo_app_for_tools() -> App {
     use std::sync::Arc;
     use zeroize::Zeroizing;
-    let provider = crate::provider::resolve("ollama", None, None, |_| None)
-        .expect("ollama preset");
+    let provider = crate::provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
     let config = Config {
         api_key: Arc::new(Zeroizing::new(String::new())),
         model: "test-model".to_owned(),
@@ -585,7 +684,6 @@ pub(crate) fn todo_app_for_tools() -> App {
     app
 }
 
-
 /// `/provider` handler extracted so the dispatch match stays compact.
 async fn provider_dispatch(arg: &str, app: &mut App) -> Outcome {
     if arg.is_empty() {
@@ -601,7 +699,9 @@ async fn provider_dispatch(arg: &str, app: &mut App) -> Outcome {
         ));
         info(format!(
             "available: {}",
-            crate::provider::preset_names().collect::<Vec<_>>().join(", ")
+            crate::provider::preset_names()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         dim("switch with /provider <name>, or a custom endpoint with /provider <name> <base-url>");
         return Outcome::Handled;
@@ -641,7 +741,9 @@ async fn provider_dispatch(arg: &str, app: &mut App) -> Outcome {
                     ""
                 },
             ));
-            dim("pick a model for this provider with /model <name> (or /models to list). Persist the switch with /config save.");
+            dim(
+                "pick a model for this provider with /model <name> (or /models to list). Persist the switch with /config save.",
+            );
         }
         Err(e) => err(format!("{e:#}")),
     }
@@ -651,40 +753,51 @@ async fn provider_dispatch(arg: &str, app: &mut App) -> Outcome {
 #[allow(dead_code)]
 async fn test_provider(app: &mut App) {
     info("Testing provider configuration...");
-    
+
     let provider_id = app.config.provider.key();
     let model = &app.config.model;
     let has_key = app.config.provider.auth().token().is_some();
-    
+
     info(format!("Provider: {}", provider_id));
     info(format!("Model: {}", model));
-    info(format!("API Key: {}", if has_key { "loaded" } else { "not set" }));
-    
-    if !has_key && provider_id != "ollama" {
+    info(format!(
+        "API Key: {}",
+        if has_key { "loaded" } else { "not set" }
+    ));
+
+    let needs_key = crate::provider::PRESETS
+        .iter()
+        .find(|p| p.id == provider_id.as_ref())
+        .and_then(|p| p.api_key_env)
+        .is_some();
+    if !has_key && needs_key {
         err("API key is required for this provider");
-        dim(format!("Set {}_API_KEY in .env or use /apikey <key>", provider_id.to_uppercase()));
+        dim(format!(
+            "Set {}_API_KEY in .env or use /apikey <key>",
+            provider_id.to_uppercase()
+        ));
         return;
     }
-    
+
     dim("Sending test request...");
-    
+
     let test_message = "Hello! Please respond with 'Test successful' if you can read this.";
     let ctx = vec![
         crate::api::Message::system("You are a helpful assistant. Keep responses brief."),
         crate::api::Message::user(test_message),
     ];
-    
+
     let auth = app.config.provider.auth();
     let opts = crate::api::ChatOptions {
         max_response_bytes: app.max_response_bytes,
         read_timeout: app.read_timeout,
         ..crate::api::ChatOptions::new(auth.token(), model, app.config.temperature)
     };
-    
+
     let mut out = String::new();
     let mut no_calls = Vec::new();
     let mut sink = crate::api::StreamSink::new(&mut out, &mut no_calls);
-    
+
     match crate::api::stream_chat(
         &app.http,
         app.config.provider.as_ref(),
@@ -711,7 +824,10 @@ async fn test_provider(app: &mut App) {
             dim("- Incorrect model name");
             dim("- Network connectivity problems");
             dim("- Provider service outage");
-            dim(format!("Try /models to see available models for {}", provider_id));
+            dim(format!(
+                "Try /models to see available models for {}",
+                provider_id
+            ));
         }
     }
 }
@@ -730,20 +846,24 @@ async fn interactive_provider_setup(
             info(format!("  - {}", preset.id));
         }
         dim("Enter provider name:");
-        return Err(anyhow::anyhow!("Provider name required. Use: /provider <name> -i"));
+        return Err(anyhow::anyhow!(
+            "Provider name required. Use: /provider <name> -i"
+        ));
     } else {
         name
     };
-    
+
     info(format!("Setting up provider: {}", provider_name));
-    
+
     // Step 2: Check if API key is needed
-    let preset = crate::provider::PRESETS.iter().find(|p| p.id == provider_name);
-    
+    let preset = crate::provider::PRESETS
+        .iter()
+        .find(|p| p.id == provider_name);
+
     match preset.and_then(|p| p.api_key_env) {
         Some(env_var) => {
             let current_key = std::env::var(env_var).ok();
-            
+
             if current_key.is_none() || current_key.as_ref().map_or(true, |k| k.trim().is_empty()) {
                 info(format!("API key required for {}", provider_name));
                 info(format!("Environment variable: {}", env_var));
@@ -751,7 +871,10 @@ async fn interactive_provider_setup(
                 dim(format!("1. Set {} in your .env file", env_var));
                 dim(format!("2. Export it: export {}=your_key", env_var));
                 dim(format!("3. Use /apikey <key> to set it interactively"));
-                return Err(anyhow::anyhow!("API key not set. Please set {} and try again.", env_var));
+                return Err(anyhow::anyhow!(
+                    "API key not set. Please set {} and try again.",
+                    env_var
+                ));
             } else {
                 ok(format!("API key found in {}", env_var));
             }
@@ -760,28 +883,39 @@ async fn interactive_provider_setup(
             ok("No API key required for this provider");
         }
     }
-    
+
     // Step 3: Resolve provider
     let key_env_lookup = |var: &str| std::env::var(var).ok();
-    let new_provider = crate::provider::resolve(provider_name, base_url_override, None, key_env_lookup)?;
+    let new_provider =
+        crate::provider::resolve(provider_name, base_url_override, None, key_env_lookup)?;
     app.config.provider = new_provider.clone();
     app.models_cache = None;
-    
-    ok(format!("Provider configured: {} ({})", new_provider.key(), new_provider.base_url()));
-    
+
+    ok(format!(
+        "Provider configured: {} ({})",
+        new_provider.key(),
+        new_provider.base_url()
+    ));
+
     // Step 4: List available models
     info("Fetching available models...");
     let provider_id = new_provider.key().to_string();
     let known_models = crate::provider::known_models(&provider_id);
-    
+
     if !known_models.is_empty() {
         info(format!("Known models for {}:", provider_id));
         for (i, model) in known_models.iter().enumerate() {
             let tag = if model.free { " [FREE]" } else { "" };
-            info(format!("  {}. {}{} - {}", i + 1, model.id, tag, model.description));
+            info(format!(
+                "  {}. {}{} - {}",
+                i + 1,
+                model.id,
+                tag,
+                model.description
+            ));
         }
     }
-    
+
     // Try to fetch live models
     if let Some(models_url) = new_provider.models_url() {
         match crate::api::list_models(&app.http, &models_url, new_provider.auth().token()).await {
@@ -800,29 +934,32 @@ async fn interactive_provider_setup(
             }
         }
     }
-    
+
     // Step 5: Prompt for model selection
     info("Step 5: Select a model");
     dim("Enter model name or use first known model as default");
-    
+
     // Auto-select first known model if available
     if let Some(first_model) = known_models.first() {
         app.config.model = first_model.id.to_string();
-        ok(format!("Auto-selected model: {} - {}", first_model.id, first_model.description));
+        ok(format!(
+            "Auto-selected model: {} - {}",
+            first_model.id, first_model.description
+        ));
         dim("You can change this with /model <name>");
     } else {
         dim("No known models available. Please specify a model with /model <name>");
     }
-    
+
     // Step 6: Test the configuration
     info("Step 6: Testing configuration...");
     dim("Run /test to verify your API key and model are working");
-    
+
     ok("Provider setup complete!");
     dim("Use /config save to persist these settings");
     dim("Use /models to see all available models");
     dim("Use /model <name> to change the selected model");
-    
+
     Ok(())
 }
 
@@ -934,18 +1071,39 @@ pub fn specialize_system(app: &mut App) {
         if !app.skills.is_empty() {
             specialized.push_str("\n\n## Custom Skills\n\nAvailable custom slash commands:\n");
             for s in &app.skills {
-                let args_hint = if s.requires_args { " (requires args)" } else { "" };
-                specialized.push_str(&format!("- `{}` â€” {}{}\n", s.name, s.description, args_hint));
+                let args_hint = if s.requires_args {
+                    " (requires args)"
+                } else {
+                    ""
+                };
+                specialized.push_str(&format!(
+                    "- `{}` â€” {}{}\n",
+                    s.name, s.description, args_hint
+                ));
             }
         }
         // GOVINDA Protocol enforcement: append the master prompt and (when
-        // present) the user's plan template + SYSTEM_INSTRUCTIONS. The
-        // master prompt is inlined so a missing file never silently
-        // disables enforcement; PLAN_TEMPLATE.md is read at runtime so
-        // users can edit it without recompiling.
+        // present) the user's plan template + SYSTEM_INSTRUCTIONS.
+        //
+        // ARCH fix: master prompt is now file-loadable (like PLAN_TEMPLATE)
+        // via `govinda_protocol::load_master_prompt()` which checks
+        // `GOVINDA_MASTER_PROMPT.md` / `GOVINDA_PROMPT.md` / `SYSTEM_INSTRUCTIONS.md`
+        // in the workspace, falling back to the inlined 8KB constant. This
+        // mirrors the file-based template pattern so edits don't require a
+        // recompile.
+        //
+        // Context-budget guard: the 8KB prompt is ~2k tokens. Without a cap
+        // it would consume ~25% of an 8k budget (or more with plan+instructions).
+        // `master_prompt_for_budget` truncates at 25% of `context_tokens`
+        // (chars ≈ tokens*4) and does a paragraph-boundary cut, so small
+        // budgets stay usable while large budgets (128k) keep the full text.
+        // This is the "lazy injection / truncation" requirement: enforcement
+        // never silently hogs >25% context.
         if app.config.protocol.enforcement_mode {
             specialized.push_str("\n\n## GOVINDA PROTOCOL (ENFORCED)\n\n");
-            specialized.push_str(crate::govinda_protocol::MASTER_SYSTEM_PROMPT);
+            specialized.push_str(&crate::govinda_protocol::master_prompt_for_budget(
+                app.config.context_tokens,
+            ));
             if let Some(plan) = load_plan_template() {
                 specialized.push_str("\n\n## ACTIVE PLAN TEMPLATE\n\n");
                 specialized.push_str(&plan);
@@ -1020,14 +1178,43 @@ pub fn capabilities_summary() -> anyhow::Result<String> {
         .unwrap();
     let provider = std::env::var("GOVINDA_PROVIDER").unwrap_or_else(|_| "unknown".into());
     let enabled_tools: Vec<&str> = vec![
-        "current_time", "count_tokens", "read_file", "write_file", "delete_file",
-        "move_file", "copy_file", "list_files", "list_directory", "grep",
-        "scan_project", "find_symbol", "explain_code", "edit_file", "insert_after",
-        "insert_before", "view_diff", "apply_edits", "discard_edits",
-        "show_staged_files", "run_shell", "run_test", "run_diagnostics",
-        "open_preview", "git_diff", "git_log", "git_branch", "git_commit",
-        "web_search", "web_fetch", "ask_user", "delegate_task", "todo",
-        "show_token_budget", "show_capabilities", "remember", "forget",
+        "current_time",
+        "count_tokens",
+        "read_file",
+        "write_file",
+        "delete_file",
+        "move_file",
+        "copy_file",
+        "list_files",
+        "list_directory",
+        "grep",
+        "scan_project",
+        "find_symbol",
+        "explain_code",
+        "edit_file",
+        "insert_after",
+        "insert_before",
+        "view_diff",
+        "apply_edits",
+        "discard_edits",
+        "show_staged_files",
+        "run_shell",
+        "run_test",
+        "run_diagnostics",
+        "open_preview",
+        "git_diff",
+        "git_log",
+        "git_branch",
+        "git_commit",
+        "web_search",
+        "web_fetch",
+        "ask_user",
+        "delegate_task",
+        "todo",
+        "show_token_budget",
+        "show_capabilities",
+        "remember",
+        "forget",
         "quality_gate_check",
     ];
     Ok(format!(
@@ -1044,13 +1231,15 @@ pub fn capabilities_summary() -> anyhow::Result<String> {
 /// slash command and the `apply_edits` tool.
 pub fn apply_pending(base: &std::path::Path, app: &App) -> anyhow::Result<String> {
     let pending = app.pending_edits.clone();
-    let mut guard = pending.lock().unwrap();
-    let ops = guard.ops().to_vec();
+    let ops = {
+        let guard = pending.lock().unwrap();
+        guard.ops().to_vec()
+    };
     if ops.is_empty() {
         return Ok("nothing to apply".to_owned());
     }
     let _ = crate::tools::apply_ops_to_disk(base, &ops)?;
-    guard.clear();
+    pending.lock().unwrap().clear();
     Ok(format!("applied {} edit(s)", ops.len()))
 }
 
@@ -1086,10 +1275,11 @@ mod tests {
         assert!(text.contains("current provider: ollama"), "{text}");
 
         // Switch to a preset with a custom endpoint override.
-        let out =
-            dispatch_structured("/provider ollama http://10.0.0.5:11434/v1", &mut app).await;
+        let out = dispatch_structured("/provider ollama http://10.0.0.5:11434/v1", &mut app).await;
         assert!(
-            out.msgs.iter().any(|m| m.text.contains("switched to ollama")),
+            out.msgs
+                .iter()
+                .any(|m| m.text.contains("switched to ollama")),
             "{out:?}"
         );
         assert_eq!(app.config.provider.id(), "ollama");
@@ -1107,7 +1297,9 @@ mod tests {
         let out =
             dispatch_structured("/provider custom https://llm.corp.internal/v1", &mut app).await;
         assert!(
-            out.msgs.iter().any(|m| m.text.contains("switched to custom")),
+            out.msgs
+                .iter()
+                .any(|m| m.text.contains("switched to custom")),
             "{out:?}"
         );
         assert_eq!(app.config.provider.id(), "custom");
@@ -1121,8 +1313,9 @@ mod tests {
         if std::env::var_os("GROQ_API_KEY").is_none() {
             let out = dispatch_structured("/provider groq", &mut app).await;
             assert!(
-                out.msgs.iter().any(|m| m.role == super::output::Role::Err
-                    && m.text.contains("GROQ_API_KEY")),
+                out.msgs
+                    .iter()
+                    .any(|m| m.role == super::output::Role::Err && m.text.contains("GROQ_API_KEY")),
                 "{out:?}"
             );
             assert_ne!(app.config.provider.id(), "groq");

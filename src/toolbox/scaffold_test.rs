@@ -7,6 +7,7 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// Source file containing the function.
     pub source_path: String,
@@ -70,7 +71,12 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Kind { Rust, Node, Python, Go }
+enum Kind {
+    Rust,
+    Node,
+    Python,
+    Go,
+}
 
 impl std::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -84,11 +90,17 @@ impl std::fmt::Display for Kind {
 }
 
 fn detect_kind(base: &Path) -> Kind {
-    if base.join("Cargo.toml").exists() { Kind::Rust }
-    else if base.join("package.json").exists() { Kind::Node }
-    else if base.join("pyproject.toml").exists() || base.join("requirements.txt").exists() { Kind::Python }
-    else if base.join("go.mod").exists() { Kind::Go }
-    else { Kind::Rust } // sensible default
+    if base.join("Cargo.toml").exists() {
+        Kind::Rust
+    } else if base.join("package.json").exists() {
+        Kind::Node
+    } else if base.join("pyproject.toml").exists() || base.join("requirements.txt").exists() {
+        Kind::Python
+    } else if base.join("go.mod").exists() {
+        Kind::Go
+    } else {
+        Kind::Rust
+    } // sensible default
 }
 
 fn rust_scaffold(fn_name: &str) -> String {

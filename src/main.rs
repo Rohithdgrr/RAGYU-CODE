@@ -11,7 +11,6 @@ use reedline::{
 use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
 
-
 /// Completes slash commands as the user types `/mod` → `/models`, `/model`.
 struct SlashCompleter;
 
@@ -117,7 +116,10 @@ async fn main() -> Result<()> {
                 println!(
                     "{}",
                     paint(
-                        format!("OpenCode detected — borrowing {pid} · model {}", config.model),
+                        format!(
+                            "OpenCode detected — borrowing {pid} · model {}",
+                            config.model
+                        ),
                         govinda_cli::render::dim_color()
                     )
                 );
@@ -138,17 +140,38 @@ async fn main() -> Result<()> {
                             govinda_cli::render::dim_color()
                         )
                     ),
-                    Ok(false) => println!(
-                        "{}",
-                        paint(
-                            "OmniRoute did not come up in time — start it manually with 'omniroute'",
-                            govinda_cli::render::dim_color()
-                        )
-                    ),
+                    Ok(false) => {
+                        println!(
+                            "{}",
+                            paint(
+                                "OmniRoute did not come up in time — start it manually with 'omniroute'",
+                                govinda_cli::render::dim_color()
+                            )
+                        );
+                        // Second-chance probe: retry once after 10s in the background.
+                        let http_bg = http.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            if govinda_cli::omniroute::ensure_running(&http_bg)
+                                .await
+                                .unwrap_or(false)
+                            {
+                                eprintln!(
+                                    "{}",
+                                    paint(
+                                        "OmniRoute reconnected",
+                                        govinda_cli::render::dim_color()
+                                    )
+                                );
+                            }
+                        });
+                    }
                     Err(e) => println!(
                         "{}",
                         paint(
-                            format!("OmniRoute unavailable ({e:#}) — first chat will fail until it is running"),
+                            format!(
+                                "OmniRoute unavailable ({e:#}) — first chat will fail until it is running"
+                            ),
                             govinda_cli::render::dim_color()
                         )
                     ),
@@ -169,12 +192,9 @@ async fn main() -> Result<()> {
     // long prompt. Only the active model is probed; fallbacks are
     // tested lazily by the router's 3-strike logic.
     {
-        let probe = govinda_cli::preflight::probe_active(
-            &http,
-            config.provider.as_ref(),
-            &config.model,
-        )
-        .await;
+        let probe =
+            govinda_cli::preflight::probe_active(&http, config.provider.as_ref(), &config.model)
+                .await;
         match probe.status {
             govinda_cli::preflight::ProbeStatus::Ok => println!(
                 "{}",
@@ -211,12 +231,9 @@ async fn main() -> Result<()> {
     // (and the `DEFAULT_CONTEXT_TOKENS` fallback) when the network is
     // reachable. The previous default of 8k silently capped 200k models
     // like `oc/hy3-free`; this restores the real limit.
-    let detected = govinda_cli::provider::fetch_model_context(
-        &http,
-        config.provider.as_ref(),
-        &config.model,
-    )
-    .await;
+    let detected =
+        govinda_cli::provider::fetch_model_context(&http, config.provider.as_ref(), &config.model)
+            .await;
     if detected > 0 && config.context_tokens < detected {
         let used = detected;
         eprintln!(
@@ -425,17 +442,19 @@ fn parse_args() -> Result<Args> {
     // Stash the enforce flag in an env var so the config layer can pick it
     // up via env_override(). No mutation of `config` happens here yet.
     if enforce {
-        unsafe { std::env::set_var("GOVINDA_ENFORCE_PROTOCOL", "1"); }
+        unsafe {
+            std::env::set_var("GOVINDA_ENFORCE_PROTOCOL", "1");
+        }
     }
     // TUI is the default for interactive sessions; --repl forces the legacy
     // REPL, --query/-q and --build/-b imply non-TUI, and piped stdout always
     // falls back to the plain REPL.
-    let tui = if force_repl || query.is_some() || build.is_some() || !std::io::stdout().is_terminal()
-    {
-        false
-    } else {
-        force_tui || true
-    };
+    let tui =
+        if force_repl || query.is_some() || build.is_some() || !std::io::stdout().is_terminal() {
+            false
+        } else {
+            force_tui || true
+        };
     Ok(Args {
         resume,
         query,
@@ -573,10 +592,7 @@ const MAX_BUILD_FIX_TURNS: usize = 3;
 /// guaranteed VERIFY phase → fix loop on persistent failure → report.
 /// Exit status reflects the final verification result.
 async fn run_build(app: &mut App, prompt: &str) -> Result<()> {
-    println!(
-        "{}",
-        paint(format!("build pipeline: {prompt}"), accent())
-    );
+    println!("{}", paint(format!("build pipeline: {prompt}"), accent()));
 
     let steps = match commands::generate_pipeline(app, prompt).await {
         Ok(steps) if !steps.is_empty() => steps,
@@ -645,7 +661,14 @@ async fn run_build(app: &mut App, prompt: &str) -> Result<()> {
         );
         run_turn_auto(
             app,
-            &format!("[{} step {}/{}] {}\n\nPhase guidance: {}", phase.tag(), i + 1, total, step, phase.hint()),
+            &format!(
+                "[{} step {}/{}] {}\n\nPhase guidance: {}",
+                phase.tag(),
+                i + 1,
+                total,
+                step,
+                phase.hint()
+            ),
         )
         .await;
         // Headless mode has no one to type /apply: commit staged edits now,
@@ -687,7 +710,10 @@ async fn run_build(app: &mut App, prompt: &str) -> Result<()> {
     // Final report; exit code mirrors verification.
     let success = !app.last_turn_had_failure;
     println!();
-    println!("{}", paint("── build report ─────────────────────", accent()));
+    println!(
+        "{}",
+        paint("── build report ─────────────────────", accent())
+    );
     let width = report.iter().map(|(t, _, _)| t.len()).max().unwrap_or(0);
     for (tag, text, ok) in &report {
         let glyph = if *ok {
@@ -822,10 +848,7 @@ impl govinda_cli::agent_loop::AgentUi for CliUi {
         }
         println!(
             "{}",
-            paint(
-                format!("← {snippet}"),
-                govinda_cli::render::dim_color()
-            )
+            paint(format!("← {snippet}"), govinda_cli::render::dim_color())
         );
     }
 
@@ -836,10 +859,7 @@ impl govinda_cli::agent_loop::AgentUi for CliUi {
     fn notice(&self, text: &str) {
         println!(
             "{}",
-            paint(
-                text.to_owned(),
-                govinda_cli::render::dim_color()
-            )
+            paint(text.to_owned(), govinda_cli::render::dim_color())
         );
     }
 
@@ -878,7 +898,12 @@ impl govinda_cli::agent_loop::AgentUi for CliUi {
         read_confirmation_answer()
     }
 
-    fn confirm(&self, name: &str, arguments_json: &str, allow_all: bool) -> govinda_cli::agent_loop::Confirm {
+    fn confirm(
+        &self,
+        name: &str,
+        arguments_json: &str,
+        allow_all: bool,
+    ) -> govinda_cli::agent_loop::Confirm {
         use govinda_cli::agent_loop::Confirm;
         println!();
         println!(
@@ -943,8 +968,13 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// Interactive REPL turn through the shared loop.
 async fn run_turn(app: &mut App, input: &str) {
     let ui = CliUi::interactive(app.renderer.markdown_enabled());
-    match govinda_cli::agent_loop::run_turn(app, &ui, govinda_cli::agent_loop::GatePolicy::Interactive, input)
-        .await
+    match govinda_cli::agent_loop::run_turn(
+        app,
+        &ui,
+        govinda_cli::agent_loop::GatePolicy::Interactive,
+        input,
+    )
+    .await
     {
         Ok(_) => {}
         Err(e) => eprintln!(

@@ -1,6 +1,7 @@
 //! `http_request` — structured HTTP caller (like curl but with parsed JSON).
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     pub method: Method,
     pub url: String,
@@ -12,14 +13,21 @@ pub struct Args {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-pub enum Method { Get, Post, Put, Delete, Patch }
+pub enum Method {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+}
 
 pub async fn run(args: Args) -> anyhow::Result<String> {
+    crate::ssrf::ensure_safe_url(&args.url)?;
     let timeout = args.timeout_secs.unwrap_or(30).clamp(1, 120);
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(timeout))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(crate::ssrf::redirect_policy())
         .user_agent("Mozilla/5.0 (compatible; govinda-cli/1.0)")
         .build()?;
     let mut req = match args.method {
@@ -43,7 +51,8 @@ pub async fn run(args: Args) -> anyhow::Result<String> {
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_owned()))
         .collect();
     let body = resp.text().await?;
-    let body_parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(truncate(&body, 10_000)));
+    let body_parsed: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or(serde_json::Value::String(truncate(&body, 10_000)));
     Ok(format!(
         "{{\"ok\":{},\"status\":{},\"headers\":{},\"body\":{}}}",
         status.is_success(),

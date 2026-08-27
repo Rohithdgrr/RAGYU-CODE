@@ -4,6 +4,15 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// SECURITY NOTE — sessions are plaintext JSON at `sessions/*.json` (and
+/// `~/.config/govinda/sessions/` when using named sessions). They are NOT
+/// encrypted. Never store API keys, tokens, or other secrets in a session:
+/// `SessionFile` only persists `system` + `messages` (user/assistant/tool
+/// content). `Config::api_key` and provider credentials are never written
+/// here; see `save_to` which explicitly serializes only the conversation
+/// transcript. If a user pastes a secret into the chat, it will be saved
+/// as plaintext — warn them and prefer env vars.
+
 const SESSION_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
@@ -221,9 +230,7 @@ impl Session {
             start -= 1;
             used += cost;
         }
-        if let Some(first_user) =
-            (start..messages.len()).find(|&i| messages[i].role == "user")
-        {
+        if let Some(first_user) = (start..messages.len()).find(|&i| messages[i].role == "user") {
             if first_user > start {
                 start = first_user;
             }
@@ -271,6 +278,11 @@ impl Session {
                 .with_context(|| format!("cannot create directory {}", parent.display()))?;
         }
         self.touch();
+        // SECURITY: SessionFile deliberately excludes `Config::api_key` and
+        // provider credentials. Only `system` and `messages` are persisted.
+        // No API keys or secrets are ever serialized here; the file is
+        // plaintext JSON and would otherwise leak them. Keep this filter
+        // in sync with `SessionFile` — do not add credential fields.
         let file = SessionFile {
             version: SESSION_VERSION,
             created_at: self.created_at.clone(),
@@ -282,8 +294,7 @@ impl Session {
         // Atomic write: write to a temp file first, then rename to avoid
         // corruption if the process is interrupted mid-write.
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        std::fs::write(&tmp, &json).with_context(|| format!("cannot write {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("cannot rename {} to {}", tmp.display(), path.display()))
     }
@@ -575,7 +586,10 @@ mod compress_tests {
         let out = compress_old_tool_results(&msgs);
         // Oldest tool messages truncated; the most recent 3 tool
         // messages kept verbatim.
-        assert!(out[0].content.contains("truncated"), "c1 should be truncated");
+        assert!(
+            out[0].content.contains("truncated"),
+            "c1 should be truncated"
+        );
         assert_eq!(out[2].content, big, "c2 should be untouched (recent)");
         assert_eq!(out[4].content, big, "c3 should be untouched (recent)");
         assert_eq!(out[6].content, "recent small", "c4 should be untouched");

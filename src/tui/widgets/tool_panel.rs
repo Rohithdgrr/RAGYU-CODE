@@ -45,7 +45,10 @@ pub fn build_lines(
             Style::default().fg(t.text_muted),
         ),
     ]));
-    lines.push(Line::styled("─".repeat(20), Style::default().fg(t.border_default)));
+    lines.push(Line::styled(
+        "─".repeat(20),
+        Style::default().fg(t.border_default),
+    ));
 
     for tool in tools {
         let (icon, icon_style) = if tool.enabled {
@@ -58,10 +61,7 @@ pub fn build_lines(
             (icons::CHECK, t.text_muted)
         };
         lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {icon} "),
-                icon_style,
-            ),
+            Span::styled(format!(" {icon} "), icon_style),
             Span::styled(
                 tool.name.clone(),
                 if tool.enabled {
@@ -75,15 +75,16 @@ pub fn build_lines(
 
     // ── Live activity ──
     lines.push(Line::default());
-    lines.push(Line::from(vec![
-        Span::styled(
-            " ACTIVITY",
-            Style::default()
-                .fg(t.accent_secondary)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::styled("─".repeat(20), Style::default().fg(t.border_default)));
+    lines.push(Line::from(vec![Span::styled(
+        " ACTIVITY",
+        Style::default()
+            .fg(t.accent_secondary)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::styled(
+        "─".repeat(20),
+        Style::default().fg(t.border_default),
+    ));
 
     if activity.is_empty() {
         lines.push(Line::styled(
@@ -112,10 +113,7 @@ pub fn build_lines(
         }
         if running > 0 {
             summary.push(Span::raw(" "));
-            summary.push(Span::styled(
-                format!("… {running}"),
-                t.warning(),
-            ));
+            summary.push(Span::styled(format!("… {running}"), t.warning()));
         }
         lines.push(Line::from(summary));
 
@@ -126,23 +124,22 @@ pub fn build_lines(
                 Some(true) => (icons::CHECK, t.success()),
                 Some(false) => (icons::CROSS, t.error()),
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {icon}"), style),
-            ]));
+            lines.push(Line::from(vec![Span::styled(format!("  {icon}"), style)]));
         }
     }
 
     // ── Session stats ──
     lines.push(Line::default());
-    lines.push(Line::from(vec![
-        Span::styled(
-            " STATUS",
-            Style::default()
-                .fg(t.accent_secondary)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::styled("─".repeat(20), Style::default().fg(t.border_default)));
+    lines.push(Line::from(vec![Span::styled(
+        " STATUS",
+        Style::default()
+            .fg(t.accent_secondary)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::styled(
+        "─".repeat(20),
+        Style::default().fg(t.border_default),
+    ));
 
     for (icon, label, value) in [
         (icons::TURNS, "Turns", turns.to_string()),
@@ -150,17 +147,13 @@ pub fn build_lines(
         (icons::LATENCY, "Avg", format!("{avg_latency_ms}ms")),
     ] {
         lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {icon} "),
-                Style::default().fg(t.text_muted),
-            ),
-            Span::styled(
-                format!("{label}: "),
-                Style::default().fg(t.text_muted),
-            ),
+            Span::styled(format!(" {icon} "), Style::default().fg(t.text_muted)),
+            Span::styled(format!("{label}: "), Style::default().fg(t.text_muted)),
             Span::styled(
                 value,
-                Style::default().fg(t.text_primary).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(t.text_primary)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
     }
@@ -230,7 +223,12 @@ mod tests {
         let lines = build_lines(&tools, &[], 4, 1, 250);
         let joined: String = lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("read_file"));

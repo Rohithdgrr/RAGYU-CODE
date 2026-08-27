@@ -6,6 +6,7 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// URL (https://...) or "local:port" for a running dev server.
     pub target: String,
@@ -19,7 +20,10 @@ pub struct Args {
 pub async fn run(base: &Path, args: Args) -> anyhow::Result<String> {
     let out_dir = base.join(".govinda").join("screenshots");
     std::fs::create_dir_all(&out_dir)?;
-    let path = out_dir.join(format!("shot-{}.png", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    let path = out_dir.join(format!(
+        "shot-{}.png",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
     // Try to find a headless browser
     let candidates: &[&str] = if cfg!(windows) {
         &[
@@ -28,9 +32,16 @@ pub async fn run(base: &Path, args: Args) -> anyhow::Result<String> {
             r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
         ]
     } else {
-        &["/usr/bin/chromium", "/usr/bin/google-chrome", "/usr/bin/chromium-browser", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+        &[
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
     };
-    let browser = candidates.iter().find(|p| std::path::Path::new(*p).exists());
+    let browser = candidates
+        .iter()
+        .find(|p| std::path::Path::new(*p).exists());
     let Some(browser) = browser else {
         anyhow::bail!(
             "no headless browser found. Install Chrome/Edge/Chromium, or set CHROME_PATH env var to the binary. Tried: {:?}",
@@ -43,7 +54,11 @@ pub async fn run(base: &Path, args: Args) -> anyhow::Result<String> {
         .arg(format!("--screenshot={path_str}"))
         .arg("--hide-scrollbars")
         .arg("--disable-gpu")
-        .arg(if args.full_page { "--full-page" } else { "--window-size=1280,720" })
+        .arg(if args.full_page {
+            "--full-page"
+        } else {
+            "--window-size=1280,720"
+        })
         .arg("--virtual-time-budget=5000");
     // SECURITY: only allow http(s) URLs to mitigate SSRF to local/private addresses
     if !args.target.starts_with("http://") && !args.target.starts_with("https://") {
@@ -61,19 +76,36 @@ pub async fn run(base: &Path, args: Args) -> anyhow::Result<String> {
     let output = cmd.output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Ok(format!("{{\"ok\":false,\"error\":{}}}", serde_json::Value::String(truncate(&stderr, 500))));
+        return Ok(format!(
+            "{{\"ok\":false,\"error\":{}}}",
+            serde_json::Value::String(truncate(&stderr, 500))
+        ));
     }
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    Ok(format!("{{\"ok\":true,\"path\":\"{}\",\"bytes\":{},\"selector\":{}}}", path.display(), bytes, args.selector.as_deref().map(|s| format!("\"{s}\"")).unwrap_or_else(|| "null".into())))
+    Ok(format!(
+        "{{\"ok\":true,\"path\":\"{}\",\"bytes\":{},\"selector\":{}}}",
+        path.display(),
+        bytes,
+        args.selector
+            .as_deref()
+            .map(|s| format!("\"{s}\""))
+            .unwrap_or_else(|| "null".into())
+    ))
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_owned() }
-    else { let mut out: String = s.chars().take(max).collect(); out.push('…'); out }
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn noop() { /* requires a real browser; covered by integration tests */ }
+    fn noop() { /* requires a real browser; covered by integration tests */
+    }
 }

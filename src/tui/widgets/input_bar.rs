@@ -33,7 +33,11 @@ pub fn filtered(input: &str) -> Vec<&'static str> {
         return Vec::new();
     }
     // only the first token matters, before any whitespace
-    let token = input.split_whitespace().next().unwrap_or(input).to_ascii_lowercase();
+    let token = input
+        .split_whitespace()
+        .next()
+        .unwrap_or(input)
+        .to_ascii_lowercase();
     if token.is_empty() || token == "/" {
         return commands::SLASH_COMMANDS.to_vec();
     }
@@ -102,14 +106,24 @@ pub fn at_mention_files(query: &str) -> Vec<String> {
             let name = entry.file_name().to_string_lossy().to_string();
             let is_dir = path.is_dir();
             // Skip hidden and common ignore dirs
-            if name.starts_with('.') || name == "target" || name == "node_modules" || name == ".git" {
+            if name.starts_with('.') || name == "target" || name == "node_modules" || name == ".git"
+            {
                 continue;
             }
-            let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
             if ignore.matches(&rel, is_dir) {
                 continue;
             }
-            if !is_dir && (query.is_empty() || name.to_ascii_lowercase().contains(&query.to_ascii_lowercase())) {
+            if !is_dir
+                && (query.is_empty()
+                    || name
+                        .to_ascii_lowercase()
+                        .contains(&query.to_ascii_lowercase()))
+            {
                 results.push(rel);
             }
             if is_dir {
@@ -136,7 +150,9 @@ pub fn palette_lines(input: &str, selected: usize, hovered: Option<usize>) -> Ve
     let max_show = 12usize.min(total);
     let sel = selected.min(total.saturating_sub(1));
     // window so selected is visible
-    let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
+    let start = sel
+        .saturating_sub(max_show / 2)
+        .min(total.saturating_sub(max_show));
     let end = (start + max_show).min(total);
     let mut out = Vec::new();
     // header with window info
@@ -147,12 +163,18 @@ pub fn palette_lines(input: &str, selected: usize, hovered: Option<usize>) -> Ve
     };
     out.push(Line::styled(
         header,
-        Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(t.text_muted)
+            .bg(t.bg_tertiary)
+            .add_modifier(Modifier::BOLD),
     ));
     if start > 0 {
         out.push(Line::styled(
             format!("  {} {} more", "\u{f077}", start), // chevron-up
-            Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(t.text_muted)
+                .bg(t.bg_tertiary)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
     for (idx, cmd) in hits[start..end].iter().enumerate() {
@@ -166,7 +188,11 @@ pub fn palette_lines(input: &str, selected: usize, hovered: Option<usize>) -> Ve
         } else {
             t.bg_tertiary
         };
-        let fg = if is_sel { t.accent_primary } else { t.text_secondary };
+        let fg = if is_sel {
+            t.accent_primary
+        } else {
+            t.text_secondary
+        };
         let mut style = Style::default().fg(fg).bg(bg);
         if is_sel {
             style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
@@ -176,16 +202,34 @@ pub fn palette_lines(input: &str, selected: usize, hovered: Option<usize>) -> Ve
         let icon = icons::command(cmd);
         let marker = if is_sel { "▸" } else { " " };
         out.push(Line::from(vec![
-            Span::styled(format!("{marker} "), Style::default().fg(t.accent_primary).bg(bg)),
-            Span::styled(format!("{icon} "), Style::default().fg(if is_sel { t.accent_primary } else { t.text_muted }).bg(bg)),
+            Span::styled(
+                format!("{marker} "),
+                Style::default().fg(t.accent_primary).bg(bg),
+            ),
+            Span::styled(
+                format!("{icon} "),
+                Style::default()
+                    .fg(if is_sel {
+                        t.accent_primary
+                    } else {
+                        t.text_muted
+                    })
+                    .bg(bg),
+            ),
             Span::styled(*cmd, style),
-            Span::styled(format!("  {desc}"), Style::default().fg(t.text_muted).bg(bg)),
+            Span::styled(
+                format!("  {desc}"),
+                Style::default().fg(t.text_muted).bg(bg),
+            ),
         ]));
     }
     if end < total {
         out.push(Line::styled(
             format!("  {} {} more", "\u{f078}", total - end), // chevron-down
-            Style::default().fg(t.text_muted).bg(t.bg_tertiary).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(t.text_muted)
+                .bg(t.bg_tertiary)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
     out
@@ -200,6 +244,7 @@ pub fn describe(cmd: &str) -> &'static str {
         "/models" => "list models",
         "/model" => "switch model",
         "/router" => "router status / failover",
+        "/stats" => "session stats",
         "/history" => "show history",
         "/retry" => "retry last",
         "/save" => "save session",
@@ -290,7 +335,10 @@ pub fn footer_hint(has_ghost: bool, focus_input: bool, confirm_pending: bool) ->
 
     if confirm_pending {
         return Line::from(vec![
-            Span::styled(format!(" {} ", icons::MODE_REVIEW), Style::default().fg(t.accent_warning).bg(t.bg_tertiary)),
+            Span::styled(
+                format!(" {} ", icons::MODE_REVIEW),
+                Style::default().fg(t.accent_warning).bg(t.bg_tertiary),
+            ),
             Span::styled(" y approve ", key_style),
             Span::styled(" n decline ", key_style),
             Span::styled(" a all ", key_style),
@@ -298,7 +346,10 @@ pub fn footer_hint(has_ghost: bool, focus_input: bool, confirm_pending: bool) ->
     }
     if has_ghost {
         return Line::from(vec![
-            Span::styled(" ↹ ", Style::default().fg(t.accent_success).bg(t.bg_tertiary)),
+            Span::styled(
+                " ↹ ",
+                Style::default().fg(t.accent_success).bg(t.bg_tertiary),
+            ),
             Span::styled(" Tab ", key_style),
             Span::styled(" to complete  ", muted),
             Span::styled(" Esc ", key_style),
@@ -318,7 +369,11 @@ pub fn footer_hint(has_ghost: bool, focus_input: bool, confirm_pending: bool) ->
 /// Builds the bordered input block plus the styled input line.
 ///
 /// Returns `(block_title_spans, input_line, completion_ghost)`.
-pub fn build(mode: AppMode, focus_input: bool, input: &str) -> (String, Line<'static>, Option<String>) {
+pub fn build(
+    mode: AppMode,
+    focus_input: bool,
+    input: &str,
+) -> (String, Line<'static>, Option<String>) {
     let t = theme::active();
 
     let border_color = if !focus_input {
@@ -352,7 +407,10 @@ pub fn build(mode: AppMode, focus_input: bool, input: &str) -> (String, Line<'st
         // rich placeholder: higher contrast for light glass
         spans.push(Span::styled(
             "Ask me to code, debug, or explain…",
-            Style::default().fg(t.text_secondary).bg(t.bg_tertiary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(t.text_secondary)
+                .bg(t.bg_tertiary)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             "  ·  try \"/\" for commands",

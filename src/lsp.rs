@@ -49,11 +49,20 @@ impl Diagnostic {
         match self.code.as_deref() {
             Some(code) if !code.is_empty() => format!(
                 "{}:{}:{}: {} {} [{}]",
-                self.file, self.line, self.column, self.severity.icon(), self.message, code
+                self.file,
+                self.line,
+                self.column,
+                self.severity.icon(),
+                self.message,
+                code
             ),
             _ => format!(
                 "{}:{}:{}: {} {}",
-                self.file, self.line, self.column, self.severity.icon(), self.message
+                self.file,
+                self.line,
+                self.column,
+                self.severity.icon(),
+                self.message
             ),
         }
     }
@@ -75,7 +84,9 @@ pub fn parse_rust_diagnostics(output: &str) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     // Pattern: error[E0001]: message\n  --> file.rs:line:col
     // or: warning: message\n  --> file.rs:line:col
-    let re = match Regex::new(r"(error|warning|note|help)\[?(\w*)\]?: (.+?)\n\s+--> (.+?):(\d+):(\d+)") {
+    let re = match Regex::new(
+        r"(error|warning|note|help)\[?(\w*)\]?: (.+?)\n\s+--> (.+?):(\d+):(\d+)",
+    ) {
         Ok(r) => r,
         Err(_) => return diagnostics,
     };
@@ -88,11 +99,26 @@ pub fn parse_rust_diagnostics(output: &str) -> Vec<Diagnostic> {
             Some("help") => Severity::Hint,
             _ => Severity::Info,
         };
-        let code = cap.get(2).map(|m| m.as_str().to_owned()).filter(|s| !s.is_empty());
-        let message = cap.get(3).map(|m| m.as_str().to_owned()).unwrap_or_default();
-        let file = cap.get(4).map(|m| m.as_str().to_owned()).unwrap_or_default();
-        let line = cap.get(5).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
-        let column = cap.get(6).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let code = cap
+            .get(2)
+            .map(|m| m.as_str().to_owned())
+            .filter(|s| !s.is_empty());
+        let message = cap
+            .get(3)
+            .map(|m| m.as_str().to_owned())
+            .unwrap_or_default();
+        let file = cap
+            .get(4)
+            .map(|m| m.as_str().to_owned())
+            .unwrap_or_default();
+        let line = cap
+            .get(5)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let column = cap
+            .get(6)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
 
         diagnostics.push(Diagnostic {
             file,
@@ -122,11 +148,23 @@ pub fn parse_typescript_diagnostics(output: &str) -> Vec<Diagnostic> {
             _ => Severity::Info,
         };
         diagnostics.push(Diagnostic {
-            file: cap.get(1).map(|m| m.as_str().to_owned()).unwrap_or_default(),
-            line: cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0),
-            column: cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0),
+            file: cap
+                .get(1)
+                .map(|m| m.as_str().to_owned())
+                .unwrap_or_default(),
+            line: cap
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0),
+            column: cap
+                .get(3)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0),
             severity,
-            message: cap.get(6).map(|m| m.as_str().to_owned()).unwrap_or_default(),
+            message: cap
+                .get(6)
+                .map(|m| m.as_str().to_owned())
+                .unwrap_or_default(),
             code: cap.get(5).map(|m| m.as_str().to_owned()),
         });
     }
@@ -150,11 +188,20 @@ pub fn parse_python_diagnostics(output: &str) -> Vec<Diagnostic> {
             _ => Severity::Info,
         };
         diagnostics.push(Diagnostic {
-            file: cap.get(1).map(|m| m.as_str().to_owned()).unwrap_or_default(),
-            line: cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0),
+            file: cap
+                .get(1)
+                .map(|m| m.as_str().to_owned())
+                .unwrap_or_default(),
+            line: cap
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0),
             column: 0,
             severity,
-            message: cap.get(4).map(|m| m.as_str().to_owned()).unwrap_or_default(),
+            message: cap
+                .get(4)
+                .map(|m| m.as_str().to_owned())
+                .unwrap_or_default(),
             code: None,
         });
     }
@@ -167,13 +214,9 @@ pub async fn run_diagnostics(workspace: &Path) -> Result<Vec<Diagnostic>> {
         run_cargo_check(workspace).await?
     } else if workspace.join("tsconfig.json").is_file() {
         run_tsc_check(workspace).await?
-    } else if [
-        "pyproject.toml",
-        "setup.py",
-        "requirements.txt",
-    ]
-    .iter()
-    .any(|f| workspace.join(f).is_file())
+    } else if ["pyproject.toml", "setup.py", "requirements.txt"]
+        .iter()
+        .any(|f| workspace.join(f).is_file())
     {
         run_mypy_check(workspace).await?
     } else {
@@ -181,7 +224,10 @@ pub async fn run_diagnostics(workspace: &Path) -> Result<Vec<Diagnostic>> {
     };
 
     let diagnostics = if workspace.join("Cargo.toml").is_file() {
-        parse_rust_diagnostics(&output)
+        let output_clone = output.clone();
+        tokio::task::spawn_blocking(move || parse_rust_diagnostics(&output_clone))
+            .await
+            .context("parse_rust_diagnostics blocking task panicked")?
     } else if workspace.join("tsconfig.json").is_file() {
         parse_typescript_diagnostics(&output)
     } else {
@@ -238,10 +284,7 @@ async fn run_mypy_check(workspace: &Path) -> Result<String> {
 }
 
 /// Looks up a symbol definition by name using the symbol index.
-pub fn go_to_definition(
-    name: &str,
-    workspace: &Path,
-) -> Option<SymbolDef> {
+pub fn go_to_definition(name: &str, workspace: &Path) -> Option<SymbolDef> {
     let index = crate::symbols::ensure(workspace);
     let hits = index.find(name, None);
     hits.into_iter().next().map(|hit| SymbolDef {
@@ -257,8 +300,14 @@ pub fn go_to_definition(
 /// Formats diagnostics for display in the TUI.
 pub fn format_diagnostics(diagnostics: &[Diagnostic], max_display: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    let errors = diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-    let warnings = diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+    let errors = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
+    let warnings = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .count();
 
     if errors > 0 || warnings > 0 {
         lines.push(format!("{} error(s), {} warning(s)", errors, warnings));
@@ -291,7 +340,8 @@ mod tests {
 
     #[test]
     fn parse_typescript_error() {
-        let output = "src/app.ts(15,3): error TS2322: Type 'string' is not assignable to type 'number'.\n";
+        let output =
+            "src/app.ts(15,3): error TS2322: Type 'string' is not assignable to type 'number'.\n";
         let diagnostics = parse_typescript_diagnostics(output);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Severity::Error);

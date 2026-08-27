@@ -13,6 +13,9 @@ const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_RENDER_MARKDOWN: bool = true;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_LIMIT_MB: u64 = 16;
+/// Current config schema version — bump when the TOML layout changes and
+/// add a migration in `read_config_file`. Written by `save_runtime_config`.
+pub const CURRENT_CONFIG_VERSION: u32 = 1;
 
 /// Parses a config TOML string through the real schema. Test hook used to
 /// prove `/config save` output loads cleanly.
@@ -27,6 +30,7 @@ pub(crate) fn parse_file_config_for_test(raw: &str) -> Result<()> {
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
+    config_version: Option<u32>,
     model: Option<String>,
     temperature: Option<f32>,
     render_markdown: Option<bool>,
@@ -63,8 +67,13 @@ struct FileConfig {
     protocol_require_gates: Option<bool>,
 }
 
+/// Never derive `Debug` for `Config` — the `api_key` field is a
+/// `Zeroizing<String>` and must never be printed. A manual impl redacts it.
 #[derive(Clone)]
 pub struct Config {
+    /// API key, zeroized on drop. Never log, serialize, or clone into a
+    /// plain `String`. Borrow via `provider.auth().token()` or `api_key.as_str()`
+    /// only when building a request, and wrap any owned copy in `Zeroizing`.
     pub api_key: Arc<Zeroizing<String>>,
     pub model: String,
     pub temperature: f32,
@@ -87,6 +96,17 @@ pub struct Config {
     pub limit_mb: u64,
     /// GOVINDA Protocol settings — see `govinda_protocol::ProtocolConfig`.
     pub protocol: crate::govinda_protocol::ProtocolConfig,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("provider", &self.provider.key())
+            .field("source_path", &self.source_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
@@ -116,7 +136,8 @@ impl Config {
         // A saved OpenCode-backed provider (`opencode-<pid>` + base_url)
         // reloads through the bridge, pulling its key from OpenCode's own
         // credential store instead of the environment.
-        let provider: Arc<dyn Provider> = if provider_name.starts_with(crate::opencode::KEY_PREFIX) {
+        let provider: Arc<dyn Provider> = if provider_name.starts_with(crate::opencode::KEY_PREFIX)
+        {
             let base_url = file.base_url.as_deref().with_context(|| {
                 format!(
                     "saved provider '{provider_name}' needs a base_url in config.toml — run '/opencode connect' to repair"
@@ -132,9 +153,13 @@ impl Config {
             )
             .context("provider setup failed")?
         };
-        let api_key = Arc::new(Zeroizing::new(
-            provider.auth().token().unwrap_or_default().to_owned(),
-        ));
+        // Borrow the provider's Zeroizing token directly — avoids an intermediate
+        // plain String that would linger on the heap. `Auth::Bearer` already
+        // holds a `Zeroizing<String>`; cloning it keeps the zeroize guarantee.
+        let api_key = match provider.auth() {
+            crate::provider::Auth::Bearer(t) => Arc::new(t),
+            crate::provider::Auth::None => Arc::new(Zeroizing::new(String::new())),
+        };
 
         let model = env_override("GOVINDA_MODEL")
             .or_else(|| env_override("MISTRAL_MODEL"))
@@ -221,9 +246,10 @@ impl Config {
     /// Used by OpenCode connect/auto-connect (the `/provider` path replaces
     /// the whole `Config`'s provider field directly).
     pub fn adopt_provider(&mut self, provider: Arc<dyn Provider>) {
-        self.api_key = Arc::new(Zeroizing::new(
-            provider.auth().token().unwrap_or_default().to_owned(),
-        ));
+        self.api_key = match provider.auth() {
+            crate::provider::Auth::Bearer(t) => Arc::new(t),
+            crate::provider::Auth::None => Arc::new(Zeroizing::new(String::new())),
+        };
         self.provider = provider;
     }
 
@@ -249,8 +275,23 @@ impl Config {
         }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        let parsed: FileConfig =
+        let mut parsed: FileConfig =
             toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
+        // Version gate — reject configs from a newer CLI that we cannot migrate
+        // forward, and normalize missing versions to CURRENT.
+        if let Some(v) = parsed.config_version {
+            if v > CURRENT_CONFIG_VERSION {
+                anyhow::bail!(
+                    "config version {v} in {} is newer than supported {CURRENT_CONFIG_VERSION} — update govinda-cli",
+                    path.display()
+                );
+            }
+            // Future migrations: match (v, CURRENT_CONFIG_VERSION) { (1,2) => migrate... }
+        } else {
+            // Old configs without a version are implicitly v1 — stamp them so
+            // the next `save_runtime_config` persists the marker.
+            parsed.config_version = Some(CURRENT_CONFIG_VERSION);
+        }
         Ok((parsed, Some(path)))
     }
 

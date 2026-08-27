@@ -1366,6 +1366,7 @@ impl ToolExecutor for BuiltinTools {
                     // shared capture path. This keeps the on-disk format in one place
                     // and the TUI's panel updates the same way it does for slash input.
                     #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
                     struct TodoArgs {
                         action: String,
                         text: Option<String>,
@@ -1382,7 +1383,7 @@ impl ToolExecutor for BuiltinTools {
                     }
                     if let Some(i) = args.index {
                         line.push(' ');
-                            line.push_str(&i.to_string());
+                        line.push_str(&i.to_string());
                     }
                     // Run through the REPL dispatcher; capture prints via the
                     // shared output helpers so the result is a plain string the
@@ -1553,7 +1554,8 @@ impl ToolExecutor for BuiltinTools {
                     let ops: Vec<EditOp> = pending.ops().to_vec();
                     let n = ops.len();
                     let paths: Vec<String> = ops.iter().map(|o| o.path().to_owned()).collect();
-                    let unique: std::collections::BTreeSet<String> = paths.iter().cloned().collect();
+                    let unique: std::collections::BTreeSet<String> =
+                        paths.iter().cloned().collect();
                     // Drop the lock before mutating disk.
                     drop(pending);
                     let result = apply_ops_to_disk(&cwd, &ops)?;
@@ -1617,7 +1619,9 @@ impl ToolExecutor for BuiltinTools {
                     let scope = args.path.as_deref().unwrap_or(".");
                     let fmt = args.format.as_deref().unwrap_or("errors_only");
                     if diagnostics.is_empty() {
-                        return Ok(format!("no diagnostics in scope '{scope}' — code looks clean"));
+                        return Ok(format!(
+                            "no diagnostics in scope '{scope}' — code looks clean"
+                        ));
                     }
                     if fmt == "summary" {
                         let mut counts: std::collections::BTreeMap<&str, (usize, usize)> =
@@ -1641,7 +1645,10 @@ impl ToolExecutor for BuiltinTools {
                         Ok(lines.join("\n"))
                     } else if fmt == "full" {
                         let formatted = crate::lsp::format_diagnostics(&diagnostics, 50);
-                        Ok(format!("diagnostics for '{scope}':\n{}", formatted.join("\n")))
+                        Ok(format!(
+                            "diagnostics for '{scope}':\n{}",
+                            formatted.join("\n")
+                        ))
                     } else {
                         // errors_only (default)
                         let errs: Vec<&crate::lsp::Diagnostic> = diagnostics
@@ -1656,10 +1663,12 @@ impl ToolExecutor for BuiltinTools {
                                 "(none)".to_owned()
                             } else {
                                 errs.iter()
-                                    .map(|d| format!(
-                                        "  {}:{}:{}: {}",
-                                        d.file, d.line, d.column, d.message
-                                    ))
+                                    .map(|d| {
+                                        format!(
+                                            "  {}:{}:{}: {}",
+                                            d.file, d.line, d.column, d.message
+                                        )
+                                    })
                                     .collect::<Vec<_>>()
                                     .join("\n")
                             }
@@ -1737,15 +1746,24 @@ impl ToolExecutor for BuiltinTools {
                 "ask_user" => {
                     let args: AskUserArgs = parse_args(arguments_json)?;
                     // In non-interactive mode, return a default answer
-                    bail!("ask_user requires interactive mode — user input is needed: {}", args.question);
+                    bail!(
+                        "ask_user requires interactive mode — user input is needed: {}",
+                        args.question
+                    );
                 }
                 "delegate_task" => {
                     let args: DelegateTaskArgs = parse_args(arguments_json)?;
-                    let cwd = std::env::current_dir().context("cannot resolve working directory")?;
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
                     let overview = crate::scan::scan(&cwd).await;
+                    let combined_context = match &args.context {
+                        Some(c) if !c.trim().is_empty() => {
+                            format!("{overview}\n\nAdditional context:\n{c}")
+                        }
+                        _ => overview,
+                    };
                     let http = crate::config::Config::http_client()
                         .context("failed to build HTTP client for delegation")?;
-                    // Resolve provider from env (same as main app startup).
                     let provider = crate::provider::resolve(
                         &std::env::var("GOVINDA_PROVIDER")
                             .unwrap_or_else(|_| crate::config::DEFAULT_PROVIDER.to_owned()),
@@ -1754,22 +1772,35 @@ impl ToolExecutor for BuiltinTools {
                         |name| std::env::var(format!("{name}_API_KEY")).ok(),
                     )
                     .context("provider setup failed for delegation")?;
-                    let result = crate::swarm::explore(&args.task, &http, provider.as_ref(), &overview).await;
+                    let timeout_secs = args.timeout_secs.unwrap_or(60).clamp(1, 300);
+                    let fut = crate::swarm::explore(
+                        &args.task,
+                        &http,
+                        provider.as_ref(),
+                        &combined_context,
+                    );
+                    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await;
                     match result {
-                        Ok(output) => Ok(format!("{{\"task\":\"{}\",\"status\":\"completed\",\"output\":{}}}", args.task, serde_json::json!(output))),
-                        Err(e) => Ok(format!("{{\"task\":\"{}\",\"status\":\"failed\",\"error\":\"{}\"}}", args.task, e)),
+                        Ok(Ok(output)) => Ok(format!(
+                            "{{\"task\":{},\"status\":\"completed\",\"output\":{}}}",
+                            serde_json::json!(args.task),
+                            serde_json::json!(output)
+                        )),
+                        Ok(Err(e)) => Ok(format!(
+                            "{{\"task\":{},\"status\":\"failed\",\"error\":{}}}",
+                            serde_json::json!(args.task),
+                            serde_json::json!(format!("{e:#}"))
+                        )),
+                        Err(_) => Ok(format!(
+                            "{{\"task\":{},\"status\":\"timeout\",\"error\":\"subagent timed out after {timeout_secs}s\"}}",
+                            serde_json::json!(args.task)
+                        )),
                     }
                 }
-                "show_token_budget" => {
-                    Ok(crate::tokens::budget_summary().unwrap_or_else(|_| {
-                        "token counter unavailable".to_owned()
-                    }))
-                }
-                "show_capabilities" => {
-                    Ok(crate::commands::capabilities_summary().unwrap_or_else(|_| {
-                        "capability summary unavailable".to_owned()
-                    }))
-                }
+                "show_token_budget" => Ok(crate::tokens::budget_summary()
+                    .unwrap_or_else(|_| "token counter unavailable".to_owned())),
+                "show_capabilities" => Ok(crate::commands::capabilities_summary()
+                    .unwrap_or_else(|_| "capability summary unavailable".to_owned())),
                 "remember" => {
                     let args: RememberArgs = parse_args(arguments_json)?;
                     crate::memory::append_note(&args.note);
@@ -1781,14 +1812,12 @@ impl ToolExecutor for BuiltinTools {
                     if removed > 0 {
                         Ok(format!("removed {removed} matching note(s)"))
                     } else {
-                        Ok(format!(
-                            "no note matched '{}' — nothing removed",
-                            args.note
-                        ))
+                        Ok(format!("no note matched '{}' — nothing removed", args.note))
                     }
                 }
                 "quality_gate_check" => {
                     #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
                     struct QualityGateArgs {
                         phase: String,
                         files_delivered: Option<Vec<String>>,
@@ -1797,22 +1826,32 @@ impl ToolExecutor for BuiltinTools {
                     }
                     let args: QualityGateArgs = parse_args(arguments_json)?;
                     let phase = match args.phase.as_str() {
-                        "INSTRUCTION_INGESTION" => crate::govinda_protocol::ProjectPhase::InstructionIngestion,
-                        "PROJECT_INTELLIGENCE" => crate::govinda_protocol::ProjectPhase::ProjectAnalysis,
-                        "ARCHITECTURE_ROADMAP" => crate::govinda_protocol::ProjectPhase::ArchitectureRoadmap,
+                        "INSTRUCTION_INGESTION" => {
+                            crate::govinda_protocol::ProjectPhase::InstructionIngestion
+                        }
+                        "PROJECT_INTELLIGENCE" => {
+                            crate::govinda_protocol::ProjectPhase::ProjectAnalysis
+                        }
+                        "ARCHITECTURE_ROADMAP" => {
+                            crate::govinda_protocol::ProjectPhase::ArchitectureRoadmap
+                        }
                         "DESIGN_SYSTEM" => crate::govinda_protocol::ProjectPhase::DesignSystem,
-                        "DEVELOPMENT_PLAN" => crate::govinda_protocol::ProjectPhase::DevelopmentPlan,
+                        "DEVELOPMENT_PLAN" => {
+                            crate::govinda_protocol::ProjectPhase::DevelopmentPlan
+                        }
                         "IMPLEMENTATION" => crate::govinda_protocol::ProjectPhase::Implementation,
-                        "SELF_VERIFICATION" => crate::govinda_protocol::ProjectPhase::SelfVerification,
-                        "FINAL_VALIDATION" => crate::govinda_protocol::ProjectPhase::FinalValidation,
+                        "SELF_VERIFICATION" => {
+                            crate::govinda_protocol::ProjectPhase::SelfVerification
+                        }
+                        "FINAL_VALIDATION" => {
+                            crate::govinda_protocol::ProjectPhase::FinalValidation
+                        }
                         other => bail!("unknown phase '{other}'"),
                     };
                     let config = crate::govinda_protocol::ProtocolConfig::default();
-                    let cwd = std::env::current_dir()
-                        .context("cannot resolve working directory")?;
-                    let files: Vec<String> = args
-                        .files_delivered
-                        .unwrap_or_default();
+                    let cwd =
+                        std::env::current_dir().context("cannot resolve working directory")?;
+                    let files: Vec<String> = args.files_delivered.unwrap_or_default();
                     let result = crate::govinda_protocol::run_quality_gate(
                         phase,
                         &files,
@@ -1859,8 +1898,11 @@ impl ToolExecutor for BuiltinTools {
                     Some(def) => run_shell_tool(def, arguments_json).await,
                     None => {
                         // Try the GOVINDA toolbox (18 high-leverage tools).
-                        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                        if let Some(result) = crate::toolbox::registry::dispatch(other, arguments_json, &cwd) {
+                        let cwd = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        if let Some(result) =
+                            crate::toolbox::registry::dispatch(other, arguments_json, &cwd)
+                        {
                             match result {
                                 Ok(s) => Ok(s),
                                 Err(e) => bail!("toolbox tool '{other}' failed: {e:#}"),
@@ -1876,17 +1918,20 @@ impl ToolExecutor for BuiltinTools {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CountTokensArgs {
     text: String,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CurrentTimeArgs {
     timezone: Option<String>,
     format: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadFileArgs {
     path: String,
     offset_line: Option<usize>,
@@ -1897,29 +1942,34 @@ struct ReadFileArgs {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteFileArgs {
     pub path: String,
     pub content: String,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeleteFileArgs {
     path: String,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MoveFileArgs {
     from: String,
     to: String,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CopyFileArgs {
     from: String,
     to: String,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListFilesArgs {
     path: Option<String>,
     max_entries: Option<usize>,
@@ -1927,17 +1977,20 @@ struct ListFilesArgs {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListDirectoryArgs {
     path: Option<String>,
     include_hidden: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ViewDiffArgs {
     file: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct GrepArgs {
     pattern: String,
@@ -1948,29 +2001,34 @@ struct GrepArgs {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunShellArgs {
     command: String,
     timeout_secs: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunTestArgs {
     filter: Option<String>,
     timeout_secs: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpenPreviewArgs {
     path: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FindSymbolArgs {
     name: String,
     kind: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExplainCodeArgs {
     path: String,
     symbol: Option<String>,
@@ -1978,11 +2036,13 @@ struct ExplainCodeArgs {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GitDiffArgs {
     file: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GitLogArgs {
     max_commits: Option<usize>,
     path: Option<String>,
@@ -1992,24 +2052,28 @@ struct GitLogArgs {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GitBranchArgs {
     action: String,
     name: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GitCommitArgs {
     message: String,
     stage_all: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunDiagnosticsArgs {
     path: Option<String>,
     format: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct WebSearchArgs {
     query: String,
@@ -2018,6 +2082,7 @@ struct WebSearchArgs {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WebFetchArgs {
     url: String,
     max_chars: Option<usize>,
@@ -2026,6 +2091,7 @@ struct WebFetchArgs {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AskUserArgs {
     question: String,
     #[allow(dead_code)]
@@ -2035,6 +2101,7 @@ struct AskUserArgs {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DelegateTaskArgs {
     task: String,
     #[allow(dead_code)]
@@ -2044,11 +2111,13 @@ struct DelegateTaskArgs {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RememberArgs {
     note: String,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ForgetArgs {
     note: String,
 }
@@ -2091,11 +2160,11 @@ async fn web_search_tool(args: WebSearchArgs) -> Result<String> {
         }
         // Extract URL
         let Some(href_start) = block.find("href=") else {
-            continue
+            continue;
         };
         let href_rest = &block[href_start + 6..];
         let Some(url_end) = href_rest.find(['"', '\'', ' ']) else {
-            continue
+            continue;
         };
         let result_url = &href_rest[..url_end];
         // Extract title (inside <a> tag)
@@ -2141,11 +2210,11 @@ async fn web_search_tool(args: WebSearchArgs) -> Result<String> {
             query
         ))
     } else {
-        Ok(format!(
-            "{{\"query\":\"{}\",\"results\":{}}}",
-            query,
-            results.len()
-        ) + "\n\n" + &results.join("\n\n"))
+        Ok(
+            format!("{{\"query\":\"{}\",\"results\":{}}}", query, results.len())
+                + "\n\n"
+                + &results.join("\n\n"),
+        )
     }
 }
 
@@ -2168,29 +2237,17 @@ fn strip_html_tags(html: &str) -> String {
 }
 
 /// `web_fetch`: fetches a URL and returns the readable text content.
+///
+/// SSRF is blocked at two layers:
+/// - `ensure_safe_url_with_dns` checks literal IPs (`0.0.0.0`, `::1`,
+///   `127.*`, `10.*`, `192.168.*`, `169.254.*`, `172.16-31.*`, `::ffff:*`)
+///   plus DNS rebinding (resolves the host and rejects private IPs).
+/// - `redirect_policy` re-validates every redirect target.
 async fn web_fetch_tool(args: WebFetchArgs) -> Result<String> {
     let url = args.url.trim();
     anyhow::ensure!(!url.is_empty(), "url must not be empty");
-    anyhow::ensure!(
-        url.starts_with("http://") || url.starts_with("https://"),
-        "url must start with http:// or https://"
-    );
-    // SSRF protection: block requests to private/loopback/link-local IPs.
-    if let Ok(parsed) = url::Url::parse(url)
-        && let Some(host) = parsed.host_str() {
-            let h = host.to_lowercase();
-            anyhow::ensure!(
-                !h.starts_with("127.")
-                    && !h.starts_with("10.")
-                    && !h.starts_with("192.168.")
-                    && !h.starts_with("172.")
-                    && h != "localhost"
-                    && h != "::1"
-                    && h != "0.0.0.0"
-                    && h != "169.254.169.254",
-                "requests to private/loopback/link-local addresses are blocked"
-            );
-        }
+    // DNS rebinding check: resolves host and rejects private IPs.
+    crate::ssrf::ensure_safe_url_with_dns(url).await?;
     let max_chars = args.max_chars.unwrap_or(20_000).min(100_000);
     let timeout_secs = args.timeout_secs.unwrap_or(15).clamp(1, 60);
     let format = args.format.as_deref().unwrap_or("text");
@@ -2198,7 +2255,7 @@ async fn web_fetch_tool(args: WebFetchArgs) -> Result<String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(timeout_secs))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(crate::ssrf::redirect_policy())
         .user_agent("Mozilla/5.0 (compatible; govinda-cli/1.0)")
         .build()
         .context("failed to build HTTP client for web fetch")?;
@@ -2214,10 +2271,7 @@ async fn web_fetch_tool(args: WebFetchArgs) -> Result<String> {
     // Format passthrough for raw/markdown.
     if format == "html" {
         let truncated = if resp.len() > max_chars {
-            format!(
-                "{}…\n…(truncated to {max_chars} chars)",
-                &resp[..max_chars]
-            )
+            format!("{}…\n…(truncated to {max_chars} chars)", &resp[..max_chars])
         } else {
             resp
         };
@@ -2405,6 +2459,7 @@ async fn run_shell_tool(def: &ShellToolDef, arguments_json: &str) -> Result<Stri
     for word in &def.args_template {
         argv.push(fill_word(word, &values)?);
     }
+    audit_shell(&format!("{} {}", def.command, argv.join(" ")));
 
     let timeout_dur = Duration::from_secs(
         def.timeout_secs
@@ -2614,17 +2669,18 @@ pub fn apply_ops_to_disk(base: &Path, ops: &[EditOp]) -> Result<String> {
     let mut written: Vec<String> = Vec::new();
     for (path, ops) in per_file {
         let full = resolve_in(base, &path)?;
-        let bytes = fs::read(&full)
-            .with_context(|| format!("cannot read '{path}' for apply"))?;
-        anyhow::ensure!(!bytes.contains(&0), "'{path}' looks binary; refusing to apply");
+        let bytes = fs::read(&full).with_context(|| format!("cannot read '{path}' for apply"))?;
+        anyhow::ensure!(
+            !bytes.contains(&0),
+            "'{path}' looks binary; refusing to apply"
+        );
         let original = String::from_utf8_lossy(&bytes).to_string();
         let updated = apply_ops_to_content(&original, &path, &ops)?;
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create parent dir for '{path}'"))?;
         }
-        fs::write(&full, &updated)
-            .with_context(|| format!("cannot write '{path}'"))?;
+        fs::write(&full, &updated).with_context(|| format!("cannot write '{path}'"))?;
         written.push(path);
     }
     Ok(written.join(", "))
@@ -2789,6 +2845,7 @@ pub(crate) fn apply_ops_to_content(
 /// Builds the `EditOp` requested by one of the staging tools.
 fn parse_edit_op(name: &str, arguments_json: &str) -> Result<EditOp> {
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct EditArgs {
         path: String,
         old_string: Option<String>,
@@ -2849,6 +2906,31 @@ fn validate_staged_op(base: &Path, op: &EditOp) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Audit log for shell execution (security)
+// ---------------------------------------------------------------------------
+
+/// Appends a shell command to `.govinda/shell_audit.log` for post-hoc review.
+/// Best-effort: failures are ignored so auditing never breaks the tool.
+/// The log lives in the workspace (`.govinda/`) and is never sent to the model.
+fn audit_shell(command: &str) {
+    let ts = crate::clock::now_iso8601();
+    let line = format!("[{ts}] shell: {command}\n");
+    if let Ok(cwd) = std::env::current_dir() {
+        let dir = cwd.join(".govinda");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("shell_audit.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Execution tools (run_shell / run_test / check_project)
 // ---------------------------------------------------------------------------
 
@@ -2886,7 +2968,12 @@ fn detect_project() -> Option<ProjectKind> {
 /// Runs `program argv…` directly (no shell), enforcing timeout and output
 /// caps. The process inherits the executor's working directory — the project
 /// root — so relative paths inside build tools resolve correctly.
+///
+/// Every invocation is audit-logged to `.govinda/shell_audit.log` even when
+/// running under `--build` auto-approve, so `--build` does not silently
+/// bypass the confirmation trail.
 async fn exec_argv(program: &str, argv: &[String], timeout_secs: u64) -> Result<String> {
+    audit_shell(&format!("{program} {}", argv.join(" ")));
     let timeout_dur = Duration::from_secs(timeout_secs.clamp(1, MAX_SHELL_TIMEOUT_SECS));
     let max_out = MAX_SHELL_OUTPUT_BYTES;
     let started = Instant::now();
@@ -2953,6 +3040,11 @@ fn apply_edits_atomic(base: &Path, ops: &[EditOp]) -> Result<String> {
 }
 
 /// `run_shell`: an arbitrary shell command in the project directory.
+///
+/// Requires user confirmation via `ToolExecutor::requires_confirmation`.
+/// Under `--build` (`GatePolicy::AutoRun`) the confirmation is auto-approved
+/// but the command is still audit-logged to `.govinda/shell_audit.log` so
+/// every shell execution leaves a trace.
 async fn run_shell_command(args: RunShellArgs) -> Result<String> {
     let command = args.command.trim();
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
@@ -2961,6 +3053,8 @@ async fn run_shell_command(args: RunShellArgs) -> Result<String> {
         "command too long (cap {MAX_ARG_VALUE_CHARS} chars)"
     );
     anyhow::ensure!(!command.contains('\0'), "command contains NUL bytes");
+    // Audit every shell invocation, including --build auto-approve.
+    audit_shell(command);
     let timeout = args
         .timeout_secs
         .unwrap_or(DEFAULT_RUN_SHELL_TIMEOUT_SECS)
@@ -3249,7 +3343,11 @@ fn move_file(base: &Path, args: &MoveFileArgs) -> Result<String> {
 fn copy_file(base: &Path, args: &CopyFileArgs) -> Result<String> {
     let from = resolve_in(base, &args.from)?;
     let to = resolve_in(base, &args.to)?;
-    anyhow::ensure!(from.is_file(), "source '{}' is not a regular file", args.from);
+    anyhow::ensure!(
+        from.is_file(),
+        "source '{}' is not a regular file",
+        args.from
+    );
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create parent directory for '{}'", args.to))?;
@@ -3274,10 +3372,7 @@ fn list_files(base: &Path, args: &ListFilesArgs) -> Result<String> {
         .max_entries
         .unwrap_or(DEFAULT_LIST_ENTRIES)
         .clamp(1, MAX_LIST_ENTRIES);
-    let max_depth = args
-        .max_depth
-        .unwrap_or(8)
-        .clamp(1, MAX_WALK_DEPTH);
+    let max_depth = args.max_depth.unwrap_or(8).clamp(1, MAX_WALK_DEPTH);
 
     let mut lines = Vec::new();
     let ignore = crate::ignore::IgnoreRules::load(base);
@@ -3330,8 +3425,8 @@ fn list_directory(base: &Path, args: &ListDirectoryArgs) -> Result<String> {
     let include_hidden = args.include_hidden.unwrap_or(true);
     let ignore = crate::ignore::IgnoreRules::load(base);
 
-    let entries = fs::read_dir(&root)
-        .with_context(|| format!("cannot read directory '{}'", root_arg))?;
+    let entries =
+        fs::read_dir(&root).with_context(|| format!("cannot read directory '{}'", root_arg))?;
     let mut names: Vec<(String, bool)> = entries
         .filter_map(|e| e.ok())
         .map(|e| {
@@ -3823,9 +3918,18 @@ mod tests {
     fn execution_tool_names_need_confirmation() {
         let tools = BuiltinTools::default();
         for name in [
-            "write_file", "delete_file", "move_file", "copy_file",
-            "run_shell", "run_test", "run_diagnostics", "open_preview",
-            "git_commit", "git_branch", "apply_edits", "forget",
+            "write_file",
+            "delete_file",
+            "move_file",
+            "copy_file",
+            "run_shell",
+            "run_test",
+            "run_diagnostics",
+            "open_preview",
+            "git_commit",
+            "git_branch",
+            "apply_edits",
+            "forget",
         ] {
             assert!(tools.requires_confirmation(name), "{name}");
         }
@@ -3851,8 +3955,10 @@ mod tests {
             .await
             .unwrap();
         // cl100k token count for this short text; just check the JSON shape.
-        assert!(out.starts_with(r#"{"tokens":"#) || out.starts_with(r#"{"tokens":""#),
-            "unexpected output: {out}");
+        assert!(
+            out.starts_with(r#"{"tokens":"#) || out.starts_with(r#"{"tokens":""#),
+            "unexpected output: {out}"
+        );
         assert!(out.contains(r#""characters":15}"#), "{out}");
     }
 
@@ -4528,7 +4634,10 @@ mod tests {
         };
         // Should succeed without stack overflow
         let result = list_files(&base, &args);
-        assert!(result.is_ok(), "list_files should handle deep paths: {result:?}");
+        assert!(
+            result.is_ok(),
+            "list_files should handle deep paths: {result:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

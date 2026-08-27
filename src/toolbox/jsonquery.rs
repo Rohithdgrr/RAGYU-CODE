@@ -6,6 +6,7 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// File path to read, OR inline JSON if `source` is "raw".
     pub source: String,
@@ -29,29 +30,59 @@ pub fn run(args: Args) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(&owned).unwrap_or_else(|_| format!("{:#?}", owned)))
 }
 
-fn query<'a>(value: &'a serde_json::Value, path: &str) -> anyhow::Result<Vec<&'a serde_json::Value>> {
+fn query<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> anyhow::Result<Vec<&'a serde_json::Value>> {
     let mut results = vec![value];
     let mut buf = String::new();
     let mut in_bracket = false;
     let mut tokens: Vec<String> = Vec::new();
     for ch in path.chars() {
         match ch {
-            '.' => { if !buf.is_empty() && !in_bracket { tokens.push(buf.clone()); buf.clear(); } },
-            '[' => { if !buf.is_empty() { tokens.push(buf.clone()); buf.clear(); } in_bracket = true; },
-            ']' => { in_bracket = false; if !buf.is_empty() { tokens.push(buf.clone()); buf.clear(); } },
+            '.' => {
+                if !buf.is_empty() && !in_bracket {
+                    tokens.push(buf.clone());
+                    buf.clear();
+                }
+            }
+            '[' => {
+                if !buf.is_empty() {
+                    tokens.push(buf.clone());
+                    buf.clear();
+                }
+                in_bracket = true;
+            }
+            ']' => {
+                in_bracket = false;
+                if !buf.is_empty() {
+                    tokens.push(buf.clone());
+                    buf.clear();
+                }
+            }
             _ => buf.push(ch),
         }
     }
-    if !buf.is_empty() { tokens.push(buf); }
+    if !buf.is_empty() {
+        tokens.push(buf);
+    }
     for token in tokens {
         if let Ok(idx) = token.parse::<usize>() {
-            results = results.into_iter().flat_map(|v| v.as_array().and_then(|a| a.get(idx))).collect();
+            results = results
+                .into_iter()
+                .flat_map(|v| v.as_array().and_then(|a| a.get(idx)))
+                .collect();
         } else if token == "*" {
-            results = results.into_iter().flat_map(|v| v.as_array().into_iter().flatten()).collect();
+            results = results
+                .into_iter()
+                .flat_map(|v| v.as_array().into_iter().flatten())
+                .collect();
         } else {
             results = results.into_iter().flat_map(|v| v.get(&token)).collect();
         }
-        if results.is_empty() { return Ok(results); }
+        if results.is_empty() {
+            return Ok(results);
+        }
     }
     Ok(results)
 }

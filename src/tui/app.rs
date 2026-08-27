@@ -11,19 +11,33 @@
 //!   to keys (scroll, cancel) while the model streams
 //! - the turn future owns `&mut App`; status-bar data is snapshotted before
 //!   the turn starts so drawing never fights that borrow
+//!
+//! # Module split (ARCH fix)
+//!
+//! At 110KB / 2800+ lines `app.rs` was a TUI god-module. Responsibilities
+//! are now split (or documented) as:
+//! - `super::widgets::chat_pane` — markdown rendering & scrolling
+//! - `super::widgets::input_bar` — slash completion, @-mentions
+//! - `super::widgets::file_tree` — project explorer with git marks
+//! - `super::provider_workflow` — guided provider setup state machine
+//!   (extracted: `ProviderWorkflow` lives there, re-exported here for
+//!   backwards compat). The event loop and turn runner remain here because
+//!   they need `&mut App` and the shared live buffer, but each widget is
+//!   behind its own module boundary.
+//! - `super::draw` / `super::layout` / `super::theme` — rendering
 
-use std::cell::RefCell;
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use futures_util::StreamExt;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use super::widgets::chat_pane::ChatEntry;
 use super::widgets::file_tree::FileTree;
@@ -31,23 +45,20 @@ use super::{draw, icons, theme};
 use crate::api;
 use crate::commands::{self, App};
 use crate::provider;
+// Extracted workflow state machine — keep `ProviderWorkflow` available as
+// `crate::tui::app::ProviderWorkflow` for backwards compatibility.
+pub use super::provider_workflow::ProviderWorkflow;
+
+/// Cap on transcript entries rendered every 250 ms tick. Without a cap a
+/// long session (1000+ tool rounds) holds 2 KB × 1000 ≈ 2 MB of markdown that
+/// `chat_pane::build_lines` re-parses every frame, turning the TUI janky.
+const MAX_TUI_ENTRIES: usize = 600;
+const TUI_PRUNE_KEEP: usize = 500;
 
 /// Slash commands that never take an argument — Enter on the palette or a
 /// click on the palette row runs them directly instead of opening the args
-/// dialog. These mirror the always-runnable subset of
-/// `commands::SLASH_COMMANDS`.
-const ZERO_ARG_SLASH: [&str; 10] = [
-    "/help",
-    "/exit",
-    "/quit",
-    "/q",
-    "/clear",
-    "/reset",
-    "/models",
-    "/tokens",
-    "/retry",
-    "/history",
-];
+/// dialog. Single source of truth is `commands::ZERO_ARG_COMMANDS`.
+const ZERO_ARG_SLASH: &[&str] = crate::commands::ZERO_ARG_COMMANDS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
@@ -71,8 +82,10 @@ impl AppMode {
     /// Validated transition per the workflow spec.
     fn transition_to(&mut self, next: AppMode) -> bool {
         let allowed = *self == next
-            || matches!((*self, next), (AppMode::Normal, AppMode::Agent)
-                | (AppMode::Agent, AppMode::Normal));
+            || matches!(
+                (*self, next),
+                (AppMode::Normal, AppMode::Agent) | (AppMode::Agent, AppMode::Normal)
+            );
         if allowed {
             *self = next;
         }
@@ -102,18 +115,26 @@ pub struct SlashDialog {
 /// Live update pushed from the turn runner back to the UI thread.
 pub enum TurnUpdate {
     AssistantProse(String),
-    ToolStart { name: String, args: String },
+    ToolStart {
+        name: String,
+        args: String,
+    },
     /// `snippet` is a short result preview (first line, truncated).
-    ToolEnd { name: String, args: String, ok: bool, snippet: String },
+    ToolEnd {
+        name: String,
+        args: String,
+        ok: bool,
+        snippet: String,
+    },
     Answer(String),
     Notice(String),
     Error(String),
 }
 
 /// Shared live-streaming buffer (written by the delta callback inside the
-/// turn future, read by the draw loop). Single-task polling makes `Rc`
-/// sound here.
-pub type SharedStream = Rc<RefCell<String>>;
+/// turn future, read by the draw loop). `Arc<Mutex>` is `Send+Sync` so the
+/// future can be polled on any tokio worker.
+pub type SharedStream = Arc<std::sync::Mutex<String>>;
 
 pub struct Tui {
     pub mode: AppMode,
@@ -193,42 +214,10 @@ pub struct Tui {
     pub pending_setup_test: bool,
 }
 
-/// Multi-step guided provider setup: select provider → API key → model → test.
-#[derive(Debug, Clone)]
-pub enum ProviderWorkflow {
-    /// Step 1: user is selecting a provider from the list.
-    SelectProvider {
-        providers: Vec<String>,
-        selected: usize,
-    },
-    /// Step 2: user is entering an API key for the chosen provider.
-    EnterApiKey {
-        provider: String,
-        key_input: String,
-        cursor: usize,
-    },
-    /// Step 3: user is selecting a model from the provider.
-    SelectModel {
-        provider: String,
-        api_key: String,
-        models: Vec<String>,
-        selected: usize,
-    },
-    /// Step 4: testing the connection with the chosen model.
-    Testing {
-        provider: String,
-        api_key: String,
-        model: String,
-    },
-    /// Step 5: showing the result.
-    Result {
-        provider: String,
-        api_key: String,
-        model: String,
-        ok: bool,
-        message: String,
-    },
-}
+// `ProviderWorkflow` was extracted to `crate::tui::provider_workflow` to
+// reduce `app.rs` from 110KB. The enum is re-exported at the top of this
+// file (`pub use super::provider_workflow::ProviderWorkflow`) so existing
+// call sites (`crate::tui::app::ProviderWorkflow`) keep working.
 
 impl Default for Tui {
     fn default() -> Self {
@@ -249,7 +238,7 @@ impl Tui {
             history_idx: None,
             draft: String::new(),
             scroll_from_bottom: 0,
-            streaming: Rc::new(RefCell::new(String::new())),
+            streaming: Arc::new(std::sync::Mutex::new(String::new())),
             cancel: Arc::new(AtomicBool::new(false)),
             busy: false,
             quit: false,
@@ -299,8 +288,37 @@ impl Tui {
     }
 
     pub fn notice(&mut self, text: impl Into<String>) {
-        self.entries.push(ChatEntry::Notice(text.into()));
+        self.push_entry(ChatEntry::Notice(text.into()));
         self.scroll_from_bottom = 0;
+    }
+
+    /// Bounded push: keeps `entries` at `MAX_TUI_ENTRIES` by dropping the
+    /// oldest entries when the cap is exceeded. Pruning is lossy (old tool
+    /// history) but prevents the O(n) per-frame `build_lines` cost from
+    /// growing unbounded in long sessions.
+    fn push_entry(&mut self, entry: ChatEntry) {
+        self.entries.push(entry);
+        self.prune_if_needed();
+    }
+
+    fn prune_if_needed(&mut self) {
+        if self.entries.len() <= MAX_TUI_ENTRIES {
+            return;
+        }
+        let to_remove = self.entries.len() - TUI_PRUNE_KEEP;
+        self.entries.drain(0..to_remove);
+        if let Some(idx) = self.plan_entry_idx {
+            if idx < to_remove {
+                self.plan_entry_idx = None;
+            } else {
+                self.plan_entry_idx = Some(idx - to_remove);
+            }
+        }
+        // Keep scroll anchored to bottom after a prune so the user doesn't
+        // see a jump into scrolled history.
+        if self.scroll_from_bottom > self.entries.len() {
+            self.scroll_from_bottom = 0;
+        }
     }
 
     /// Consumes a queued user prompt (Enter on a plain message).
@@ -353,7 +371,7 @@ impl Tui {
         self.history.push(line.clone());
         self.history_idx = None;
         self.draft.clear();
-        self.entries.push(ChatEntry::User(line.clone()));
+        self.push_entry(ChatEntry::User(line.clone()));
         self.scroll_from_bottom = 0;
         self.pending_prompt = Some(line);
     }
@@ -387,9 +405,14 @@ impl Tui {
         let models = if cmd == "/model" && !self.models_cache.is_empty() {
             self.models_cache.clone()
         } else if cmd == "/provider" {
-            crate::provider::preset_names().map(|s| s.to_owned()).collect()
+            crate::provider::preset_names()
+                .map(|s| s.to_owned())
+                .collect()
         } else if cmd == "/theme" {
-            crate::tui::theme::NAMED_THEMES.iter().map(|t| t.name.to_owned()).collect()
+            crate::tui::theme::NAMED_THEMES
+                .iter()
+                .map(|t| t.name.to_owned())
+                .collect()
         } else {
             Vec::new()
         };
@@ -412,12 +435,10 @@ impl Tui {
         if let Some(d) = self.slash_dialog.take() {
             let full = if d.arg_input.trim().is_empty() {
                 // For list-backed commands, use the highlighted entry.
-                if (d.command == "/model" || d.command == "/provider" || d.command == "/theme") && !d.models.is_empty() {
-                    let name = d
-                        .models
-                        .get(d.models_selected)
-                        .cloned()
-                        .unwrap_or_default();
+                if (d.command == "/model" || d.command == "/provider" || d.command == "/theme")
+                    && !d.models.is_empty()
+                {
+                    let name = d.models.get(d.models_selected).cloned().unwrap_or_default();
                     if name.is_empty() {
                         d.command.clone()
                     } else {
@@ -497,12 +518,20 @@ impl Tui {
             }
             KeyCode::Left => {
                 if let Some(dialog) = &mut self.slash_dialog {
-                    if dialog.arg_cursor > 0 { dialog.arg_cursor -= 1; } else { return false; }
+                    if dialog.arg_cursor > 0 {
+                        dialog.arg_cursor -= 1;
+                    } else {
+                        return false;
+                    }
                 }
             }
             KeyCode::Right => {
                 if let Some(dialog) = &mut self.slash_dialog {
-                    if dialog.arg_cursor < dialog.arg_input.chars().count() { dialog.arg_cursor += 1; } else { return false; }
+                    if dialog.arg_cursor < dialog.arg_input.chars().count() {
+                        dialog.arg_cursor += 1;
+                    } else {
+                        return false;
+                    }
                 }
             }
             KeyCode::Up => {
@@ -519,7 +548,11 @@ impl Tui {
                             dialog.arg_cursor = dialog.arg_input.chars().count();
                         }
                     } else {
-                        if dialog.arg_cursor > 0 { dialog.arg_cursor -= 1; } else { return false; }
+                        if dialog.arg_cursor > 0 {
+                            dialog.arg_cursor -= 1;
+                        } else {
+                            return false;
+                        }
                     }
                 }
             }
@@ -532,15 +565,23 @@ impl Tui {
                             dialog.arg_cursor = dialog.arg_input.chars().count();
                         }
                     } else {
-                        if dialog.arg_cursor < dialog.arg_input.chars().count() { dialog.arg_cursor += 1; } else { return false; }
+                        if dialog.arg_cursor < dialog.arg_input.chars().count() {
+                            dialog.arg_cursor += 1;
+                        } else {
+                            return false;
+                        }
                     }
                 }
             }
             KeyCode::Home => {
-                if let Some(dialog) = &mut self.slash_dialog { dialog.arg_cursor = 0; }
+                if let Some(dialog) = &mut self.slash_dialog {
+                    dialog.arg_cursor = 0;
+                }
             }
             KeyCode::End => {
-                if let Some(dialog) = &mut self.slash_dialog { dialog.arg_cursor = dialog.arg_input.chars().count(); }
+                if let Some(dialog) = &mut self.slash_dialog {
+                    dialog.arg_cursor = dialog.arg_input.chars().count();
+                }
             }
             _ => return false,
         }
@@ -549,7 +590,9 @@ impl Tui {
 
     /// Starts the multi-step provider setup workflow.
     pub fn start_provider_workflow(&mut self) {
-        let providers: Vec<String> = crate::provider::preset_names().map(|s| s.to_owned()).collect();
+        let providers: Vec<String> = crate::provider::preset_names()
+            .map(|s| s.to_owned())
+            .collect();
         self.provider_workflow = Some(ProviderWorkflow::SelectProvider {
             providers,
             selected: 0,
@@ -566,7 +609,10 @@ impl Tui {
             _ => {
                 if let Some(ref mut wf) = self.provider_workflow {
                     match wf {
-                        ProviderWorkflow::SelectProvider { providers, selected } => {
+                        ProviderWorkflow::SelectProvider {
+                            providers,
+                            selected,
+                        } => {
                             match key.code {
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     *selected = selected.saturating_sub(1);
@@ -578,12 +624,28 @@ impl Tui {
                                 }
                                 KeyCode::Enter => {
                                     let chosen = providers[*selected].clone();
-                                    // Skip API key step for local providers.
-                                    if chosen == "ollama" {
-                                        let wf = std::mem::replace(wf, ProviderWorkflow::SelectProvider { providers: vec![], selected: 0 });
-                                        if let ProviderWorkflow::SelectProvider { providers: _, selected: _ } = wf {
+                                    // Skip API key step for local/keyless providers.
+                                    let needs_key = crate::provider::PRESETS
+                                        .iter()
+                                        .find(|p| p.id == chosen)
+                                        .and_then(|p| p.api_key_env)
+                                        .is_some();
+                                    if !needs_key {
+                                        let wf = std::mem::replace(
+                                            wf,
+                                            ProviderWorkflow::SelectProvider {
+                                                providers: vec![],
+                                                selected: 0,
+                                            },
+                                        );
+                                        if let ProviderWorkflow::SelectProvider {
+                                            providers: _,
+                                            selected: _,
+                                        } = wf
+                                        {
                                             // Fetch models for ollama and go to model selection.
-                                            self.pending_setup_models = Some((chosen, String::new()));
+                                            self.pending_setup_models =
+                                                Some((chosen, String::new()));
                                         }
                                     } else {
                                         *wf = ProviderWorkflow::EnterApiKey {
@@ -596,28 +658,49 @@ impl Tui {
                                 _ => {}
                             }
                         }
-                        ProviderWorkflow::EnterApiKey { provider, key_input, cursor } => {
+                        ProviderWorkflow::EnterApiKey {
+                            provider,
+                            key_input,
+                            cursor,
+                        } => {
                             match key.code {
                                 KeyCode::Char(c) => {
-                                    let byte = key_input.char_indices().nth(*cursor).map_or(key_input.len(), |(i, _)| i);
+                                    let byte = key_input
+                                        .char_indices()
+                                        .nth(*cursor)
+                                        .map_or(key_input.len(), |(i, _)| i);
                                     key_input.insert(byte, c);
                                     *cursor += 1;
                                 }
                                 KeyCode::Backspace if *cursor > 0 => {
-                                    let byte = key_input.char_indices().nth(*cursor).map_or(key_input.len(), |(i, _)| i);
-                                    let prev = key_input[..byte].char_indices().next_back().map_or(0, |(i, _)| i);
+                                    let byte = key_input
+                                        .char_indices()
+                                        .nth(*cursor)
+                                        .map_or(key_input.len(), |(i, _)| i);
+                                    let prev = key_input[..byte]
+                                        .char_indices()
+                                        .next_back()
+                                        .map_or(0, |(i, _)| i);
                                     key_input.replace_range(prev..byte, "");
                                     *cursor -= 1;
                                 }
                                 KeyCode::Left if *cursor > 0 => *cursor -= 1,
-                                KeyCode::Right if *cursor < key_input.chars().count() => *cursor += 1,
+                                KeyCode::Right if *cursor < key_input.chars().count() => {
+                                    *cursor += 1
+                                }
                                 KeyCode::Home => *cursor = 0,
                                 KeyCode::End => *cursor = key_input.chars().count(),
                                 KeyCode::Enter => {
                                     let key_val = key_input.clone();
                                     let prov = provider.clone();
                                     // Move to model selection.
-                                    let wf = std::mem::replace(wf, ProviderWorkflow::SelectProvider { providers: vec![], selected: 0 });
+                                    let wf = std::mem::replace(
+                                        wf,
+                                        ProviderWorkflow::SelectProvider {
+                                            providers: vec![],
+                                            selected: 0,
+                                        },
+                                    );
                                     if let ProviderWorkflow::EnterApiKey { .. } = wf {
                                         self.pending_setup_models = Some((prov, key_val));
                                     }
@@ -625,7 +708,12 @@ impl Tui {
                                 _ => {}
                             }
                         }
-                        ProviderWorkflow::SelectModel { provider, api_key, models, selected } => {
+                        ProviderWorkflow::SelectModel {
+                            provider,
+                            api_key,
+                            models,
+                            selected,
+                        } => {
                             match key.code {
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     *selected = selected.saturating_sub(1);
@@ -657,7 +745,14 @@ impl Tui {
                         ProviderWorkflow::Result { .. } => {
                             // Any key closes the result.
                             let result = self.provider_workflow.take();
-                            if let Some(ProviderWorkflow::Result { provider, api_key: _, model, ok, message }) = result {
+                            if let Some(ProviderWorkflow::Result {
+                                provider,
+                                api_key: _,
+                                model,
+                                ok,
+                                message,
+                            }) = result
+                            {
                                 if ok {
                                     self.notice(format!("setup complete: {provider} / {model}"));
                                 } else {
@@ -720,7 +815,9 @@ impl Tui {
                         self.notice("select a file in the explorer first (Ctrl+T / Ctrl+P).");
                     }
                 } else {
-                    self.notice("open explorer with Ctrl+T or Ctrl+P, then Enter pins the selected file.");
+                    self.notice(
+                        "open explorer with Ctrl+T or Ctrl+P, then Enter pins the selected file.",
+                    );
                 }
                 return true;
             }
@@ -728,14 +825,15 @@ impl Tui {
             // (which calls App-aware handlers for `/router`, `/provider`,
             // `/save`, etc.). handle_tui_slash syncs derived state.
             _ => {}
-        }        // Known slash commands and custom skills need App-aware handling
+        } // Known slash commands and custom skills need App-aware handling
         if crate::commands::SLASH_COMMANDS.contains(&cmd_lc.as_str()) {
             return false;
         }
 
         // Unknown command — queue for handle_tui_slash which checks skills
         false
-    }    pub fn handle_event(&mut self, ev: Event) {
+    }
+    pub fn handle_event(&mut self, ev: Event) {
         match ev {
             Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
                 self.handle_key(key);
@@ -780,15 +878,25 @@ impl Tui {
         let col = me.column;
         let row = me.row;
         // helper to test inside rect
-        let inside = |r: ratatui::layout::Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
+        let inside = |r: ratatui::layout::Rect| {
+            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+        };
         // Dialog captures mouse first
         if let Some(dialog) = &self.slash_dialog {
             // centered dialog — compute same as draw (dynamic height for model list)
             let full_w = layout.status.width;
             let full_h = layout.status.height + layout.chat.height + layout.input.height;
             let dw: u16 = 60;
-            let model_visible = if !dialog.models.is_empty() { dialog.models.len().min(8) as u16 } else { 0 };
-            let dh: u16 = if !dialog.models.is_empty() { 9 + model_visible + 1 } else { 9 };
+            let model_visible = if !dialog.models.is_empty() {
+                dialog.models.len().min(8) as u16
+            } else {
+                0
+            };
+            let dh: u16 = if !dialog.models.is_empty() {
+                9 + model_visible + 1
+            } else {
+                9
+            };
             let dx = full_w.saturating_sub(dw) / 2;
             let dy = full_h.saturating_sub(dh) / 2;
             let dlg = ratatui::layout::Rect::new(dx, dy, dw.min(full_w), dh.min(full_h));
@@ -840,7 +948,11 @@ impl Tui {
         if self.focus == Focus::Input && self.input.starts_with('/') && !self.input.contains(' ') {
             let hits = crate::tui::widgets::input_bar::filtered(&self.input);
             if !hits.is_empty() {
-                let lines = crate::tui::widgets::input_bar::palette_lines(&self.input, self.slash_selected, self.palette_hover);
+                let lines = crate::tui::widgets::input_bar::palette_lines(
+                    &self.input,
+                    self.slash_selected,
+                    self.palette_hover,
+                );
                 let pal_h = (lines.len() as u16 + 2).min(18);
                 let pal_w = layout.input.width.saturating_sub(2).min(56);
                 let pal_x = layout.input.x;
@@ -854,7 +966,9 @@ impl Tui {
                         let total = hits.len();
                         let max_show = 12.min(total);
                         let sel = self.slash_selected.min(total.saturating_sub(1));
-                        let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
+                        let start = sel
+                            .saturating_sub(max_show / 2)
+                            .min(total.saturating_sub(max_show));
                         self.palette_hover = if total > max_show && start > 0 {
                             (off >= 2 && off < 2 + max_show).then(|| start + (off - 2))
                         } else {
@@ -871,7 +985,9 @@ impl Tui {
                             let total = hits.len();
                             let max_show = 12.min(total);
                             let sel = self.slash_selected.min(total.saturating_sub(1));
-                            let start = sel.saturating_sub(max_show / 2).min(total.saturating_sub(max_show));
+                            let start = sel
+                                .saturating_sub(max_show / 2)
+                                .min(total.saturating_sub(max_show));
                             let end = (start + max_show).min(total);
                             // determine which row was clicked
                             let mut cmd_idx: Option<usize> = None;
@@ -927,11 +1043,15 @@ impl Tui {
                             return;
                         }
                         MouseEventKind::ScrollUp => {
-                            if self.slash_selected > 0 { self.slash_selected -= 1; }
+                            if self.slash_selected > 0 {
+                                self.slash_selected -= 1;
+                            }
                             return;
                         }
                         MouseEventKind::ScrollDown => {
-                            if self.slash_selected + 1 < hits.len() { self.slash_selected += 1; }
+                            if self.slash_selected + 1 < hits.len() {
+                                self.slash_selected += 1;
+                            }
                             return;
                         }
                         _ => {}
@@ -976,11 +1096,15 @@ impl Tui {
                 if let Some(r) = layout.tree
                     && inside(r)
                 {
-                    if let Some(tree) = &mut self.tree { tree.move_selection(-3); }
+                    if let Some(tree) = &mut self.tree {
+                        tree.move_selection(-3);
+                    }
                 } else if let Some(r) = layout.tools
                     && inside(r)
                 {
-                    if let Some(tree) = &mut self.tree { tree.move_selection(-3); }
+                    if let Some(tree) = &mut self.tree {
+                        tree.move_selection(-3);
+                    }
                 } else if inside(layout.chat) {
                     self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(3);
                 } else {
@@ -991,11 +1115,15 @@ impl Tui {
                 if let Some(r) = layout.tree
                     && inside(r)
                 {
-                    if let Some(tree) = &mut self.tree { tree.move_selection(3); }
+                    if let Some(tree) = &mut self.tree {
+                        tree.move_selection(3);
+                    }
                 } else if let Some(r) = layout.tools
                     && inside(r)
                 {
-                    if let Some(tree) = &mut self.tree { tree.move_selection(3); }
+                    if let Some(tree) = &mut self.tree {
+                        tree.move_selection(3);
+                    }
                 } else if inside(layout.chat) {
                     self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(3);
                 } else {
@@ -1009,17 +1137,25 @@ impl Tui {
     fn click_tree_at(&mut self, _col: u16, row: u16, pane: ratatui::layout::Rect) {
         let Some(tree) = &mut self.tree else { return };
         // inner area (border 1)
-        if pane.width < 3 || pane.height < 3 { return; }
+        if pane.width < 3 || pane.height < 3 {
+            return;
+        }
         let inner_y = pane.y + 1;
         let clicked_offset = row.saturating_sub(inner_y) as usize;
         let view_h = (pane.height.saturating_sub(2)) as usize;
         // compute window start as render does
         let len = tree.flat_len();
-        if len == 0 { return; }
+        if len == 0 {
+            return;
+        }
         let selected = tree.selected_index();
-        let start = selected.saturating_sub(view_h.saturating_sub(1)).min(len.saturating_sub(view_h.min(len)));
+        let start = selected
+            .saturating_sub(view_h.saturating_sub(1))
+            .min(len.saturating_sub(view_h.min(len)));
         let idx = start + clicked_offset;
-        if idx >= len { return; }
+        if idx >= len {
+            return;
+        }
         tree.set_selected(idx);
         // single click opens: dir toggles, file pins
         if let Some(node) = tree.selected_node() {
@@ -1059,7 +1195,9 @@ impl Tui {
         // future interactive gating; the shared agent loop currently runs
         // gated tools in AutoRun mode, so this never triggers.)
         if self.confirm_pending {
-            if let (KeyModifiers::CONTROL, KeyCode::Char('q')) = (key.modifiers, key.code) { self.quit = true }
+            if let (KeyModifiers::CONTROL, KeyCode::Char('q')) = (key.modifiers, key.code) {
+                self.quit = true
+            }
             return;
         }
 
@@ -1089,65 +1227,66 @@ impl Tui {
             }
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
-            && let KeyCode::Char(c) = key.code {
-                match c.to_ascii_lowercase() {
-                    'q' => {
-                        self.quit = true;
-                        return;
-                    }
-                    'c' => {
-                        if self.busy {
-                            self.cancel.store(true, Ordering::Relaxed);
-                        } else {
-                            self.input.clear();
-                            self.input_cursor = 0;
-                        }
-                        return;
-                    }
-                    'l' => {
-                        self.pending_clear = true;
-                        return;
-                    }
-                    't' => {
-                        self.toggle_tree();
-                        return;
-                    }
-                    'p' => {
-                        self.toggle_explorer();
-                        return;
-                    }
-                    'i' => {
-                        self.show_cost_dashboard = !self.show_cost_dashboard;
-                        return;
-                    }
-                    ',' => {
-                        self.show_settings = !self.show_settings;
-                        return;
-                    }
-                    'o' => {
-                        // Ctrl+O: open folder — change working directory
-                        self.open_slash_dialog("/open");
-                        return;
-                    }
-                    'z' => {
-                        // Ctrl+Z: zen mode (toggle sidebars) — moved from Ctrl+O
-                        if self.show_tree || self.show_tools {
-                            self.show_tree = false;
-                            self.show_tools = false;
-                        } else {
-                            self.show_tree = true;
-                            self.show_tools = true;
-                        }
-                        return;
-                    }
-                    'f' => {
-                        // Ctrl+F: find in chat (placeholder)
-                        self.notice("find in chat: use /search <text>");
-                        return;
-                    }
-                    _ => {}
+            && let KeyCode::Char(c) = key.code
+        {
+            match c.to_ascii_lowercase() {
+                'q' => {
+                    self.quit = true;
+                    return;
                 }
+                'c' => {
+                    if self.busy {
+                        self.cancel.store(true, Ordering::Relaxed);
+                    } else {
+                        self.input.clear();
+                        self.input_cursor = 0;
+                    }
+                    return;
+                }
+                'l' => {
+                    self.pending_clear = true;
+                    return;
+                }
+                't' => {
+                    self.toggle_tree();
+                    return;
+                }
+                'p' => {
+                    self.toggle_explorer();
+                    return;
+                }
+                'i' => {
+                    self.show_cost_dashboard = !self.show_cost_dashboard;
+                    return;
+                }
+                ',' => {
+                    self.show_settings = !self.show_settings;
+                    return;
+                }
+                'o' => {
+                    // Ctrl+O: open folder — change working directory
+                    self.open_slash_dialog("/open");
+                    return;
+                }
+                'z' => {
+                    // Ctrl+Z: zen mode (toggle sidebars) — moved from Ctrl+O
+                    if self.show_tree || self.show_tools {
+                        self.show_tree = false;
+                        self.show_tools = false;
+                    } else {
+                        self.show_tree = true;
+                        self.show_tools = true;
+                    }
+                    return;
+                }
+                'f' => {
+                    // Ctrl+F: find in chat (placeholder)
+                    self.notice("find in chat: use /search <text>");
+                    return;
+                }
+                _ => {}
             }
+        }
 
         // Plan confirmation gate: y executes, anything else aborts.
         if self.plan_awaiting {
@@ -1234,7 +1373,9 @@ impl Tui {
                 }
                 self.focus = match self.focus {
                     Focus::Input => Focus::Chat,
-                    Focus::Chat if self.tree.is_some() && (self.show_tree || self.show_tools) => Focus::Tree,
+                    Focus::Chat if self.tree.is_some() && (self.show_tree || self.show_tools) => {
+                        Focus::Tree
+                    }
                     Focus::Chat => Focus::Input,
                     Focus::Tree => Focus::Input,
                 };
@@ -1336,7 +1477,10 @@ impl Tui {
             .to_string_lossy()
             .replace('\\', "/");
         self.pinned_files.push(path);
-        self.notice(format!("{} pinned {rel} to context", crate::tui::icons::PINNED));
+        self.notice(format!(
+            "{} pinned {rel} to context",
+            crate::tui::icons::PINNED
+        ));
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) {
@@ -1395,7 +1539,8 @@ impl Tui {
             }
             KeyCode::Down => {
                 if self.at_picker_active && !self.at_picker_files.is_empty() {
-                    self.at_picker_selected = (self.at_picker_selected + 1) % self.at_picker_files.len();
+                    self.at_picker_selected =
+                        (self.at_picker_selected + 1) % self.at_picker_files.len();
                 } else {
                     self.history_next();
                 }
@@ -1414,7 +1559,9 @@ impl Tui {
 
     /// Updates the @-mention picker based on current input and cursor position.
     fn update_at_picker(&mut self) {
-        if let Some(query) = crate::tui::widgets::input_bar::at_mention_query(&self.input, self.input_cursor) {
+        if let Some(query) =
+            crate::tui::widgets::input_bar::at_mention_query(&self.input, self.input_cursor)
+        {
             self.at_picker_active = true;
             self.at_picker_query = query.clone();
             self.at_picker_files = crate::tui::widgets::input_bar::at_mention_files(&query);
@@ -1512,17 +1659,22 @@ impl Tui {
     pub fn apply_update(&mut self, upd: TurnUpdate) {
         match upd {
             TurnUpdate::AssistantProse(text) => {
-                self.entries.push(ChatEntry::Assistant(text));
+                self.push_entry(ChatEntry::Assistant(text));
             }
             TurnUpdate::ToolStart { name, args } => {
-                self.entries.push(ChatEntry::Tool {
+                self.push_entry(ChatEntry::Tool {
                     name,
                     args,
                     ok: None,
                 });
                 self.scroll_from_bottom = 0;
             }
-            TurnUpdate::ToolEnd { name, args, ok, snippet } => {
+            TurnUpdate::ToolEnd {
+                name,
+                args,
+                ok,
+                snippet,
+            } => {
                 if let Some(ChatEntry::Tool { ok: slot, .. }) = self
                     .entries
                     .iter_mut()
@@ -1531,7 +1683,7 @@ impl Tui {
                 {
                     *slot = Some(ok);
                 } else {
-                    self.entries.push(ChatEntry::Tool {
+                    self.push_entry(ChatEntry::Tool {
                         name: name.clone(),
                         args: args.clone(),
                         ok: Some(ok),
@@ -1540,27 +1692,25 @@ impl Tui {
                 // Result preview — for shell-like tools use the terminal-styled Shell entry.
                 if !snippet.trim().is_empty() {
                     if matches!(name.as_str(), "run_shell" | "run_test" | "check_project") {
-                        self.entries.push(ChatEntry::Shell {
+                        self.push_entry(ChatEntry::Shell {
                             cmd: args.clone(),
                             output: snippet.chars().take(800).collect(),
                             ok,
                         });
                     } else {
                         let text: String = snippet.chars().take(160).collect();
-                        self.entries
-                            .push(ChatEntry::Notice(format!("↳ {text}")));
+                        self.push_entry(ChatEntry::Notice(format!("↳ {text}")));
                     }
                 }
             }
             TurnUpdate::Answer(text) => {
-                self.streaming.borrow_mut().clear();
-                self.entries.push(ChatEntry::Assistant(text));
+                self.streaming.lock().unwrap().clear();
+                self.push_entry(ChatEntry::Assistant(text));
                 self.scroll_from_bottom = 0;
             }
             TurnUpdate::Notice(text) => self.notice(text),
             TurnUpdate::Error(text) => {
-                self.entries
-                    .push(ChatEntry::Notice(format!("error: {text}")));
+                self.push_entry(ChatEntry::Notice(format!("error: {text}")));
                 self.scroll_from_bottom = 0;
             }
         }
@@ -1575,10 +1725,15 @@ impl Tui {
         if self.mode == AppMode::Review {
             self.mode = self.prev_mode;
         }
-        let leftover = std::mem::take(&mut *self.streaming.borrow_mut());
-        if interrupted && !leftover.trim().is_empty() {
-            self.entries
-                .push(ChatEntry::Assistant(format!("{leftover}\n\n*(interrupted)*")));
+        let leftover = std::mem::take(&mut *self.streaming.lock().unwrap());
+        if !leftover.trim().is_empty() {
+            if interrupted {
+                self.push_entry(ChatEntry::Assistant(format!(
+                    "{leftover}\n\n*(interrupted)*"
+                )));
+            } else {
+                self.push_entry(ChatEntry::Assistant(leftover));
+            }
         }
     }
 
@@ -1603,8 +1758,16 @@ impl Tui {
         match self.plan_entry_idx {
             Some(idx) if idx < self.entries.len() => self.entries[idx] = entry,
             _ => {
-                self.entries.push(entry);
-                self.plan_entry_idx = Some(self.entries.len() - 1);
+                self.push_entry(entry);
+                // push_entry may have pruned; ensure index points to the just-pushed entry
+                if self.plan_entry_idx.is_none()
+                    || self.plan_entry_idx.unwrap() >= self.entries.len()
+                {
+                    self.plan_entry_idx = Some(self.entries.len() - 1);
+                } else {
+                    // if prune shifted, re-anchor to last
+                    self.plan_entry_idx = Some(self.entries.len() - 1);
+                }
             }
         }
         self.scroll_from_bottom = 0;
@@ -1617,8 +1780,12 @@ impl Tui {
         }
         self.plan_executing = true;
         let (step, _) = self.plan_steps[self.plan_cursor].clone();
-        self.pending_prompt =
-            Some(format!("[plan step {}/{}] {}", self.plan_cursor + 1, self.plan_steps.len(), step));
+        self.pending_prompt = Some(format!(
+            "[plan step {}/{}] {}",
+            self.plan_cursor + 1,
+            self.plan_steps.len(),
+            step
+        ));
         self.focus = Focus::Input;
     }
 
@@ -1745,7 +1912,9 @@ async fn event_loop(
             if tui.take_model_fetch_request() {
                 let provider_id = app.config.provider.key().to_string();
                 let api_models = if let Some(url) = app.config.provider.models_url() {
-                    match api::list_models(&app.http, &url, app.config.provider.auth().token()).await {
+                    match api::list_models(&app.http, &url, app.config.provider.auth().token())
+                        .await
+                    {
                         Ok(list) => list,
                         Err(e) => {
                             tui.notice(format!("failed to fetch models: {e:#}"));
@@ -1758,8 +1927,10 @@ async fn event_loop(
                 // Merge API models with known static registry.
                 let known = crate::provider::known_models(&provider_id);
                 let mut models = api_models;
-                let api_set: std::collections::HashSet<&str> = models.iter().map(|s| s.as_str()).collect();
-                let extras: Vec<String> = known.iter()
+                let api_set: std::collections::HashSet<&str> =
+                    models.iter().map(|s| s.as_str()).collect();
+                let extras: Vec<String> = known
+                    .iter()
                     .filter(|m| !api_set.contains(m.id))
                     .map(|m| m.id.to_owned())
                     .collect();
@@ -1781,13 +1952,18 @@ async fn event_loop(
                 if let Ok(p) = crate::provider::resolve(&prov, None, None, {
                     let k = key.clone();
                     move |_: &str| Some(k.clone())
-                })
-                    && let Some(url) = p.models_url()
-                        && let Ok(api_models) = api::list_models(&app.http, &url, p.auth().token()).await {
-                    let known_set: std::collections::HashSet<&str> = models.iter().map(|s| s.as_str()).collect();
-                    let extras: Vec<String> = api_models.into_iter().filter(|m| !known_set.contains(m.as_str())).collect();
+                }) && let Some(url) = p.models_url()
+                    && let Ok(api_models) =
+                        api::list_models(&app.http, &url, p.auth().token()).await
+                {
+                    let known_set: std::collections::HashSet<&str> =
+                        models.iter().map(|s| s.as_str()).collect();
+                    let extras: Vec<String> = api_models
+                        .into_iter()
+                        .filter(|m| !known_set.contains(m.as_str()))
+                        .collect();
                     models.extend(extras);
-                        }
+                }
                 if models.is_empty() {
                     models.push("default".to_owned());
                 }
@@ -1802,7 +1978,12 @@ async fn event_loop(
             // Provider setup workflow: test the connection by fetching models.
             if tui.pending_setup_test {
                 tui.pending_setup_test = false;
-                if let Some(ProviderWorkflow::Testing { provider, api_key, model }) = tui.provider_workflow.take() {
+                if let Some(ProviderWorkflow::Testing {
+                    provider,
+                    api_key,
+                    model,
+                }) = tui.provider_workflow.take()
+                {
                     let test_result = {
                         match crate::provider::resolve(&provider, None, None, {
                             let k = api_key.clone();
@@ -1810,11 +1991,16 @@ async fn event_loop(
                         }) {
                             Ok(p) => {
                                 if let Some(url) = p.models_url() {
-                                    match crate::api::list_models(&app.http, &url, p.auth().token()).await {
+                                    match crate::api::list_models(&app.http, &url, p.auth().token())
+                                        .await
+                                    {
                                         Ok(list) => {
                                             let ok = !list.is_empty();
                                             let msg = if ok {
-                                                format!("{} models available — connection verified", list.len())
+                                                format!(
+                                                    "{} models available — connection verified",
+                                                    list.len()
+                                                )
                                             } else {
                                                 "provider returned no models (may still work for direct calls)".to_owned()
                                             };
@@ -1836,10 +2022,11 @@ async fn event_loop(
                         && let Ok(p) = crate::provider::resolve(&provider, None, None, {
                             let k = api_key.clone();
                             move |_: &str| Some(k.clone())
-                        }) {
-                            app.config.provider = p;
-                            app.config.model = model.clone();
-                        }
+                        })
+                    {
+                        app.config.provider = p;
+                        app.config.model = model.clone();
+                    }
                     tui.provider_workflow = Some(ProviderWorkflow::Result {
                         provider,
                         api_key,
@@ -1964,9 +2151,30 @@ async fn event_loop(
 }
 
 fn git_branch_and_dirty() -> (Option<String>, bool) {
-    // Cheap, sync read of .git/HEAD; no process spawn per frame.
+    // Cheap, sync read of .git/HEAD; no process spawn per frame. Handles worktrees where .git is a file.
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let head = cwd.join(".git").join("HEAD");
+    let git_path = cwd.join(".git");
+    let git_dir = if git_path.is_dir() {
+        git_path
+    } else if git_path.is_file() {
+        let content = match std::fs::read_to_string(&git_path) {
+            Ok(c) => c,
+            Err(_) => return (None, false),
+        };
+        let rest = match content.strip_prefix("gitdir:") {
+            Some(r) => r.trim(),
+            None => return (None, false),
+        };
+        let p = Path::new(rest);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        }
+    } else {
+        return (None, false);
+    };
+    let head = git_dir.join("HEAD");
     let dirty = false; // keep cheap; file-tree handles precise git marks
     let branch = std::fs::read_to_string(&head).ok().and_then(|s| {
         let t = s.trim();
@@ -1990,10 +2198,8 @@ fn status_info(app: &App, tui: &Tui) -> draw::StatusInfo {
     // value (and the trimmer enforces it) — the bar still shows the
     // model's full limit so they can see the cap.
     let model_context = {
-        let from_registry = provider::context_window_for(
-            &app.config.provider.key(),
-            &app.config.model,
-        );
+        let from_registry =
+            provider::context_window_for(&app.config.provider.key(), &app.config.model);
         if from_registry > app.config.context_tokens {
             from_registry
         } else {
@@ -2067,7 +2273,11 @@ async fn handle_tui_slash(
         theme::apply_provider_accent(&tui.provider_name);
     }
     // Folder change: refresh tree to new cwd and prune pinned files
-    let cmd_lc = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let cmd_lc = line
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if matches!(cmd_lc.as_str(), "/cd" | "/cwd" | "/folder" | "/open") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         tui.tree = Some(FileTree::open(&cwd));
@@ -2083,16 +2293,21 @@ async fn handle_tui_slash(
 
 /// Maps [`CommandOutput`] onto the TUI: messages become notices or assistant
 /// entries, effects drive theme switches, transcript syncs, plan checklists.
-fn apply_command_output(app: &mut App, tui: &mut Tui, line: &str, out: commands::output::CommandOutput) {
+fn apply_command_output(
+    app: &mut App,
+    tui: &mut Tui,
+    line: &str,
+    out: commands::output::CommandOutput,
+) {
     use commands::output::{Effect, Role};
 
     for msg in &out.msgs {
         match msg.role {
             Role::Markdown => {
-                tui.entries.push(ChatEntry::Assistant(msg.text.clone()));
+                tui.push_entry(ChatEntry::Assistant(msg.text.clone()));
                 tui.scroll_from_bottom = 0;
             }
-            Role::Err => tui.entries.push(ChatEntry::Notice(format!("error: {}", msg.text))),
+            Role::Err => tui.push_entry(ChatEntry::Notice(format!("error: {}", msg.text))),
             _ => tui.notice(msg.text.clone()),
         }
     }
@@ -2105,17 +2320,33 @@ fn apply_command_output(app: &mut App, tui: &mut Tui, line: &str, out: commands:
         Effect::Resend(text) => {
             // `/retry` semantics: drop the trailing assistant side so the
             // regenerated answer does not duplicate.
-            while tui.entries.last().is_some_and(|e| matches!(e, ChatEntry::Notice(_))) {
+            while tui
+                .entries
+                .last()
+                .is_some_and(|e| matches!(e, ChatEntry::Notice(_)))
+            {
                 tui.entries.pop();
             }
             // Pop back until just before the last assistant-side block, but keep the User.
-            while tui.entries.last().is_some_and(|e| matches!(e, ChatEntry::Assistant(_) | ChatEntry::Tool {..} | ChatEntry::Op(_) | ChatEntry::Shell {..} | ChatEntry::Code {..} | ChatEntry::Checklist {..})) {
+            while tui.entries.last().is_some_and(|e| {
+                matches!(
+                    e,
+                    ChatEntry::Assistant(_)
+                        | ChatEntry::Tool { .. }
+                        | ChatEntry::Op(_)
+                        | ChatEntry::Shell { .. }
+                        | ChatEntry::Code { .. }
+                        | ChatEntry::Checklist { .. }
+                )
+            }) {
                 tui.entries.pop();
             }
             tui.pending_prompt = Some(text);
         }
         Effect::Plan(steps) => {
-            let task = line.split_once(char::is_whitespace).map_or("task", |(_, r)| r.trim());
+            let task = line
+                .split_once(char::is_whitespace)
+                .map_or("task", |(_, r)| r.trim());
             tui.start_plan(task, steps);
         }
         Effect::ThemeChanged(name) => {
@@ -2125,10 +2356,11 @@ fn apply_command_output(app: &mut App, tui: &mut Tui, line: &str, out: commands:
         }
         Effect::ReloadTranscript => {
             tui.entries.clear();
+            tui.plan_entry_idx = None;
             for m in app.session.messages() {
                 match m.role.as_str() {
-                    "user" => tui.entries.push(ChatEntry::User(m.content.clone())),
-                    "assistant" => tui.entries.push(ChatEntry::Assistant(m.content.clone())),
+                    "user" => tui.push_entry(ChatEntry::User(m.content.clone())),
+                    "assistant" => tui.push_entry(ChatEntry::Assistant(m.content.clone())),
                     _ => {}
                 }
             }
@@ -2144,15 +2376,24 @@ fn apply_command_output(app: &mut App, tui: &mut Tui, line: &str, out: commands:
 /// notices printed alongside (the dispatcher emits them before the effect).
 fn pop_last_exchange(entries: &mut Vec<ChatEntry>) {
     // Strip trailing notices first.
-    while entries.last().is_some_and(|e| matches!(e, ChatEntry::Notice(_))) {
+    while entries
+        .last()
+        .is_some_and(|e| matches!(e, ChatEntry::Notice(_)))
+    {
         entries.pop();
     }
     // Find last User and truncate to before it, removing the whole exchange
     // (User + any following assistant/tool/op/shell/code/checklist entries).
-    if let Some(pos) = entries.iter().rposition(|e| matches!(e, ChatEntry::User(_))) {
+    if let Some(pos) = entries
+        .iter()
+        .rposition(|e| matches!(e, ChatEntry::User(_)))
+    {
         entries.truncate(pos);
     }
-    while entries.last().is_some_and(|e| matches!(e, ChatEntry::Notice(_))) {
+    while entries
+        .last()
+        .is_some_and(|e| matches!(e, ChatEntry::Notice(_)))
+    {
         entries.pop();
     }
 }
@@ -2190,7 +2431,7 @@ impl crate::agent_loop::AgentUi for TuiUi {
     }
 
     fn stream_delta(&self, delta: &str) {
-        self.streaming.borrow_mut().push_str(delta);
+        self.streaming.lock().unwrap().push_str(delta);
     }
 
     fn prose(&self, text: &str) {
@@ -2248,7 +2489,8 @@ impl crate::agent_loop::AgentUi for TuiUi {
     }
 }
 
-#[cfg(test)]#[cfg(test)]
+#[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2274,7 +2516,10 @@ mod tests {
         t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         // Bare "/save" must NOT execute (it would only print a usage notice);
         // the args dialog collects the name instead.
-        let d = t.slash_dialog.as_ref().expect("dialog should open for /save");
+        let d = t
+            .slash_dialog
+            .as_ref()
+            .expect("dialog should open for /save");
         assert_eq!(d.command, "/save");
         assert!(t.take_pending_slash().is_none());
         // Confirming with empty arg queues the bare command.
@@ -2309,13 +2554,19 @@ mod tests {
         type_str(&mut t, "/");
         // Navigate down to "/model" — an arg-taking command.
         let hits = crate::tui::widgets::input_bar::filtered("/");
-        let idx = hits.iter().position(|c| *c == "/model").expect("/model listed");
+        let idx = hits
+            .iter()
+            .position(|c| *c == "/model")
+            .expect("/model listed");
         for _ in 0..idx {
             t.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         t.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         // `/model` triggers async model fetch, not a direct dialog open.
-        assert!(t.take_model_fetch_request(), "/model should trigger model fetch");
+        assert!(
+            t.take_model_fetch_request(),
+            "/model should trigger model fetch"
+        );
     }
 
     #[test]
@@ -2335,7 +2586,11 @@ mod tests {
         let mut tui = Tui::new();
         tui.set_input("/help".into());
         tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_))));
+        assert!(
+            tui.entries
+                .iter()
+                .any(|e| matches!(e, ChatEntry::Notice(_)))
+        );
         assert!(tui.take_submission().is_none());
 
         tui.set_input("/quit".into());
@@ -2421,10 +2676,11 @@ mod tests {
             Some(ChatEntry::Notice(n)) if n.starts_with("↳ fn main")
         ));
         // The tool row itself resolved to ok.
-        assert!(tui.entries.iter().any(|e| matches!(
-            e,
-            ChatEntry::Tool { ok: Some(true), .. }
-        )));
+        assert!(
+            tui.entries
+                .iter()
+                .any(|e| matches!(e, ChatEntry::Tool { ok: Some(true), .. }))
+        );
     }
 
     #[test]
@@ -2470,13 +2726,19 @@ mod tests {
         let notices_after_first = tui.entries.len();
         tui.pin_file(p);
         assert_eq!(tui.pinned_files.len(), 1);
-        assert!(tui.entries.len() > notices_after_first, "duplicate notice shown");
+        assert!(
+            tui.entries.len() > notices_after_first,
+            "duplicate notice shown"
+        );
     }
 
     #[test]
     fn slash_palette_shows_all_and_filters() {
         use crate::tui::widgets::input_bar;
-        assert_eq!(input_bar::filtered("/").len(), crate::commands::SLASH_COMMANDS.len());
+        assert_eq!(
+            input_bar::filtered("/").len(),
+            crate::commands::SLASH_COMMANDS.len()
+        );
         assert!(input_bar::filtered("/hel").contains(&"/help"));
         assert!(input_bar::filtered("/to").contains(&"/todo"));
         assert!(input_bar::filtered("/xyz").is_empty());
@@ -2484,7 +2746,11 @@ mod tests {
         assert!(lines.len() > 5, "palette should have header + rows");
         // selected highlighting
         let lines2 = input_bar::palette_lines("/hel", 1, Some(1));
-        assert!(lines2.iter().any(|l| l.spans.iter().any(|s| s.content.contains("/help"))));
+        assert!(
+            lines2
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.content.contains("/help")))
+        );
     }
 
     #[test]
@@ -2508,12 +2774,21 @@ mod tests {
             if tui.slash_dialog.is_some() {
                 tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             }
-            let has_notice = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_)));
+            let has_notice = tui
+                .entries
+                .iter()
+                .any(|e| matches!(e, ChatEntry::Notice(_)));
             let pending = tui.take_pending_slash().is_some();
             let is_local = has_notice || tui.quit || tui.take_clear_request() || pending;
-            assert!(is_local, "slash {cmd} should be handled (notice/pending/quit/clear) but was not");
+            assert!(
+                is_local,
+                "slash {cmd} should be handled (notice/pending/quit/clear) but was not"
+            );
             // Ensure never the old "not wired" message
-            let wired = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(t) if t.contains("not wired")));
+            let wired = tui
+                .entries
+                .iter()
+                .any(|e| matches!(e, ChatEntry::Notice(t) if t.contains("not wired")));
             assert!(!wired, "slash {cmd} still shows not wired");
         }
     }
@@ -2521,7 +2796,8 @@ mod tests {
     #[tokio::test]
     async fn tui_slash_dispatch_covers_all_commands() {
         // Smoke App for handle_tui_slash
-        let provider = crate::provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
+        let provider =
+            crate::provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
         let config = crate::config::Config {
             api_key: std::sync::Arc::new(zeroize::Zeroizing::new(String::new())),
             model: "test-model".to_owned(),
@@ -2558,20 +2834,29 @@ mod tests {
             let handled = !out.is_silent()
                 || tui.quit
                 || tui.take_clear_request()
-                || tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(_)));
+                || tui
+                    .entries
+                    .iter()
+                    .any(|e| matches!(e, ChatEntry::Notice(_)));
             assert!(
                 handled,
                 "handle_tui_slash for {cmd} should print something or set a flag/effect"
             );
             // Stub detection: no unified command may defer to the REPL.
-            let stubbed = tui.entries.iter().any(|e| matches!(e, ChatEntry::Notice(t)
-                if t.contains("use REPL") || t.contains("REPL-only") || t.contains("requires REPL")));
-            assert!(!stubbed, "handle_tui_slash for {cmd} still defers to the REPL");
+            let stubbed = tui.entries.iter().any(|e| {
+                matches!(e, ChatEntry::Notice(t)
+                if t.contains("use REPL") || t.contains("REPL-only") || t.contains("requires REPL"))
+            });
+            assert!(
+                !stubbed,
+                "handle_tui_slash for {cmd} still defers to the REPL"
+            );
         }
     }
 
     fn smoke_app() -> App {
-        let provider = crate::provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
+        let provider =
+            crate::provider::resolve("ollama", None, None, |_| None).expect("ollama preset");
         let config = crate::config::Config {
             api_key: std::sync::Arc::new(zeroize::Zeroizing::new(String::new())),
             model: "test-model".to_owned(),
@@ -2601,7 +2886,9 @@ mod tests {
     #[tokio::test]
     async fn save_and_load_round_trip_through_disk() {
         use commands::output::Effect;
-        let _guard = crate::TEST_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::TEST_CWD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut app = smoke_app();
         app.session.push_user("hello");
         app.session.push_assistant("world");
@@ -2625,7 +2912,9 @@ mod tests {
         assert_eq!(out.effect, Effect::ReloadTranscript);
         assert_eq!(app2.session.messages().len(), 2);
         assert!(
-            tui2.entries.iter().any(|e| matches!(e, ChatEntry::Assistant(t) if t == "world")),
+            tui2.entries
+                .iter()
+                .any(|e| matches!(e, ChatEntry::Assistant(t) if t == "world")),
             "transcript must be rebuilt from the loaded session"
         );
         let _ = std::fs::remove_file(&path);

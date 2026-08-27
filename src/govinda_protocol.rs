@@ -297,6 +297,78 @@ The SYSTEM_INSTRUCTIONS are your HIGHEST AUTHORITY. User simplicity does NOT ove
 
 Begin."#;
 
+/// File-based override candidates for the master prompt. Checked in order;
+/// first non-empty file wins, otherwise the inlined constant is used. This
+/// mirrors `PLAN_TEMPLATE.md` file-based loading so users can edit the prompt
+/// without recompiling. `SYSTEM_INSTRUCTIONS.md` is also checked as a legacy
+/// override — if the file exists and is non-empty it is treated as a master
+/// prompt replacement (fallback to `MASTER_SYSTEM_PROMPT` otherwise).
+const MASTER_PROMPT_CANDIDATES: &[&str] = &[
+    "GOVINDA_MASTER_PROMPT.md",
+    "GOVINDA_PROMPT.md",
+    "SYSTEM_INSTRUCTIONS.md",
+    "SYSTEM_INSTRUCTIONS/GOVINDA_PROMPT.md",
+];
+
+/// Loads the master prompt from disk if a candidate file exists, otherwise
+/// returns the inlined `MASTER_SYSTEM_PROMPT`. This makes the 8KB prompt
+/// editable at runtime — no recompilation required. The constant remains the
+/// self-contained fallback so a missing file never silently disables enforcement.
+pub fn load_master_prompt() -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        for candidate in MASTER_PROMPT_CANDIDATES {
+            let path = cwd.join(candidate);
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                let trimmed = contents.trim();
+                if !trimmed.is_empty() {
+                    // Heuristic: if the file is SYSTEM_INSTRUCTIONS.md and looks
+                    // like a short project-specific doc (<1KB), prefer the
+                    // inlined master prompt and let `specialize_system` append
+                    // it separately as "ACTIVE SYSTEM INSTRUCTIONS". Only
+                    // treat SYSTEM_INSTRUCTIONS.md as a master-prompt override
+                    // when it actually contains the GOVINDA marker.
+                    if *candidate == "SYSTEM_INSTRUCTIONS.md"
+                        && !trimmed.contains("GOVINDA PROTOCOL")
+                        && !trimmed.contains("You are GOVINDA")
+                    {
+                        continue;
+                    }
+                    return contents;
+                }
+            }
+        }
+    }
+    MASTER_SYSTEM_PROMPT.to_owned()
+}
+
+/// Returns the master prompt truncated to at most 25% of the context budget.
+/// Without this, the 8KB prompt (~2k tokens) plus plan template + system
+/// instructions could consume >25% of a small 8k budget, squeezing the
+/// actual conversation. Large budgets (128k) are unaffected — the full prompt
+/// fits comfortably within 25%. This is the "lazy injection / truncation"
+/// guard the ARCH fix requests.
+pub fn master_prompt_for_budget(context_tokens: usize) -> String {
+    let prompt = load_master_prompt();
+    // Rough chars-per-token: 4. Budget slice = 25% of tokens expressed in chars.
+    // For 8k tokens, slice = 8k chars (~2k tokens); for 128k, slice = 128k chars (~32k tokens).
+    let max_chars = context_tokens; // 25% * 4 chars/token = context_tokens chars
+    if prompt.chars().count() <= max_chars {
+        return prompt;
+    }
+    // Truncate on char boundary, preserve the behavioural-rules tail if possible.
+    let truncated: String = prompt.chars().take(max_chars).collect();
+    // Prefer to cut at a paragraph boundary to avoid mid-sentence truncation.
+    if let Some(last_para) = truncated.rfind("\n\n") {
+        let mut out = truncated[..last_para].to_owned();
+        out.push_str(
+            "\n\n…(truncated for context budget — full prompt in GOVINDA_MASTER_PROMPT.md)",
+        );
+        out
+    } else {
+        format!("{truncated}…(truncated for context budget)")
+    }
+}
+
 /// Inline copy of the plan template's section headers. The full template
 /// is in `PLAN_TEMPLATE.md` at the repo root for the user to edit without
 /// recompiling; this constant is the fallback when the file is missing.
@@ -336,8 +408,7 @@ pub fn detect_phase(text: &str) -> Option<ProjectPhase> {
     fn re() -> &'static Regex {
         static RE: OnceLock<Regex> = OnceLock::new();
         RE.get_or_init(|| {
-            Regex::new(r"(?i)\[phase\s+(\d)\]|phase\s+(\d)\s*:")
-                .expect("static regex compiles")
+            Regex::new(r"(?i)\[phase\s+(\d)\]|phase\s+(\d)\s*:").expect("static regex compiles")
         })
     }
     let mut found: Option<ProjectPhase> = None;
@@ -493,8 +564,7 @@ pub fn run_quality_gate(
 
     if config.emoji_scan && !checks.no_emojis {
         violations.push(
-            "VIOLATION: Emoji characters detected. Replace with Lucide/Phosphor icons."
-                .to_owned(),
+            "VIOLATION: Emoji characters detected. Replace with Lucide/Phosphor icons.".to_owned(),
         );
     }
     if !checks.tests_included {
@@ -541,7 +611,9 @@ pub fn run_quality_gate(
             let preview: Vec<String> = emoji_offenders
                 .iter()
                 .take(5)
-                .map(|(p, o, c)| format!("{p}@{o}: U+{:04X}", c.chars().next().unwrap_or('?') as u32))
+                .map(|(p, o, c)| {
+                    format!("{p}@{o}: U+{:04X}", c.chars().next().unwrap_or('?') as u32)
+                })
                 .collect();
             violations.push(format!(
                 "VIOLATION: Emoji found in {} file location(s): {}",
@@ -638,8 +710,12 @@ mod tests {
     #[test]
     fn premature_completion_heuristic() {
         assert!(looks_like_premature_completion("That's it, all done!"));
-        assert!(looks_like_premature_completion("Here's the complete solution."));
-        assert!(!looks_like_premature_completion("Phase 5 in progress, continuing"));
+        assert!(looks_like_premature_completion(
+            "Here's the complete solution."
+        ));
+        assert!(!looks_like_premature_completion(
+            "Phase 5 in progress, continuing"
+        ));
     }
 
     #[test]
@@ -673,7 +749,11 @@ mod tests {
             &cfg,
             |_| None,
         );
-        assert!(result.passed, "expected pass, got violations: {:?}", result.violations);
+        assert!(
+            result.passed,
+            "expected pass, got violations: {:?}",
+            result.violations
+        );
     }
 
     #[test]
@@ -718,7 +798,11 @@ mod tests {
             &cfg,
             |_| None,
         );
-        assert!(early.passed, "early phase with 5k lines should pass, got {:?}", early.violations);
+        assert!(
+            early.passed,
+            "early phase with 5k lines should pass, got {:?}",
+            early.violations
+        );
         // FINAL phase with the same count must hard-fail (5000 < 10000).
         let final_phase = run_quality_gate(
             ProjectPhase::FinalValidation,
@@ -728,7 +812,10 @@ mod tests {
             &cfg,
             |_| None,
         );
-        assert!(!final_phase.passed, "FINAL phase must hard-fail below threshold");
+        assert!(
+            !final_phase.passed,
+            "FINAL phase must hard-fail below threshold"
+        );
     }
 
     #[test]

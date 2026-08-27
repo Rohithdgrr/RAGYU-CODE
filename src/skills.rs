@@ -61,10 +61,7 @@ pub fn load_skills() -> Vec<Skill> {
             match parse_skill_file(&path) {
                 Ok(skill) => skills.push(skill),
                 Err(e) => {
-                    eprintln!(
-                        "warning: failed to load skill {}: {e:#}",
-                        path.display()
-                    );
+                    eprintln!("warning: failed to load skill {}: {e:#}", path.display());
                 }
             }
         }
@@ -75,8 +72,8 @@ pub fn load_skills() -> Vec<Skill> {
 
 /// Parses a single skill `.md` file.
 fn parse_skill_file(path: &Path) -> Result<Skill> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
 
     let raw = raw.trim();
     anyhow::ensure!(!raw.is_empty(), "empty skill file");
@@ -111,24 +108,18 @@ fn parse_skill_file(path: &Path) -> Result<Skill> {
         }
     }
 
-    let name = meta
-        .get("name")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .map(|s| format!("/{}", s.to_string_lossy()))
-                .unwrap_or_else(|| "/unknown".into())
-        });
+    let name = meta.get("name").map(|s| s.to_string()).unwrap_or_else(|| {
+        path.file_stem()
+            .map(|s| format!("/{}", s.to_string_lossy()))
+            .unwrap_or_else(|| "/unknown".into())
+    });
 
     let description = meta
         .get("description")
         .unwrap_or(&"Custom skill")
         .to_string();
 
-    let requires_args = meta
-        .get("args")
-        .map(|s| *s == "required")
-        .unwrap_or(false);
+    let requires_args = meta.get("args").map(|s| *s == "required").unwrap_or(false);
 
     anyhow::ensure!(!body.is_empty(), "skill body is empty");
 
@@ -143,10 +134,7 @@ fn parse_skill_file(path: &Path) -> Result<Skill> {
 
 /// Builds a skill map from command name to skill for quick lookup.
 pub fn skill_map(skills: &[Skill]) -> HashMap<String, &Skill> {
-    skills
-        .iter()
-        .map(|s| (s.name.clone(), s))
-        .collect()
+    skills.iter().map(|s| (s.name.clone(), s)).collect()
 }
 
 #[cfg(test)]

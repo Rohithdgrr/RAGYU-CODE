@@ -131,12 +131,51 @@ pub enum TurnResult {
     RoundLimit,
 }
 
+/// Explicit state machine for the agent turn loop. The original
+/// procedural `loop { stream → tools → continue }` is now tracked via
+/// this enum so observers, tests, and future UI can reason about the
+/// current phase without parsing logs. States map 1:1 to the loop's
+/// branches: streaming deltas, executing tool calls, self-correcting
+/// after a failure, compacting history, terminal completed/cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnState {
+    /// Waiting for streamed deltas from the provider.
+    Streaming,
+    /// Running the tool round that the last stream requested.
+    ExecutingTools,
+    /// Granted an extra round after a failed tool result (self-correction).
+    SelfCorrecting,
+    /// Auto-compact triggered (history summarized or hard reset).
+    Compacting,
+    /// Turn finished with a final answer.
+    Completed,
+    /// Turn was cancelled via `AgentUi::cancel_wait()` or Ctrl+C.
+    Cancelled,
+    /// Hit the round/fix limit without a final answer.
+    RoundLimited,
+}
+
+impl TurnState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnState::Streaming => "streaming",
+            TurnState::ExecutingTools => "executing_tools",
+            TurnState::SelfCorrecting => "self_correcting",
+            TurnState::Compacting => "compacting",
+            TurnState::Completed => "completed",
+            TurnState::Cancelled => "cancelled",
+            TurnState::RoundLimited => "round_limited",
+        }
+    }
+}
+
 /// Runs one full agent turn: stream → optional concurrent tool rounds with
 /// self-correction → final answer.
 ///
 /// Session mutation happens here; presentation flows through `ui`. Returns
 /// `Err` only when `ui.fail_fast()` is set (one-shot mode); otherwise errors
 /// are salvaged locally and reported through [`AgentUi::error`].
+#[allow(unused_assignments)]
 pub async fn run_turn(
     app: &mut App,
     ui: &dyn AgentUi,
@@ -173,16 +212,15 @@ pub async fn run_turn(
         MAX_FIX_ROUNDS
     };
 
-    // Per-turn router: 3 strikes on the active model promote to the
-    // next non-quarantined entry. State is local to the turn — the
-    // pre-flight probe is the cross-turn check.
-    let provider_key = app.config.provider.key();
-    let mut router = crate::router::Router::for_active(
-        provider_key.as_ref(),
-        &app.config.model,
-    );
-    if !app.router_failover {
-        router.set_failover(false);
+    // Persistent per-session router: sync to the current active
+    // provider/model, preserving strike counters and quarantine set
+    // across turns. 3 strikes on the active model promote to the
+    // next non-quarantined entry.
+    {
+        let provider_key = app.config.provider.key().to_string();
+        let model = app.config.model.clone();
+        app.router.sync_active(&provider_key, &model);
+        app.router.set_failover(app.router_failover);
     }
     let mut failover_attempts: u8 = 0;
 
@@ -210,31 +248,43 @@ pub async fn run_turn(
     // failed tool round grants extra turns so the model can react.
     let mut fixes_granted = 0usize;
     let mut round_no = 0usize;
+    // State machine tracking — the original procedural loop now has an
+    // explicit `TurnState` so the current phase is inspectable.
+    let mut turn_state = TurnState::Streaming;
 
     loop {
         round_no += 1;
         if round_no > max_rounds + fixes_granted {
+            turn_state = TurnState::RoundLimited;
             ui.notice(&format!(
-                "stopped after {} tool rounds{} — ask again to continue.",
+                "stopped after {} tool rounds{} — ask again to continue. [state={}]",
                 max_rounds + fixes_granted,
                 if fixes_granted > 0 {
                     format!(" (+{fixes_granted} self-correction)")
                 } else {
                     String::new()
-                }
+                },
+                turn_state.as_str()
             ));
             return Ok(TurnResult::RoundLimit);
         }
 
         let history = {
             let compressed = app.session.messages_compressed();
-            app.session
-                .window_with_messages(&compressed, app.config.context_tokens, injection.as_deref())
+            app.session.window_with_messages(
+                &compressed,
+                app.config.context_tokens,
+                injection.as_deref(),
+            )
         };
         let auth = app.config.provider.auth();
+        let provider_key_for_tokens = app.config.provider.key().to_string();
+        let model_for_tokens = app.config.model.clone();
+        let max_out = crate::provider::max_output_for(&provider_key_for_tokens, &model_for_tokens);
         let opts = ChatOptions {
             max_response_bytes: app.max_response_bytes,
             read_timeout: app.read_timeout,
+            max_tokens: Some(max_out as u32),
             tools: if app.tools_enabled {
                 app.tool_specs
                     .iter()
@@ -244,7 +294,11 @@ pub async fn run_turn(
             } else {
                 Vec::new()
             },
-            ..ChatOptions::new(auth.token(), app.config.model.as_str(), app.config.temperature)
+            ..ChatOptions::new(
+                auth.token(),
+                app.config.model.as_str(),
+                app.config.temperature,
+            )
         };
 
         // Everything the session held before this stream attempt; an error
@@ -269,6 +323,7 @@ pub async fn run_turn(
 
         match result {
             Ok(()) if !tool_calls.is_empty() && app.tools_enabled => {
+                turn_state = TurnState::ExecutingTools;
                 show_prose(ui, &out);
                 // GOVINDA protocol: track the current phase from the
                 // model's [Phase N] markers so we can spot the assistant
@@ -282,10 +337,14 @@ pub async fn run_turn(
                 }
                 if had_failure && fixes_granted < max_fixes {
                     fixes_granted += 1;
+                    turn_state = TurnState::SelfCorrecting;
                     ui.notice(&format!(
-                        "↻ failure detected — granting self-correction round ({fixes_granted}/{max_fixes} max)"
+                        "↻ failure detected — granting self-correction round ({fixes_granted}/{max_fixes} max) [state={}]",
+                        turn_state.as_str()
                     ));
                 }
+                // Back to streaming for the next round.
+                turn_state = TurnState::Streaming;
                 continue; // stream again so the model sees the results
             }
             Ok(()) => {
@@ -302,15 +361,17 @@ pub async fn run_turn(
                 {
                     if fixes_granted < max_fixes {
                         fixes_granted += 1;
+                        turn_state = TurnState::SelfCorrecting;
                         let phase_str = app
                             .current_phase
                             .map(|p| p.as_str())
                             .unwrap_or("INSTRUCTION_INGESTION");
                         ui.notice(&format!(
                             "GOVINDA PROTOCOL: premature completion detected (phase={phase_str}). \
-                             Granting self-correction round {fixes_granted}/{max_fixes}. \
+                             Granting self-correction round {fixes_granted}/{max_fixes} [state={}] . \
                              Continue with the next phase and call quality_gate_check before \
-                             claiming completion."
+                             claiming completion.",
+                            turn_state.as_str()
                         ));
                         // Inject the pressure as an extra user turn so
                         // the model sees it in the next stream.
@@ -321,6 +382,7 @@ pub async fn run_turn(
                              [Phase N] marker, then either keep implementing or call \
                              quality_gate_check with phase=FINAL_VALIDATION.",
                         );
+                        turn_state = TurnState::Streaming;
                         continue;
                     } else {
                         ui.notice(
@@ -329,10 +391,15 @@ pub async fn run_turn(
                         );
                     }
                 }
+                turn_state = TurnState::Completed;
                 finish_answer(app, ui, out);
                 ui.timeline(app.config.model.as_str(), started.elapsed());
                 app.record_turn(started.elapsed());
-                router.record_success(&app.config.model, started.elapsed().as_millis() as u32);
+                {
+                    let model = app.config.model.clone();
+                    let latency = started.elapsed().as_millis() as u32;
+                    app.router.record_success(&model, latency);
+                }
                 crate::router_health::append(&crate::router_health::HealthEntry {
                     ts: chrono::Utc::now().to_rfc3339(),
                     model: app.config.model.clone(),
@@ -340,9 +407,10 @@ pub async fn run_turn(
                     success: true,
                     error: None,
                 });
+                let router_snapshot = app.router.clone();
                 match crate::auto_compact::check_and_run(
                     app,
-                    &mut router,
+                    &router_snapshot,
                     crate::auto_compact::SOFT_COMPACT_PCT,
                     crate::auto_compact::HARD_COMPACT_PCT,
                 )
@@ -350,21 +418,38 @@ pub async fn run_turn(
                 {
                     crate::auto_compact::Outcome::Noop => {}
                     crate::auto_compact::Outcome::SoftCompacted => {
-                        ui.notice("auto-compact: history summarized (>= 90% fill)");
+                        turn_state = TurnState::Compacting;
+                        ui.notice(&format!(
+                            "auto-compact: history summarized (>= 90% fill) [state={}]",
+                            turn_state.as_str()
+                        ));
+                        turn_state = TurnState::Completed;
                     }
                     crate::auto_compact::Outcome::HardReset => {
-                        ui.notice("auto-compact: hard reset (>= 98% fill)");
+                        turn_state = TurnState::Compacting;
+                        ui.notice(&format!(
+                            "auto-compact: hard reset (>= 98% fill) [state={}]",
+                            turn_state.as_str()
+                        ));
+                        turn_state = TurnState::Completed;
                     }
                 }
                 return Ok(TurnResult::Answered);
             }
             Err(e) => {
+                // State tracking: interruptions are explicit Cancelled,
+                // other errors are treated as RoundLimited for now.
+                if e.to_string().contains("interrupted") {
+                    turn_state = TurnState::Cancelled;
+                } else {
+                    // Preserve previous state; will become RoundLimited if we bail.
+                }
                 app.record_error();
                 // Record the failure against the active model and
                 // try the next non-quarantined entry once before
                 // giving up.
                 let active = app.config.model.clone();
-                router.record_failure(
+                app.router.record_failure(
                     &active,
                     crate::router::FailureKind::Server,
                     &format!("{e:#}"),
@@ -377,17 +462,23 @@ pub async fn run_turn(
                     error: Some(format!("{e:#}")),
                 });
                 if failover_attempts < 1 {
-                    if let Some(next) = router.promote() {
+                    let next_model = {
+                        let r = &mut app.router;
+                        r.promote().map(|e| e.model.clone())
+                    };
+                    if let Some(next) = next_model {
                         failover_attempts += 1;
-                        app.config.model = next.model.clone();
+                        let active_clone = active.clone();
+                        app.config.model = next.clone();
                         ui.notice(&format!(
                             "router: failover to {} after strike on {}",
-                            next.model, active
+                            next, active_clone
                         ));
                         // Roll back the partial assistant turn so the
                         // next request starts cleanly.
                         app.session
                             .truncate_messages(resume_len.min(app.session.messages().len()));
+                        turn_state = TurnState::Streaming;
                         continue;
                     }
                 }
@@ -395,6 +486,10 @@ pub async fn run_turn(
                 handle_round_error(app, ui, out, resume_len, e);
                 if fail_fast {
                     anyhow::bail!("turn failed");
+                }
+                // Only set RoundLimited if we weren't already Cancelled.
+                if turn_state != TurnState::Cancelled {
+                    turn_state = TurnState::RoundLimited;
                 }
                 return Ok(TurnResult::RoundLimit);
             }
@@ -418,7 +513,10 @@ async fn run_tool_round(
     calls: &[api::ToolCall],
 ) -> bool {
     for call in calls {
-        ui.notice(&format!("→ {}({})", call.function.name, call.function.arguments));
+        ui.notice(&format!(
+            "→ {}({})",
+            call.function.name, call.function.arguments
+        ));
     }
 
     let executor: Option<std::sync::Arc<dyn crate::tools::ToolExecutor>> =
@@ -487,7 +585,8 @@ async fn run_tool_round(
         })
         .collect();
 
-    let mut outcomes: Vec<Option<anyhow::Result<String>>> = (0..calls.len()).map(|_| None).collect();
+    let mut outcomes: Vec<Option<anyhow::Result<String>>> =
+        (0..calls.len()).map(|_| None).collect();
     let mut had_failure = false;
     while let Some((i, outcome)) = futures.next().await {
         let ok = outcome.is_ok();
@@ -496,7 +595,12 @@ async fn run_tool_round(
             Err(e) if e.to_string() == "declined" => String::new(),
             Err(_) => String::new(),
         };
-        ui.tool_end(&calls[i].function.name, &calls[i].function.arguments, ok, &snippet);
+        ui.tool_end(
+            &calls[i].function.name,
+            &calls[i].function.arguments,
+            ok,
+            &snippet,
+        );
         if outcome.is_err() || outcome.as_deref().is_ok_and(result_signals_failure) {
             had_failure = true;
         }
@@ -567,7 +671,13 @@ fn finish_answer(app: &mut App, ui: &dyn AgentUi, out: String) {
 
 /// Error policy: keep any partially generated answer (marked interrupted),
 /// otherwise roll back to the pre-round state minus the trailing prompt.
-fn handle_round_error(app: &mut App, ui: &dyn AgentUi, out: String, resume_len: usize, e: anyhow::Error) {
+fn handle_round_error(
+    app: &mut App,
+    ui: &dyn AgentUi,
+    out: String,
+    resume_len: usize,
+    e: anyhow::Error,
+) {
     if !out.is_empty() {
         let kept = format!("{out}\n\n*(interrupted)*");
         app.session.push_assistant(kept.clone());

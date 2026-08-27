@@ -20,6 +20,7 @@ pub enum Kind {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     pub kind: Kind,
     /// Framework name (nextjs, vite, tauri, electron, discord.py, ratatui, ...).
@@ -151,7 +152,10 @@ fn scaffold_nextjs(name: &str) -> BTreeMap<&'static str, String> {
         "app/layout.tsx",
         "import './globals.css';\nexport default function RootLayout({ children }: { children: React.ReactNode }) { return <html><body>{children}</body></html>; }\n".to_string(),
     );
-    m.insert("app/globals.css", "html, body { padding: 0; margin: 0; font-family: system-ui, sans-serif; }\n".to_string());
+    m.insert(
+        "app/globals.css",
+        "html, body { padding: 0; margin: 0; font-family: system-ui, sans-serif; }\n".to_string(),
+    );
     m.insert(
         "tsconfig.json",
         "{\n  \"compilerOptions\": {\n    \"target\": \"es2017\",\n    \"lib\": [\"dom\", \"dom.iterable\", \"esnext\"],\n    \"allowJs\": true,\n    \"skipLibCheck\": true,\n    \"strict\": true,\n    \"noEmit\": true,\n    \"esModuleInterop\": true,\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"resolveJsonModule\": true,\n    \"isolatedModules\": true,\n    \"jsx\": \"preserve\",\n    \"incremental\": true,\n    \"plugins\": [{ \"name\": \"next\" }]\n  },\n  \"include\": [\"next-env.d.ts\", \"**/*.ts\", \"**/*.tsx\"],\n  \"exclude\": [\"node_modules\"]\n}\n".to_string(),
@@ -174,8 +178,14 @@ fn scaffold_vite(name: &str) -> BTreeMap<&'static str, String> {
         ),
     );
     m.insert("src/main.ts", format!("import './style.css';\ndocument.querySelector<HTMLDivElement>('#app')!.innerHTML = `<h1>{name}</h1>`;\n"));
-    m.insert("src/style.css", "body { font-family: system-ui; padding: 2rem; }\n".to_string());
-    m.insert("vite.config.ts", "import { defineConfig } from 'vite';\nexport default defineConfig({});\n".to_string());
+    m.insert(
+        "src/style.css",
+        "body { font-family: system-ui; padding: 2rem; }\n".to_string(),
+    );
+    m.insert(
+        "vite.config.ts",
+        "import { defineConfig } from 'vite';\nexport default defineConfig({});\n".to_string(),
+    );
     m.insert("tsconfig.json", "{ \"compilerOptions\": { \"target\": \"es2020\", \"useDefineForClassFields\": true, \"module\": \"esnext\", \"moduleResolution\": \"bundler\", \"strict\": true, \"jsx\": \"preserve\" }, \"include\": [\"src\"] }\n".to_string());
     m
 }
@@ -187,7 +197,12 @@ fn scaffold_tauri(name: &str) -> BTreeMap<&'static str, String> {
         "src-tauri/src/main.rs",
         "fn main() { tauri::Builder::default().run(tauri::generate_context!()).expect(\"error\"); }\n".to_string(),
     );
-    m.insert("package.json", format!("{{\"name\": \"{name}\", \"private\": true, \"scripts\": {{\"tauri\": \"tauri\"}}}}\n"));
+    m.insert(
+        "package.json",
+        format!(
+            "{{\"name\": \"{name}\", \"private\": true, \"scripts\": {{\"tauri\": \"tauri\"}}}}\n"
+        ),
+    );
     m
 }
 
@@ -273,7 +288,10 @@ fn scaffold_chrome_ext(name: &str) -> BTreeMap<&'static str, String> {
             + "\",\n  \"version\": \"0.1.0\",\n  \"action\": {\"default_popup\": \"popup.html\"}\n}\n",
     );
     m.insert("popup.html", format!("<!doctype html>\n<html><head><title>{name}</title></head><body><h1>{name}</h1></body></html>\n"));
-    m.insert("popup.js", format!("document.body.textContent = '{name} loaded';\n"));
+    m.insert(
+        "popup.js",
+        format!("document.body.textContent = '{name} loaded';\n"),
+    );
     m
 }
 

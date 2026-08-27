@@ -153,7 +153,9 @@ pub(super) fn show_tools(arg: &str, app: &mut App) {
                 }
             };
             if !app.tool_specs.iter().any(|t| t.name == name) {
-                err(format!("unknown tool '{name}' — run /tools to see the registry"));
+                err(format!(
+                    "unknown tool '{name}' — run /tools to see the registry"
+                ));
                 return;
             }
             if disable {
@@ -216,7 +218,6 @@ pub(super) fn search_history(needle: &str, app: &App) {
     ok(format!("{} match(es).", hits.len()));
 }
 
-#[allow(dead_code)]
 pub(super) fn show_stats(app: &App) {
     let elapsed = app.stats.started.map_or(Duration::ZERO, |s| s.elapsed());
     let avg = if app.stats.turns > 0 {
@@ -232,6 +233,51 @@ pub(super) fn show_stats(app: &App) {
         app.stats.errors,
         app.session.messages().len(),
         app.session.approx_tokens(),
+    ));
+    // Router health summary
+    let mut total_req: u32 = 0;
+    let mut total_fail: u32 = 0;
+    let mut latencies: Vec<u32> = Vec::new();
+    let mut quarantined: Vec<String> = Vec::new();
+    for entry in app.router.iter() {
+        if let Some(h) = app.router.health(&entry.model) {
+            total_req += h.total_requests;
+            total_fail += h.total_failures;
+            if h.last_latency_ms > 0 {
+                latencies.push(h.last_latency_ms);
+            }
+        }
+        if app.router.is_quarantined(&entry.model) {
+            quarantined.push(entry.model.clone());
+        }
+    }
+    let success_rate = if total_req > 0 {
+        (total_req - total_fail) as f32 / total_req as f32 * 100.0
+    } else {
+        100.0
+    };
+    latencies.sort_unstable();
+    let p50 = if latencies.is_empty() {
+        0
+    } else {
+        latencies[latencies.len() / 2]
+    };
+    let p95 = if latencies.is_empty() {
+        0
+    } else {
+        let idx = ((latencies.len() as f32 * 0.95) as usize).min(latencies.len() - 1);
+        latencies[idx]
+    };
+    info(format!(
+        "router         success {:.1}%  p50 {}ms  p95 {}ms  quarantined {}",
+        success_rate,
+        p50,
+        p95,
+        if quarantined.is_empty() {
+            "(none)".to_owned()
+        } else {
+            quarantined.join(", ")
+        }
     ));
 }
 

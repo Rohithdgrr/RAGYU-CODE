@@ -66,11 +66,19 @@ Delivery history and forward plan. Phases 1–7 are **shipped**; 8+ are planned.
 - Git tools: `git_diff`, `git_log` (read-only), `git_branch`, `git_commit`
   (mutations confirmation-gated; direct argv spawns)
 
-## Phase 10 — Context & content (planned)
-- File attachments / RAG over a local folder
-- Incremental symbol-index updates on staged applies
-- Streaming markdown renderer (render-as-it-arrives in markdown mode)
-- Smarter compaction: preserve recent tool rounds verbatim
+## Phase 10 — Context & content (done)
+- File attachments / RAG over a local folder — token-aware chunking (`rag.rs`) with tokenizer budgeting and `prompt_cache` LRU
+- Incremental symbol-index updates on staged applies (debounced `symbols::ensure` with `max_mtime` check)
+- Streaming markdown renderer (chat_pane `inline_spans` + `build_lines` memo cache)
+- Smarter compaction: `auto_compact` soft (90 %) via cheapest healthy router entry + hard (98 %) keep system + last 4 turns
 
-## Phase 11 — Productization (planned)
-- Full-TUI mode, release packaging (cargo-dist), install script, badges
+## Phase 11 — Productization (done)
+- Full-TUI mode (ratatui, 110KB split into `chat_pane`/`input_bar`/`file_tree`/`provider_workflow`, glassmorphism themes, Sharp frosted borders)
+- Release packaging docs, install script via `cargo run --release`, badges
+
+## Phase 12 — OmniRouter hardening & intelligence (done — 2026-08-27)
+- `RouterRole` + `OMNIROUTE_COMBOS` table, `Router` 3-strike failover + `preflight` probe (8s), `auto_compact` thresholds, `/router status|failover|reset`, `model_rank` health-aware `top_models`, `router_health` JSONL, `prompt_cache` LRU, `max_tokens` via `max_output_for`, `prompt_cache` for `/variants`/`/retry`
+- OmniRoute bootstrap stderr→tempfile tail + 10s second-chance probe
+
+## Phase 13 — Second-pass hardening (done — 2026-08-27)
+- `Rc<RefCell>` → `Arc<Mutex>` for `SharedStream`, `highlight_code_line` bounds fix, `inline_spans` coalesce fix, `preview` canonical symlink guard + `OnceCell` race fix, `sessions`/`persistence` symlink + `..` guards, `apply_pending` lock-drop, `tokens` provider-aware scaling, `git` worktree `.git` file handling, API key `Zeroizing` + redacted `Debug`, `ssrf` expanded blocklists + DNS rebinding check + `shell_audit.log`, `preview` token auth, `chat_pane` memo cache, `lsp` `spawn_blocking`

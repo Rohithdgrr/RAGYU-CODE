@@ -322,41 +322,63 @@ impl FileTree {
                     t.sidebar_bg()
                 };
                 let icon_style = if selected_row {
-                    Style::default().fg(icon_fg).bg(base.bg.unwrap_or(t.bg_secondary)).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(icon_fg)
+                        .bg(base.bg.unwrap_or(t.bg_secondary))
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(icon_fg).bg(base.bg.unwrap_or(t.bg_secondary))
+                    Style::default()
+                        .fg(icon_fg)
+                        .bg(base.bg.unwrap_or(t.bg_secondary))
                 };
 
                 // compute truncation for perfect fit
-                let mark_w = if self.git_marks.contains_key(&node.rel) { 2 } else { 0 };
+                let mark_w = if self.git_marks.contains_key(&node.rel) {
+                    2
+                } else {
+                    0
+                };
                 let prefix_w = indent.len() + 3; // "▸ " is 2 chars + space
                 let max_name = avail.saturating_sub(prefix_w + mark_w).max(8);
                 let display_name = truncate_name(&node.name, max_name);
 
                 let mut spans = vec![
-                    Span::styled(
-                        format!("{indent}{:>2} ", icon),
-                        icon_style,
-                    ),
+                    Span::styled(format!("{indent}{:>2} ", icon), icon_style),
                     Span::styled(
                         display_name.clone(),
                         if selected_row {
                             base.add_modifier(Modifier::BOLD)
                         } else if node.is_dir {
-                            Style::default().fg(t.accent_secondary).bg(t.bg_secondary).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(t.accent_secondary)
+                                .bg(t.bg_secondary)
+                                .add_modifier(Modifier::BOLD)
                         } else {
                             base
                         },
                     ),
                 ];
                 if let Some(mark) = self.git_marks.get(&node.rel) {
-                    spans.push(Span::styled(format!(" {}", mark.symbol()), mark.color(&t).bg(base.bg.unwrap_or(t.bg_secondary))));
+                    spans.push(Span::styled(
+                        format!(" {}", mark.symbol()),
+                        mark.color(&t).bg(base.bg.unwrap_or(t.bg_secondary)),
+                    ));
                 }
                 // dim rlib/d artefacts
-                if !node.is_dir && matches!(node.name.rsplit('.').next().unwrap_or(""), "rmeta" | "rlib" | "d" | "pdb") {
+                if !node.is_dir
+                    && matches!(
+                        node.name.rsplit('.').next().unwrap_or(""),
+                        "rmeta" | "rlib" | "d" | "pdb"
+                    )
+                {
                     // already muted via icon color, keep name muted
                     if let Some(last) = spans.get_mut(1) {
-                        *last = Span::styled(display_name.clone(), Style::default().fg(t.text_muted).bg(base.bg.unwrap_or(t.bg_secondary)));
+                        *last = Span::styled(
+                            display_name.clone(),
+                            Style::default()
+                                .fg(t.text_muted)
+                                .bg(base.bg.unwrap_or(t.bg_secondary)),
+                        );
                     }
                 }
                 Line::from(spans).style(base)
@@ -427,12 +449,7 @@ fn expand_to(nodes: &mut [TreeNode], root: &Path, ignore: &IgnoreRules, target: 
     }
 }
 
-fn walk_expand(
-    nodes: &mut [TreeNode],
-    root: &Path,
-    ignore: &IgnoreRules,
-    rel: &str,
-) -> bool {
+fn walk_expand(nodes: &mut [TreeNode], root: &Path, ignore: &IgnoreRules, rel: &str) -> bool {
     for node in nodes {
         if node.rel != rel {
             continue;
@@ -447,12 +464,7 @@ fn walk_expand(
     false
 }
 
-fn toggle_in(
-    nodes: &mut [TreeNode],
-    root: &Path,
-    ignore: &IgnoreRules,
-    target: &str,
-) -> bool {
+fn toggle_in(nodes: &mut [TreeNode], root: &Path, ignore: &IgnoreRules, target: &str) -> bool {
     for node in nodes {
         if node.rel == target && node.is_dir {
             if !node.loaded {
@@ -462,9 +474,7 @@ fn toggle_in(
             node.expanded = !node.expanded;
             return true;
         }
-        if node.is_dir
-            && toggle_in(&mut node.children, root, ignore, target)
-        {
+        if node.is_dir && toggle_in(&mut node.children, root, ignore, target) {
             return true;
         }
     }
@@ -501,8 +511,7 @@ mod tests {
     fn scratch() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("govinda-tree-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("govinda-tree-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src/nested")).unwrap();
         std::fs::create_dir_all(dir.join("target")).unwrap();
@@ -561,7 +570,11 @@ mod tests {
         assert!(tree.activate_selected().is_none()); // toggles closed again
 
         tree.toggle_selected(); // reopen
-        let file_idx = tree.flat().iter().position(|n| n.rel == "src/main.rs").unwrap();
+        let file_idx = tree
+            .flat()
+            .iter()
+            .position(|n| n.rel == "src/main.rs")
+            .unwrap();
         tree.move_selection(file_idx as isize - tree.selected as isize);
         let pinned = tree.activate_selected().unwrap();
         assert!(pinned.ends_with("main.rs"));

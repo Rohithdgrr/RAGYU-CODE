@@ -69,12 +69,7 @@ pub fn fill_pct(app: &App) -> u8 {
 }
 
 /// Decides whether to run a soft compact, a hard reset, or nothing.
-pub async fn check_and_run(
-    app: &mut App,
-    router: &Router,
-    soft_pct: u8,
-    hard_pct: u8,
-) -> Outcome {
+pub async fn check_and_run(app: &mut App, router: &Router, soft_pct: u8, hard_pct: u8) -> Outcome {
     let pct = fill_pct(app);
     if pct < soft_pct {
         reset_streak();
@@ -91,9 +86,8 @@ pub async fn check_and_run(
     // Soft path. The streak counter forces a hard reset when two
     // soft compactions in a row did not move the needle.
     let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
-    let drifted = state.soft_streak >= 1
-        && pct.abs_diff(state.last_soft_pct) < 5
-        && pct >= soft_pct;
+    let drifted =
+        state.soft_streak >= 1 && pct.abs_diff(state.last_soft_pct) < 5 && pct >= soft_pct;
     state.last_soft_pct = pct;
     state.soft_streak = state.soft_streak.saturating_add(1);
     drop(state);
@@ -139,14 +133,23 @@ async fn soft_compact(app: &mut App, router: &Router) -> bool {
 /// `.govinda/compaction.log` for observability.
 fn hard_reset(app: &mut App) {
     use crate::api::Message;
-    let keep = HARD_KEEP_TURNS;
-    let len = app.session.messages().len();
-    if len <= keep {
+    let msgs = app.session.messages();
+    if msgs.is_empty() {
         return;
     }
-    let drop_count = len - keep;
-    let start = len - keep;
-    let mut tail: Vec<Message> = app.session.messages()[start..].to_vec();
+    // Find the start of the 4th-last user turn so the window stays
+    // user-aligned (tool rounds are never split).
+    let user_indices: Vec<usize> = msgs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| if m.role == "user" { Some(i) } else { None })
+        .collect();
+    if user_indices.len() <= HARD_KEEP_TURNS {
+        return;
+    }
+    let start = user_indices[user_indices.len() - HARD_KEEP_TURNS];
+    let drop_count = start;
+    let mut tail: Vec<Message> = msgs[start..].to_vec();
     let note = format!(
         "Earlier context was reset at {} to recover from overflow (dropped {drop_count} messages).",
         chrono::Utc::now().to_rfc3339()
@@ -162,7 +165,11 @@ fn hard_reset(app: &mut App) {
         .open(".govinda/compaction.log")
         .and_then(|mut f| {
             use std::io::Write;
-            writeln!(f, "hard_reset ts={} dropped={drop_count}", chrono::Utc::now().to_rfc3339())
+            writeln!(
+                f,
+                "hard_reset ts={} dropped={drop_count}",
+                chrono::Utc::now().to_rfc3339()
+            )
         });
     app.last_auto_compact_count = app.session.messages().len();
 }

@@ -7,11 +7,7 @@ use std::path::Path;
 ///
 /// Async tools (http, git_diff_apply, screenshot, git_tools) are spawned via
 /// `tokio::runtime::Handle::block_on` so the executor can stay sync.
-pub fn dispatch(
-    name: &str,
-    arguments_json: &str,
-    cwd: &Path,
-) -> Option<anyhow::Result<String>> {
+pub fn dispatch(name: &str, arguments_json: &str, cwd: &Path) -> Option<anyhow::Result<String>> {
     let value: serde_json::Value = match serde_json::from_str(arguments_json) {
         Ok(v) => v,
         Err(e) => return Some(Err(anyhow::anyhow!("invalid JSON: {e}"))),
@@ -118,22 +114,60 @@ fn block_on(
 
 /// Tools that require user confirmation before execution.
 pub const CONFIRM_REQUIRED: &[&str] = &[
-    "delete_file", "move_file", "copy_file", "write_file",
-    "run_shell", "run_test", "run_diagnostics", "open_preview",
-    "git_commit", "git_branch", "apply_edits", "forget",
-    "template", "package_install", "format", "build_project",
-    "process_manager", "template_fill", "git_diff_apply", "scaffold_test",
-    "bulk_crud", "format_setter", "git_tools",
+    "delete_file",
+    "move_file",
+    "copy_file",
+    "write_file",
+    "run_shell",
+    "run_test",
+    "run_diagnostics",
+    "open_preview",
+    "git_commit",
+    "git_branch",
+    "apply_edits",
+    "forget",
+    "template",
+    "package_install",
+    "format",
+    "build_project",
+    "process_manager",
+    "template_fill",
+    "git_diff_apply",
+    "scaffold_test",
+    "bulk_crud",
+    "format_setter",
+    "git_tools",
 ];
 
 /// Names of all toolbox tools (for BUILTIN_TOOL_NAMES list).
 pub const TOOLBOX_NAMES: &[&str] = &[
-    "clipboard", "template", "package_install", "lint", "format",
-    "build_project", "http_request", "process_manager", "env",
-    "json_query", "regex_search", "diff_apply", "template_fill",
-    "git_diff_apply", "scaffold_test", "memory_search", "screenshot",
+    "clipboard",
+    "template",
+    "package_install",
+    "lint",
+    "format",
+    "build_project",
+    "http_request",
+    "process_manager",
+    "env",
+    "json_query",
+    "regex_search",
+    "diff_apply",
+    "template_fill",
+    "git_diff_apply",
+    "scaffold_test",
+    "memory_search",
+    "screenshot",
     "image_view",
-    "bulk_read", "bulk_shell", "bulk_crud", "docs", "html",
-    "screenrec", "format_setter", "code_format", "git_tools",
-    "find_issues", "parallel",
+    "bulk_read",
+    "bulk_shell",
+    "bulk_crud",
+    "docs",
+    "html",
+    "screenrec",
+    "format_setter",
+    "code_format",
+    "git_tools",
+    "find_issues",
+    "parallel",
 ];

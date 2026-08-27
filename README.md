@@ -28,6 +28,9 @@ A minimal, pure-Rust CLI chatbot with streaming responses, conversation memory, 
 - **Resilient** — byte-safe SSE parsing (survives chunks split mid-UTF-8-character), retries with backoff on 429/5xx, connect/read timeouts, response size cap
 - **Ctrl+C safe** — cancels the current reply and keeps whatever was generated so far
 - **Pure-Rust TLS** — rustls engine; OS certificate store via `rustls-native-certs` (no OpenSSL)
+- **OmniRouter hardening** — 3-strike per-model failover, cheapest-healthy summarizer, pre-flight probe, `/router status|failover|reset`, `/models top --sort=quality|speed|cost`
+- **Security hardening** — `Arc<Mutex>` streaming, canonical path guards, symlink-aware `preview`, SSRF (`0.0.0.0`/`::1`/`172.16/12` + DNS rebinding), `Zeroizing` keys with redacted `Debug`, shell audit log, preview token auth
+- **Performance** — `chat_pane` memo cache, debounced symbol index (`max_mtime`), provider-aware token scaling (Gemini ×1.8 etc.), prompt-cache LRU for `/variants`/`/retry`
 
 ## Setup
 

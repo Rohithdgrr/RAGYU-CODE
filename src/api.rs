@@ -176,6 +176,10 @@ pub enum SseEvent {
     ToolCalls(Vec<ToolCall>),
     Done,
     ApiError(String),
+    /// Provider-supplied `finish_reason` other than `tool_calls` / `stop`.
+    /// The most actionable is `"length"` (output truncated at `max_tokens`);
+    /// callers should surface it instead of silently returning a partial answer.
+    FinishReason(String),
 }
 
 /// Byte-safe SSE parser.
@@ -227,7 +231,7 @@ impl SseParser {
     }
 
     /// Emits buffered tool calls (if any) and clears the accumulator.
-    fn take_tool_calls(&mut self) -> Option<SseEvent> {
+    pub(crate) fn take_tool_calls(&mut self) -> Option<SseEvent> {
         if self.pending_tools.iter().all(Option::is_none) {
             return None;
         }
@@ -278,10 +282,60 @@ impl SseParser {
                 }
             }
         }
-        if choice["finish_reason"].as_str() == Some("tool_calls")
-            && let Some(calls) = self.take_tool_calls()
-        {
-            events.push(calls);
+        if choice.get("finish_reason").is_some_and(|v| v.is_null()) {
+            // Explicit `finish_reason: null` — some providers send null at
+            // termination instead of "stop". Standard OpenAI streams use null
+            // for intermediate chunks that carry deltas, so we must not emit
+            // Done when the chunk also carries content/tool fragments; only
+            // an empty delta with explicit null signals completion.
+            let has_delta = choice
+                .get("delta")
+                .and_then(|d| d.get("content"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+                || choice
+                    .get("delta")
+                    .and_then(|d| d.get("tool_calls"))
+                    .is_some();
+            if !has_delta {
+                if let Some(calls) = self.take_tool_calls() {
+                    events.push(calls);
+                }
+                events.push(SseEvent::Done);
+            }
+        } else if let Some(reason) = choice["finish_reason"].as_str() {
+            match reason {
+                "tool_calls" => {
+                    if let Some(calls) = self.take_tool_calls() {
+                        events.push(calls);
+                    }
+                }
+                "stop" => {
+                    if let Some(calls) = self.take_tool_calls() {
+                        events.push(calls);
+                    }
+                    events.push(SseEvent::Done);
+                }
+                "length" => {
+                    if let Some(calls) = self.take_tool_calls() {
+                        events.push(calls);
+                    }
+                    events.push(SseEvent::FinishReason("length".to_owned()));
+                }
+                "content_filter" => {
+                    if let Some(calls) = self.take_tool_calls() {
+                        events.push(calls);
+                    }
+                    events.push(SseEvent::FinishReason("content_filter".to_owned()));
+                }
+                other if !other.is_empty() => {
+                    if let Some(calls) = self.take_tool_calls() {
+                        events.push(calls);
+                    }
+                    events.push(SseEvent::FinishReason(other.to_owned()));
+                }
+                _ => {}
+            }
         }
         events
     }
@@ -325,6 +379,12 @@ impl SseParser {
 
 pub struct ChatOptions<'a> {
     /// Bearer token; `None` for unauthenticated local runtimes.
+    ///
+    /// Borrows from a `Zeroizing<String>` (via `Auth::token()` or
+    /// `Config::api_key`). Never clone the key into an owned `String`
+    /// without wrapping it in `Zeroizing` — a plain `String` would leave
+    /// the secret on the heap after drop. This struct never logs the token
+    /// and `Debug` is intentionally not derived.
     pub bearer: Option<&'a str>,
     pub model: &'a str,
     pub temperature: f32,
@@ -337,6 +397,11 @@ pub struct ChatOptions<'a> {
     /// Optional `tool_choice` override (`"auto"`, `"none"`, `"required"` or
     /// a specific-function object).
     pub tool_choice: Option<Value>,
+    /// Optional output-token cap sent as `max_tokens` (and `max_completion_tokens`
+    /// for reasoning models). When `None` the wire field is omitted and the
+    /// provider applies its default (often 4k) which can surface as a silent
+    /// `finish_reason: length` truncation.
+    pub max_tokens: Option<u32>,
 }
 
 impl<'a> ChatOptions<'a> {
@@ -349,6 +414,7 @@ impl<'a> ChatOptions<'a> {
             read_timeout: DEFAULT_READ_TIMEOUT,
             tools: Vec::new(),
             tool_choice: None,
+            max_tokens: None,
         }
     }
 }
@@ -430,6 +496,13 @@ pub async fn stream_chat_at(
     }
     if let Some(choice) = &opts.tool_choice {
         body["tool_choice"] = choice.clone();
+    }
+    if let Some(n) = opts.max_tokens {
+        body["max_tokens"] = json!(n);
+        // Newer OpenAI reasoning models prefer `max_completion_tokens`; send
+        // both for compatibility — providers that don't recognise one will
+        // ignore it, and the alias prevents truncation on those that do.
+        body["max_completion_tokens"] = json!(n);
     }
 
     for attempt in 1..=MAX_RETRIES {
@@ -520,7 +593,14 @@ async fn attempt_once(
                     retry_after: None,
                 });
             }
-            None => return Ok(Attempt::Ok), // server closed without [DONE]; fine
+            None => {
+                // Server closed without [DONE] — flush any buffered tool calls
+                // (common with local Ollama/vLLM). Treat remaining prose as complete.
+                if let Some(SseEvent::ToolCalls(calls)) = parser.take_tool_calls() {
+                    sink.tool_calls.extend(calls);
+                }
+                return Ok(Attempt::Ok);
+            }
         };
 
         for event in parser.feed(&chunk) {
@@ -540,6 +620,27 @@ async fn attempt_once(
                 SseEvent::ApiError(msg) => {
                     return Ok(Attempt::Fatal(anyhow::anyhow!("API error: {msg}")));
                 }
+                SseEvent::FinishReason(reason) => match reason.as_str() {
+                    "length" => {
+                        // Output truncated at max_tokens — preserve what we have and warn.
+                        let warn = "\n\n*[response truncated: output limit reached — retry with shorter context or higher max_tokens]*";
+                        if sink.out.len() + warn.len() <= opts.max_response_bytes {
+                            sink.out.push_str(warn);
+                            on_delta(warn);
+                        }
+                        return Ok(Attempt::Ok);
+                    }
+                    "content_filter" => {
+                        return Ok(Attempt::Fatal(anyhow::anyhow!(
+                            "response blocked by content filter (finish_reason: content_filter)"
+                        )));
+                    }
+                    other => {
+                        // Unknown finish reason — log and treat as completion.
+                        eprintln!("warning: unknown finish_reason '{other}' — treating as done");
+                        return Ok(Attempt::Ok);
+                    }
+                },
             }
         }
     }

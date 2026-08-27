@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use super::{dim, err, info, ok, App, Outcome};
+use super::{App, Outcome, dim, err, info, ok};
 
 fn resolve_target(raw: &str) -> PathBuf {
     let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
@@ -16,14 +16,18 @@ fn resolve_target(raw: &str) -> PathBuf {
     }
     let mut p = PathBuf::from(trimmed);
     // Expand ~ to home
-    if let Some(stripped) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+    if let Some(stripped) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
         if let Some(home) = dirs_home() {
             p = home.join(stripped);
         }
     } else if trimmed == "~"
-        && let Some(home) = dirs_home() {
-            p = home;
-        }
+        && let Some(home) = dirs_home()
+    {
+        p = home;
+    }
     p
 }
 
@@ -93,5 +97,3 @@ pub async fn handle(arg: &str, app: &mut App) -> Outcome {
 pub fn show_current() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
-
-

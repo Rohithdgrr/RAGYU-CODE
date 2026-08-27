@@ -162,7 +162,11 @@ pub fn auth_file() -> Option<PathBuf> {
         }
     }
     if let Some(home) = home_dir() {
-        let p = home.join(".local").join("share").join("opencode").join("auth.json");
+        let p = home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json");
         if p.exists() {
             return Some(p);
         }
@@ -317,7 +321,8 @@ fn resolve_endpoint(
         return Some((url, auth.unwrap_or(Auth::None)));
     }
     let endpoint = known_endpoint(pid)?;
-    let local = endpoint.starts_with("http://127.0.0.1") || endpoint.starts_with("http://localhost");
+    let local =
+        endpoint.starts_with("http://127.0.0.1") || endpoint.starts_with("http://localhost");
     if auth.is_none() && !local {
         return None;
     }
@@ -377,8 +382,7 @@ pub(crate) fn parse_config_body(body: &Value, auth_map: &BTreeMap<String, Auth>)
 /// Splits OpenCode's `provider/model` reference form.
 pub(crate) fn split_model_ref(model_ref: &str) -> Option<(String, String)> {
     let (pid, mid) = model_ref.split_once('/')?;
-    (!pid.is_empty() && !mid.is_empty())
-        .then(|| (pid.to_owned(), mid.to_owned()))
+    (!pid.is_empty() && !mid.is_empty()).then(|| (pid.to_owned(), mid.to_owned()))
 }
 
 /// Offline catalog: parse OpenCode's own files without touching the network.
@@ -408,8 +412,8 @@ fn server_base() -> String {
 fn authorized(mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     if let Ok(password) = std::env::var("OPENCODE_SERVER_PASSWORD") {
         if !password.trim().is_empty() {
-            let user = std::env::var("OPENCODE_SERVER_USERNAME")
-                .unwrap_or_else(|_| "opencode".to_owned());
+            let user =
+                std::env::var("OPENCODE_SERVER_USERNAME").unwrap_or_else(|_| "opencode".to_owned());
             req = req.basic_auth(user, Some(password));
         }
     }
@@ -424,10 +428,7 @@ pub async fn probe(http: &reqwest::Client) -> Option<String> {
         .ok()?
         .ok()?;
     let body: Value = response.json().await.ok()?;
-    let healthy = body
-        .get("healthy")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let healthy = body.get("healthy").and_then(Value::as_bool).unwrap_or(true);
     healthy.then(|| {
         body.get("version")
             .and_then(Value::as_str)
@@ -462,7 +463,9 @@ pub fn resolve_saved(key: &str, base_url: &str) -> Result<Arc<dyn Provider>> {
         .filter(|p| !p.is_empty())
         .with_context(|| format!("invalid saved provider key '{key}'"))?;
     let auth = load_auth_map().remove(pid).unwrap_or(Auth::None);
-    if matches!(auth, Auth::None) && !base_url.starts_with("http://127.0.0.1") && !base_url.starts_with("http://localhost")
+    if matches!(auth, Auth::None)
+        && !base_url.starts_with("http://127.0.0.1")
+        && !base_url.starts_with("http://localhost")
     {
         anyhow::bail!(
             "no OpenCode credential found for '{pid}' — run '/opencode connect' or re-authenticate in OpenCode"
@@ -491,7 +494,11 @@ pub async fn auto_connect(
         model.to_owned()
     };
     Ok(Some((
-        Arc::new(OcProvider::new(entry.pid.clone(), entry.base_url.clone(), entry.auth.clone())),
+        Arc::new(OcProvider::new(
+            entry.pid.clone(),
+            entry.base_url.clone(),
+            entry.auth.clone(),
+        )),
         model,
     )))
 }
@@ -533,9 +540,7 @@ pub async fn connect(
                 (e, None)
             }),
     };
-    let model = model
-        .map(str::to_owned)
-        .unwrap_or_else(fallback_model_name);
+    let model = model.map(str::to_owned).unwrap_or_else(fallback_model_name);
     let provider = Arc::new(OcProvider::new(
         entry.pid.clone(),
         entry.base_url.clone(),
@@ -558,7 +563,8 @@ pub async fn status_line(http: &reqwest::Client) -> String {
         Some(version) => format!("server detected at {} (v{version})", server_base()),
         None => {
             if auth_file().is_some() || !config_files().is_empty() {
-                "installed (files found) but no server running — using stored credentials".to_owned()
+                "installed (files found) but no server running — using stored credentials"
+                    .to_owned()
             } else {
                 "not detected (no server, no OpenCode files)".to_owned()
             }
@@ -574,7 +580,12 @@ mod tests {
     fn auth_map(pairs: &[(&str, &str)]) -> BTreeMap<String, Auth> {
         pairs
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), Auth::Bearer(Zeroizing::new((*v).to_owned()))))
+            .map(|(k, v)| {
+                (
+                    (*k).to_owned(),
+                    Auth::Bearer(Zeroizing::new((*v).to_owned())),
+                )
+            })
             .collect()
     }
 
@@ -591,7 +602,11 @@ mod tests {
             "default": { "openai": "gpt-4o-mini" }
         });
         let catalog = parse_catalog_response(&body);
-        assert_eq!(catalog.entries.len(), 2, "anthropic has no endpoint/key and must be skipped");
+        assert_eq!(
+            catalog.entries.len(),
+            2,
+            "anthropic has no endpoint/key and must be skipped"
+        );
         assert_eq!(
             catalog.default,
             Some(("openai".to_owned(), "gpt-4o-mini".to_owned()))

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 /// Rejects absolute paths and any `..` component, then anchors relative paths
 /// under `sessions/` so save/load/fork can never escape the workspace.
+/// Also rejects symlink escapes when the target already exists.
 pub(super) fn safe_session_path(arg: &str) -> anyhow::Result<PathBuf> {
     let p = Path::new(arg);
     anyhow::ensure!(
@@ -17,7 +18,24 @@ pub(super) fn safe_session_path(arg: &str) -> anyhow::Result<PathBuf> {
         !p.components().any(|c| c == std::path::Component::ParentDir),
         "'..' components are not allowed"
     );
-    Ok(PathBuf::from(sessions::SESSIONS_DIR).join(p))
+    let joined = PathBuf::from(sessions::SESSIONS_DIR).join(p);
+    // If the sessions dir and the joined path both exist, ensure the
+    // canonical forms stay under the sessions dir (symlink escape).
+    if let Ok(canonical_sessions) = Path::new(sessions::SESSIONS_DIR).canonicalize() {
+        if let Ok(canonical_parent) = joined.parent().unwrap_or(Path::new(".")).canonicalize() {
+            anyhow::ensure!(
+                canonical_parent.starts_with(&canonical_sessions),
+                "path escapes sessions directory via symlink"
+            );
+        }
+        if let Ok(canonical_joined) = joined.canonicalize() {
+            anyhow::ensure!(
+                canonical_joined.starts_with(&canonical_sessions),
+                "path escapes sessions directory via symlink"
+            );
+        }
+    }
+    Ok(joined)
 }
 
 pub(super) fn save_session(arg: &str, app: &mut App) {
@@ -257,7 +275,8 @@ impl RuntimeSnapshot {
         let key = app.config.provider.key();
         // Custom endpoints and OpenCode-backed providers both point at
         // non-preset URLs; persisting base_url is what makes them reloadable.
-        let needs_base_url = key.as_ref() == "custom" || key.starts_with(crate::opencode::KEY_PREFIX);
+        let needs_base_url =
+            key.as_ref() == "custom" || key.starts_with(crate::opencode::KEY_PREFIX);
         Self {
             model: app.config.model.clone(),
             temperature: app.config.temperature,
@@ -275,6 +294,10 @@ impl RuntimeSnapshot {
 /// Updates the keys Govinda owns inside an existing TOML table, leaving every
 /// other key (including `[[tools]]` blocks) untouched.
 fn merge_snapshot(table: &mut toml::Table, s: &RuntimeSnapshot) {
+    table.insert(
+        "config_version".into(),
+        toml::Value::from(crate::config::CURRENT_CONFIG_VERSION as i64),
+    );
     table.insert("model".into(), toml::Value::from(s.model.clone()));
     table.insert("temperature".into(), toml::Value::from(s.temperature));
     table.insert(
@@ -334,8 +357,7 @@ pub(super) fn save_runtime_config(app: &App) -> anyhow::Result<PathBuf> {
     merge_snapshot(&mut table, &snapshot);
     let content = toml::to_string_pretty(&table)?;
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, &content)
-        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    std::fs::write(&tmp, &content).with_context(|| format!("cannot write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("cannot rename {} to {}", tmp.display(), path.display()))?;
     Ok(path)

@@ -6,6 +6,7 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// URL of a patch (text/plain, application/x-patch, or raw .diff/.patch).
     pub url: String,
@@ -18,7 +19,10 @@ pub async fn run(base: &Path, args: Args) -> anyhow::Result<String> {
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Mozilla/5.0 (compatible; govinda-cli/1.0)")
         .build()?;
-    let resp = client.get(&args.url).send().await
+    let resp = client
+        .get(&args.url)
+        .send()
+        .await
         .map_err(|e| anyhow::anyhow!("fetch failed: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
@@ -38,7 +42,8 @@ pub async fn run(base: &Path, args: Args) -> anyhow::Result<String> {
     let n_files = body.matches("diff --git").count();
     Ok(format!(
         "{{\"ok\":true,\"url\":\"{}\",\"base_sha\":\"{base_sha}\",\"files\":{n_files},\"patch_bytes\":{}}}",
-        args.url, body.len()
+        args.url,
+        body.len()
     ))
 }
 
@@ -48,6 +53,9 @@ mod tests {
     // Can't test async reqwest here without an HTTP server; covered by integration tests
     #[test]
     fn url_parsing_does_not_panic() {
-        let _ = Args { url: "https://example.com".into(), base_sha: None };
+        let _ = Args {
+            url: "https://example.com".into(),
+            base_sha: None,
+        };
     }
 }

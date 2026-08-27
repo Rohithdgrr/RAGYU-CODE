@@ -51,7 +51,7 @@ pub struct RouterEntry {
     pub context_window: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Router {
     entries: Vec<RouterEntry>,
     active_idx: usize,
@@ -176,6 +176,29 @@ impl Router {
         self.quarantined.clear();
     }
 
+    /// Re-syncs the router when the active provider/model changes.
+    /// Preserves strike counters and quarantine state, rebuilds the
+    /// fallback list for the new provider, and re-enables the new
+    /// active model if it was previously quarantined (per spec:
+    /// `/model <id>` re-enables a quarantined model).
+    pub fn sync_active(&mut self, provider: &str, model: &str) {
+        let needs_rebuild = self.active_model() != model
+            || (provider == "omniroute") != (self.entries.len() > 1)
+            || (provider != "omniroute" && self.entries.len() != 1);
+        if !needs_rebuild {
+            return;
+        }
+        let old_health = std::mem::take(&mut self.health);
+        let old_quarantined = std::mem::take(&mut self.quarantined);
+        let failover = self.failover_enabled;
+        let mut new = Self::for_active(provider, model);
+        new.health = old_health;
+        new.quarantined = old_quarantined;
+        new.failover_enabled = failover;
+        new.quarantined.remove(model);
+        *self = new;
+    }
+
     /// Promotes to the next non-quarantined entry. Returns `None` if
     /// every entry is quarantined or `failover_enabled` is `false`.
     /// The caller is expected to call this only once per turn.
@@ -190,10 +213,7 @@ impl Router {
             let m = &self.entries[idx].model;
             if !self.quarantined.contains(m) {
                 self.active_idx = idx;
-                eprintln!(
-                    "router: promoted {} → {}",
-                    self.entries[start].model, m
-                );
+                eprintln!("router: promoted {} → {}", self.entries[start].model, m);
                 return Some(&self.entries[idx]);
             }
         }
@@ -246,7 +266,9 @@ mod tests {
         let mut r = fixture();
         let models: Vec<String> = r.iter().map(|e| e.model.clone()).collect();
         for model in &models {
-            r.record_failure(model, FailureKind::Server, "x");
+            for _ in 0..STRIKES_TO_QUARANTINE {
+                r.record_failure(model, FailureKind::Server, "x");
+            }
         }
         assert!(r.promote().is_none());
     }

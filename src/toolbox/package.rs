@@ -4,6 +4,7 @@
 //! command, returning structured info (added version, manifest diff).
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// Package name (e.g. "serde", "react", "requests").
     pub package: String,
@@ -17,21 +18,17 @@ pub struct Args {
 pub fn run(base: &std::path::Path, args: Args) -> anyhow::Result<String> {
     let kind = detect_kind(base);
     let Some(kind) = kind else {
-        anyhow::bail!("no supported manifest (Cargo.toml, package.json, requirements.txt, go.mod) found in workspace");
+        anyhow::bail!(
+            "no supported manifest (Cargo.toml, package.json, requirements.txt, go.mod) found in workspace"
+        );
     };
     let spec = match &args.version {
         Some(v) => format!("{}@{}", args.package, v),
         None => args.package.clone(),
     };
     let (program, argv) = match (kind, args.dev) {
-        (Kind::Cargo, false) => (
-            "cargo",
-            vec!["add".into(), spec.clone()],
-        ),
-        (Kind::Cargo, true) => (
-            "cargo",
-            vec!["add".into(), "--dev".into(), spec.clone()],
-        ),
+        (Kind::Cargo, false) => ("cargo", vec!["add".into(), spec.clone()]),
+        (Kind::Cargo, true) => ("cargo", vec!["add".into(), "--dev".into(), spec.clone()]),
         (Kind::Npm, false) => (
             if cfg!(windows) { "npm.cmd" } else { "npm" },
             vec!["install".into(), spec.clone()],
@@ -44,10 +41,7 @@ pub fn run(base: &std::path::Path, args: Args) -> anyhow::Result<String> {
             if cfg!(windows) { "pip.cmd" } else { "pip" },
             vec!["install".into(), spec.clone()],
         ),
-        (Kind::Go, _) => (
-            "go",
-            vec!["get".into(), spec.clone()],
-        ),
+        (Kind::Go, _) => ("go", vec!["get".into(), spec.clone()]),
     };
     let output = std::process::Command::new(program)
         .args(&argv)

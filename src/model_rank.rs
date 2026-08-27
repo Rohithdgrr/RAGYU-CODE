@@ -41,17 +41,37 @@ pub struct RankedModel {
 }
 
 pub fn top_models(provider: &str, sort: SortKey, n: usize) -> Vec<RankedModel> {
+    top_models_with_health(provider, sort, n, None)
+}
+
+pub fn top_models_with_health(
+    provider: &str,
+    sort: SortKey,
+    n: usize,
+    router: Option<&crate::router::Router>,
+) -> Vec<RankedModel> {
     let registry = provider::known_models(provider);
     let mut out: Vec<RankedModel> = registry
         .iter()
-        .map(|km| score_row(km, sort))
+        .map(|km| {
+            let h = router.and_then(|r| r.health(km.id));
+            score_row(km, sort, h)
+        })
         .collect();
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out.truncate(n);
     out
 }
 
-fn score_row(km: &KnownModel, sort: SortKey) -> RankedModel {
+fn score_row(
+    km: &KnownModel,
+    sort: SortKey,
+    health: Option<&crate::router::Health>,
+) -> RankedModel {
     let role = role_for(km);
     let context_norm = if km.context_window == 0 {
         0.0
@@ -59,11 +79,38 @@ fn score_row(km: &KnownModel, sort: SortKey) -> RankedModel {
         (km.context_window as f32 / 1_000_000.0).min(1.0)
     };
     let score = match sort {
-        SortKey::Quality => 0.6 * context_norm + 0.4 * (if km.free { 1.0 } else { 0.5 }),
-        SortKey::Speed => 0.7 + 0.3 * context_norm,
-        SortKey::Cost => if km.free { 1.0 } else { 0.4 },
+        SortKey::Quality => {
+            if let Some(h) = health {
+                let total = h.total_requests.max(1) as f32;
+                let success_rate = (total - h.total_failures as f32) / total;
+                let strike_factor = 1.0 - (h.strikes as f32 / 3.0).min(1.0);
+                0.5 * success_rate + 0.3 * strike_factor + 0.2 * context_norm
+            } else {
+                0.6 * context_norm + 0.4 * (if km.free { 1.0 } else { 0.5 })
+            }
+        }
+        SortKey::Speed => {
+            if let Some(h) = health {
+                1.0 / (1.0 + h.last_latency_ms as f32 / 1000.0)
+            } else {
+                0.7 + 0.3 * context_norm
+            }
+        }
+        SortKey::Cost => {
+            if km.free {
+                1.0
+            } else {
+                0.4
+            }
+        }
         SortKey::Context => context_norm,
-        SortKey::Free => if km.free { 1.0 } else { 0.0 },
+        SortKey::Free => {
+            if km.free {
+                1.0
+            } else {
+                0.0
+            }
+        }
     };
     RankedModel {
         id: km.id.to_owned(),
@@ -76,13 +123,15 @@ fn score_row(km: &KnownModel, sort: SortKey) -> RankedModel {
 }
 
 fn role_for(km: &KnownModel) -> RouterRole {
-    provider::omniroute_combo(&km.id).map(|c| c.role).unwrap_or_else(|| {
-        if km.id == "auto" {
-            RouterRole::Smart
-        } else {
-            RouterRole::Generic
-        }
-    })
+    provider::omniroute_combo(&km.id)
+        .map(|c| c.role)
+        .unwrap_or_else(|| {
+            if km.id == "auto" {
+                RouterRole::Smart
+            } else {
+                RouterRole::Generic
+            }
+        })
 }
 
 #[cfg(test)]
@@ -107,9 +156,9 @@ mod tests {
 
     #[test]
     fn free_sort_puts_free_first() {
-        let rows = top_models("openai", SortKey::Free, 10);
-        // GPT-3.5 is the only "free" entry (registry flag) and
-        // should rank first.
+        let rows = top_models("mistral", SortKey::Free, 10);
+        // mistral-small-latest is marked free and should rank first
+        // when sorting by the Free key.
         assert!(!rows.is_empty());
         assert!(rows[0].free);
     }

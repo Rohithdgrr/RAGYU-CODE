@@ -6,6 +6,7 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// List of workspace-relative paths.
     pub paths: Vec<String>,
@@ -25,7 +26,11 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
             Ok(content) => {
                 let original_len = content.len();
                 let truncated = if max_bytes > 0 && content.len() > max_bytes {
-                    format!("{}…(truncated to {} bytes)", &content[..max_bytes], max_bytes)
+                    format!(
+                        "{}…(truncated to {} bytes)",
+                        &content[..max_bytes],
+                        max_bytes
+                    )
                 } else {
                     content
                 };

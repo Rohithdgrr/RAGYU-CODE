@@ -22,11 +22,19 @@ async fn models_list(app: &mut App) {
     if let Some(ref list) = api_list {
         info(format!("models for {provider_id} (from API):"));
         for id in list.iter() {
-            let marker = if **id == app.config.model { "  ← current" } else { "" };
-            let free_tag = known.iter().find(|k| *k.id == **id).map_or("", |k| {
-                if k.free { " [FREE]" } else { "" }
-            });
-            let desc = known.iter().find(|k| *k.id == **id).map_or("", |k| k.description);
+            let marker = if **id == app.config.model {
+                "  ← current"
+            } else {
+                ""
+            };
+            let free_tag = known
+                .iter()
+                .find(|k| *k.id == **id)
+                .map_or("", |k| if k.free { " [FREE]" } else { "" });
+            let desc = known
+                .iter()
+                .find(|k| *k.id == **id)
+                .map_or("", |k| k.description);
             let suffix = if !desc.is_empty() || !free_tag.is_empty() {
                 format!("  {free_tag}  {desc}")
             } else {
@@ -36,12 +44,17 @@ async fn models_list(app: &mut App) {
         }
         // Show known models not in API list
         let api_set: std::collections::HashSet<&str> = list.iter().map(|s| s.as_str()).collect();
-        let extra: Vec<&crate::provider::KnownModel> = known.iter().filter(|k| !api_set.contains(k.id)).collect();
+        let extra: Vec<&crate::provider::KnownModel> =
+            known.iter().filter(|k| !api_set.contains(k.id)).collect();
         if !extra.is_empty() {
             info("");
-            info("known models (not listed by API):")
-;            for m in &extra {
-                let marker = if *m.id == app.config.model { "  ← current" } else { "" };
+            info("known models (not listed by API):");
+            for m in &extra {
+                let marker = if *m.id == app.config.model {
+                    "  ← current"
+                } else {
+                    ""
+                };
                 let tag = if m.free { " [FREE]" } else { "" };
                 info(format!("  {}{tag}{marker}  {}", m.id, m.description));
             }
@@ -49,7 +62,11 @@ async fn models_list(app: &mut App) {
     } else if !known.is_empty() {
         info(format!("models for {provider_id} (from registry):"));
         for m in known {
-            let marker = if m.id == app.config.model { "  ← current" } else { "" };
+            let marker = if m.id == app.config.model {
+                "  ← current"
+            } else {
+                ""
+            };
             let tag = if m.free { " [FREE]" } else { "" };
             info(format!("  {}{tag}{marker}  {}", m.id, m.description));
         }
@@ -95,7 +112,9 @@ async fn models_top(rest: &str, app: &mut App) {
     }
     let provider_key = app.config.provider.key();
     let provider_id: &str = provider_key.as_ref();
-    let rows = crate::model_rank::top_models(provider_id, sort_key, n);
+    // Prefer the new health-aware ranker when router health is available.
+    let rows =
+        crate::model_rank::top_models_with_health(provider_id, sort_key, n, Some(&app.router));
     if rows.is_empty() {
         err(format!("no registry models for '{provider_id}'"));
         return;
@@ -315,11 +334,7 @@ pub(super) async fn generate_variants(arg: &str, app: &mut App) {
         match res {
             Ok(out) if !out.trim().is_empty() => {
                 let preview: String = out.trim().lines().next().unwrap_or("").to_owned();
-                ok(format!(
-                    "({}) {}",
-                    i + 1,
-                    truncate_preview(&preview, 100)
-                ));
+                ok(format!("({}) {}", i + 1, truncate_preview(&preview, 100)));
                 app.pending_variants.push(out.trim().to_owned());
             }
             Ok(_) => err(format!("variant {} came back empty.", i + 1)),

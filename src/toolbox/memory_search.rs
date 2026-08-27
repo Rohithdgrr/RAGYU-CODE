@@ -7,6 +7,7 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// Natural-language query.
     pub query: String,
@@ -42,19 +43,27 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
         sections.push((current_header, current_body.trim().to_owned()));
     }
     // Score by token overlap (Jaccard-like)
-    let mut scored: Vec<(usize, &(String, String))> = sections.iter()
+    let mut scored: Vec<(usize, &(String, String))> = sections
+        .iter()
         .map(|s| (score(&query_tokens, s.1.to_lowercase().as_str()), s))
         .filter(|(s, _)| *s > 0)
         .collect();
     scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
-    let results: Vec<serde_json::Value> = scored.into_iter()
+    let results: Vec<serde_json::Value> = scored
+        .into_iter()
         .take(max)
-        .map(|(_, (h, b))| serde_json::json!({
-            "header": h,
-            "body": truncate(b, 500),
-        }))
+        .map(|(_, (h, b))| {
+            serde_json::json!({
+                "header": h,
+                "body": truncate(b, 500),
+            })
+        })
         .collect();
-    Ok(format!("{{\"count\":{},\"results\":{}}}", results.len(), serde_json::to_string(&results).unwrap_or_default()))
+    Ok(format!(
+        "{{\"count\":{},\"results\":{}}}",
+        results.len(),
+        serde_json::to_string(&results).unwrap_or_default()
+    ))
 }
 
 fn score(query_tokens: &[&str], text: &str) -> usize {
@@ -62,8 +71,13 @@ fn score(query_tokens: &[&str], text: &str) -> usize {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_owned() }
-    else { let mut out: String = s.chars().take(max).collect(); out.push('…'); out }
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
 }
 
 #[cfg(test)]
@@ -79,7 +93,14 @@ mod tests {
     #[test]
     fn returns_empty_when_no_memory_file() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run(dir.path(), Args { query: "anything".into(), max_results: Some(5) }).unwrap();
+        let result = run(
+            dir.path(),
+            Args {
+                query: "anything".into(),
+                max_results: Some(5),
+            },
+        )
+        .unwrap();
         assert!(result.contains("\"results\":[]"));
     }
 }

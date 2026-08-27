@@ -1,6 +1,7 @@
 //! `format` — run the project's formatter (rustfmt, prettier, black, gofmt).
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// Scope to a file or directory (default = all).
     pub path: Option<String>,
@@ -20,7 +21,9 @@ enum Kind {
 pub fn run(base: &std::path::Path, args: Args) -> anyhow::Result<String> {
     let scope = args.path.as_deref().unwrap_or(".");
     let kind = detect_kind(base).ok_or_else(|| {
-        anyhow::anyhow!("no supported project found (Cargo.toml, package.json, pyproject.toml, go.mod)")
+        anyhow::anyhow!(
+            "no supported project found (Cargo.toml, package.json, pyproject.toml, go.mod)"
+        )
     })?;
     let (program, argv) = format_command(kind, scope, args.check);
     let output = std::process::Command::new(program)
@@ -66,7 +69,15 @@ fn format_command(kind: Kind, scope: &str, check: bool) -> (&'static str, Vec<St
         ),
         Kind::Node => (
             "npx",
-            vec!["prettier".into(), if check { "--check".into() } else { "--write".into() }, scope.into()],
+            vec![
+                "prettier".into(),
+                if check {
+                    "--check".into()
+                } else {
+                    "--write".into()
+                },
+                scope.into(),
+            ],
         ),
         Kind::Python => (
             "black",
@@ -76,7 +87,14 @@ fn format_command(kind: Kind, scope: &str, check: bool) -> (&'static str, Vec<St
                 vec![scope.into()]
             },
         ),
-        Kind::Go => ("gofmt", if check { vec!["-l".into(), scope.into()] } else { vec!["-w".into(), scope.into()] }),
+        Kind::Go => (
+            "gofmt",
+            if check {
+                vec!["-l".into(), scope.into()]
+            } else {
+                vec!["-w".into(), scope.into()]
+            },
+        ),
     }
 }
 

@@ -27,6 +27,7 @@ pub enum Action {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     pub action: Action,
     /// File to read from (copy/cut) or write to (paste). Required for copy/cut/paste.
@@ -93,10 +94,7 @@ pub fn run(base: &std::path::Path, args: Args) -> anyhow::Result<String> {
             let full = std::fs::read_to_string(base.join(path))?;
             let lines: Vec<&str> = full.lines().collect();
             let start = args.line_start.unwrap_or(1).saturating_sub(1);
-            let end = args
-                .line_end
-                .unwrap_or(lines.len())
-                .min(lines.len());
+            let end = args.line_end.unwrap_or(lines.len()).min(lines.len());
             let mut new_lines: Vec<String> = lines
                 .iter()
                 .enumerate()

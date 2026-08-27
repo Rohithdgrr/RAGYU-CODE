@@ -8,6 +8,7 @@
 use std::time::Instant;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// Build in release mode (default false).
     #[serde(default)]
@@ -20,14 +21,22 @@ pub struct Args {
     pub max_retries: u8,
 }
 
-fn default_max_retries() -> u8 { 2 }
+fn default_max_retries() -> u8 {
+    2
+}
 
 #[derive(Clone, Copy, Debug)]
-enum Kind { Rust, Node, Go }
+enum Kind {
+    Rust,
+    Node,
+    Go,
+}
 
 pub fn run(base: &std::path::Path, args: Args) -> anyhow::Result<String> {
     let kind = detect_kind(base).ok_or_else(|| {
-        anyhow::anyhow!("no supported build target (Cargo.toml, package.json with build script, go.mod)")
+        anyhow::anyhow!(
+            "no supported build target (Cargo.toml, package.json with build script, go.mod)"
+        )
     })?;
     let mut attempts = 0u8;
     let max = args.max_retries.min(5);
@@ -74,12 +83,21 @@ fn detect_kind(base: &std::path::Path) -> Option<Kind> {
     }
 }
 
-fn build_command(kind: Kind, _base: &std::path::Path, args: &Args) -> anyhow::Result<(&'static str, Vec<String>)> {
+fn build_command(
+    kind: Kind,
+    _base: &std::path::Path,
+    args: &Args,
+) -> anyhow::Result<(&'static str, Vec<String>)> {
     match kind {
         Kind::Rust => {
             let mut a = vec!["build".to_owned()];
-            if args.release { a.push("--release".to_owned()); }
-            if let Some(t) = &args.target { a.push("--target".to_owned()); a.push(t.clone()); }
+            if args.release {
+                a.push("--release".to_owned());
+            }
+            if let Some(t) = &args.target {
+                a.push("--target".to_owned());
+                a.push(t.clone());
+            }
             Ok(("cargo", a))
         }
         Kind::Node => Ok(("npm", vec!["run".to_owned(), "build".to_owned()])),
@@ -94,7 +112,9 @@ fn extract_errors(stdout: &str, stderr: &str, kind: Kind) -> serde_json::Value {
         if let Some(err) = parse_error_line(line, kind) {
             errors.push(err);
         }
-        if errors.len() >= 50 { break; }
+        if errors.len() >= 50 {
+            break;
+        }
     }
     serde_json::Value::Array(errors)
 }
@@ -137,7 +157,11 @@ mod tests {
 
     #[test]
     fn rust_build_command_includes_release() {
-        let args = Args { release: true, target: None, max_retries: 0 };
+        let args = Args {
+            release: true,
+            target: None,
+            max_retries: 0,
+        };
         let (prog, argv) = build_command(Kind::Rust, &std::path::PathBuf::new(), &args).unwrap();
         assert_eq!(prog, "cargo");
         assert!(argv.contains(&"--release".to_string()));

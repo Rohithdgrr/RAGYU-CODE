@@ -6,6 +6,7 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
     /// Unified diff content.
     pub patch: String,
@@ -17,7 +18,9 @@ pub struct Args {
     pub parallel: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone)]
 enum Hunk {
@@ -39,10 +42,16 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
             current_file = Some(std::path::PathBuf::from(&line[6..]));
             continue;
         }
-        if line.starts_with("--- ") || line.starts_with("+++ ") { continue; }
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
         if line.starts_with("@@") {
             // flush previous
-            flush_hunk(&mut hunks, &mut hunk_kind, std::mem::take(&mut current_hunk));
+            flush_hunk(
+                &mut hunks,
+                &mut hunk_kind,
+                std::mem::take(&mut current_hunk),
+            );
             continue;
         }
         if line.starts_with("diff --git") || line.starts_with("Index:") {
@@ -55,17 +64,29 @@ pub fn run(base: &Path, args: Args) -> anyhow::Result<String> {
         if let Some(c) = line.chars().next() {
             match c {
                 ' ' => {
-                    flush_hunk(&mut hunks, &mut hunk_kind, std::mem::take(&mut current_hunk));
+                    flush_hunk(
+                        &mut hunks,
+                        &mut hunk_kind,
+                        std::mem::take(&mut current_hunk),
+                    );
                     current_hunk.push(line[1..].to_owned());
                     hunk_kind = Some("same");
                 }
                 '+' => {
-                    flush_hunk(&mut hunks, &mut hunk_kind, std::mem::take(&mut current_hunk));
+                    flush_hunk(
+                        &mut hunks,
+                        &mut hunk_kind,
+                        std::mem::take(&mut current_hunk),
+                    );
                     current_hunk.push(line[1..].to_owned());
                     hunk_kind = Some("add");
                 }
                 '-' => {
-                    flush_hunk(&mut hunks, &mut hunk_kind, std::mem::take(&mut current_hunk));
+                    flush_hunk(
+                        &mut hunks,
+                        &mut hunk_kind,
+                        std::mem::take(&mut current_hunk),
+                    );
                     current_hunk.push(line[1..].to_owned());
                     hunk_kind = Some("del");
                 }
@@ -94,12 +115,22 @@ fn flush_hunk(hunks: &mut Vec<Hunk>, kind: &mut Option<&'static str>, lines: Vec
     }
 }
 
-fn apply_to_file(base: &Path, file: &Path, hunks: &[Hunk], allow_create: bool) -> anyhow::Result<()> {
+fn apply_to_file(
+    base: &Path,
+    file: &Path,
+    hunks: &[Hunk],
+    allow_create: bool,
+) -> anyhow::Result<()> {
     let full = base.join(file);
     let original: Vec<String> = if full.exists() {
-        std::fs::read_to_string(&full)?.lines().map(String::from).collect()
+        std::fs::read_to_string(&full)?
+            .lines()
+            .map(String::from)
+            .collect()
     } else {
-        if !allow_create { return Ok(()); }
+        if !allow_create {
+            return Ok(());
+        }
         Vec::new()
     };
     let mut result: Vec<String> = Vec::new();
@@ -118,7 +149,9 @@ fn apply_to_file(base: &Path, file: &Path, hunks: &[Hunk], allow_create: bool) -
                 }
             }
             Hunk::Add { lines } => {
-                for l in lines { result.push(l.clone()); }
+                for l in lines {
+                    result.push(l.clone());
+                }
             }
             Hunk::Del { lines } => {
                 for l in lines {
@@ -145,7 +178,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "line1\nline2\nline3\n").unwrap();
         let patch = "--- a/a.txt\n+++ b/a.txt\n@@\n line1\n-line2\n+LINE2\n line3\n";
-        let args = Args { patch: patch.into(), apply_untracked: true, parallel: false };
+        let args = Args {
+            patch: patch.into(),
+            apply_untracked: true,
+            parallel: false,
+        };
         run(dir.path(), args).unwrap();
         let result = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
         assert!(result.contains("LINE2"));

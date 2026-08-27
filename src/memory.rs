@@ -34,10 +34,7 @@ impl ProjectMemory {
         Self {
             agents_md: load_memory_file(workspace, "AGENTS.md"),
             claude_md: load_memory_file(workspace, "CLAUDE.md"),
-            govinda_memory: load_memory_file(
-                &workspace.join(".govinda"),
-                "memory.md",
-            ),
+            govinda_memory: load_memory_file(&workspace.join(".govinda"), "memory.md"),
         }
     }
 
@@ -110,9 +107,13 @@ pub fn append_note(note: &str) {
 /// Removes all sections of `.govinda/memory.md` whose body (case-insensitive)
 /// contains `needle`. Returns the number of sections removed.
 pub fn remove_note(needle: &str) -> usize {
-    let Ok(cwd) = std::env::current_dir() else { return 0 };
+    let Ok(cwd) = std::env::current_dir() else {
+        return 0;
+    };
     let path = cwd.join(".govinda").join("memory.md");
-    let Ok(content) = std::fs::read_to_string(&path) else { return 0 };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
     let lower = needle.to_lowercase();
     let mut kept = Vec::new();
     let mut removed = 0usize;
@@ -199,11 +200,12 @@ mod tests {
         assert!(mem.has_content());
         assert!(mem.agents_md.as_deref().unwrap().contains("Be helpful"));
         assert!(mem.claude_md.as_deref().unwrap().contains("Be concise"));
-        assert!(mem
-            .govinda_memory
-            .as_deref()
-            .unwrap()
-            .contains("tests pass"));
+        assert!(
+            mem.govinda_memory
+                .as_deref()
+                .unwrap()
+                .contains("tests pass")
+        );
 
         let suffix = mem.to_system_suffix().unwrap();
         assert!(suffix.contains("AGENTS.md"));

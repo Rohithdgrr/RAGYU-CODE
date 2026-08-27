@@ -209,7 +209,11 @@ pub fn render_diff_lines(state: &DiffState, width: u16) -> Vec<Line<'static>> {
             Style::default().fg(t.text_secondary),
         ),
         Span::styled(
-            if state.unified { " [unified]" } else { " [split]" },
+            if state.unified {
+                " [unified]"
+            } else {
+                " [split]"
+            },
             Style::default().fg(t.text_muted),
         ),
     ]));
@@ -232,12 +236,13 @@ pub fn render_diff_lines(state: &DiffState, width: u16) -> Vec<Line<'static>> {
         };
 
         // Hunk header line
-        let header_bg = if is_selected { t.bg_hover } else { t.bg_secondary };
+        let header_bg = if is_selected {
+            t.bg_hover
+        } else {
+            t.bg_secondary
+        };
         lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {status_icon} "),
-                status_style,
-            ),
+            Span::styled(format!(" {status_icon} "), status_style),
             Span::styled(
                 format!("[{}] ", idx + 1),
                 Style::default().fg(t.text_muted).bg(header_bg),
@@ -245,9 +250,17 @@ pub fn render_diff_lines(state: &DiffState, width: u16) -> Vec<Line<'static>> {
             Span::styled(
                 truncate(&hunk.header, inner.saturating_sub(10)),
                 Style::default()
-                    .fg(if is_selected { t.accent_primary } else { t.text_secondary })
+                    .fg(if is_selected {
+                        t.accent_primary
+                    } else {
+                        t.text_secondary
+                    })
                     .bg(header_bg)
-                    .add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() }),
+                    .add_modifier(if is_selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ),
         ]));
 
@@ -255,32 +268,22 @@ pub fn render_diff_lines(state: &DiffState, width: u16) -> Vec<Line<'static>> {
         if is_selected || state.unified {
             for hunk_line in &hunk.lines {
                 let (prefix, style) = match hunk_line.kind {
-                    HunkLineKind::Added => (
-                        "+",
-                        Style::default().fg(t.accent_success).bg(t.bg_primary),
-                    ),
-                    HunkLineKind::Removed => (
-                        "-",
-                        Style::default().fg(t.accent_error).bg(t.bg_primary),
-                    ),
-                    HunkLineKind::Context => (
-                        " ",
-                        Style::default().fg(t.text_muted).bg(t.bg_primary),
-                    ),
-                    HunkLineKind::Header => (
-                        "@",
-                        Style::default().fg(t.accent_primary).bg(t.bg_primary),
-                    ),
+                    HunkLineKind::Added => {
+                        ("+", Style::default().fg(t.accent_success).bg(t.bg_primary))
+                    }
+                    HunkLineKind::Removed => {
+                        ("-", Style::default().fg(t.accent_error).bg(t.bg_primary))
+                    }
+                    HunkLineKind::Context => {
+                        (" ", Style::default().fg(t.text_muted).bg(t.bg_primary))
+                    }
+                    HunkLineKind::Header => {
+                        ("@", Style::default().fg(t.accent_primary).bg(t.bg_primary))
+                    }
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("   {prefix}"),
-                        style,
-                    ),
-                    Span::styled(
-                        truncate(&hunk_line.content, inner.saturating_sub(5)),
-                        style,
-                    ),
+                    Span::styled(format!("   {prefix}"), style),
+                    Span::styled(truncate(&hunk_line.content, inner.saturating_sub(5)), style),
                 ]));
             }
             if !state.unified || is_selected {
@@ -358,7 +361,12 @@ mod tests {
         let state = DiffState::parse_diff(diff);
         assert_eq!(state.hunks.len(), 1);
         assert_eq!(state.hunks[0].lines.len(), 4);
-        assert!(state.hunks[0].lines.iter().any(|l| l.kind == HunkLineKind::Added));
+        assert!(
+            state.hunks[0]
+                .lines
+                .iter()
+                .any(|l| l.kind == HunkLineKind::Added)
+        );
     }
 
     #[test]

@@ -80,7 +80,11 @@ impl Theme {
     /// Border style; focused panes get the glowing accent edge.
     pub fn border_style(&self, focused: bool) -> Style {
         Style::default()
-            .fg(if focused { self.border_focus } else { self.border_default })
+            .fg(if focused {
+                self.border_focus
+            } else {
+                self.border_default
+            })
             .bg(self.bg_primary)
     }
 
@@ -205,25 +209,95 @@ const fn glass_dark(
 /// mapped onto one of the two glass bases with its own accent set.
 pub const NAMED_THEMES: &[Theme] = &[
     // "default" — midnight glass with the classic cyan glow.
-    glass_dark("default", Color::Rgb(34, 211, 238), Color::Rgb(125, 211, 252), MINT, AMBER, CORAL),
+    glass_dark(
+        "default",
+        Color::Rgb(34, 211, 238),
+        Color::Rgb(125, 211, 252),
+        MINT,
+        AMBER,
+        CORAL,
+    ),
     // "mono" — frosted daylight, greyscale accents.
-    glass_light("mono", Color::Rgb(60, 60, 68), Color::Rgb(120, 120, 128), Color::Rgb(40, 40, 44), Color::Rgb(110, 110, 116), Color::Rgb(160, 30, 30)),
+    glass_light(
+        "mono",
+        Color::Rgb(60, 60, 68),
+        Color::Rgb(120, 120, 128),
+        Color::Rgb(40, 40, 44),
+        Color::Rgb(110, 110, 116),
+        Color::Rgb(160, 30, 30),
+    ),
     // "dracula" — dark base, signature violet/pink.
-    glass_dark("dracula", Color::Rgb(189, 147, 249), Color::Rgb(255, 121, 198), Color::Rgb(80, 250, 123), Color::Rgb(241, 250, 140), Color::Rgb(255, 85, 85)),
+    glass_dark(
+        "dracula",
+        Color::Rgb(189, 147, 249),
+        Color::Rgb(255, 121, 198),
+        Color::Rgb(80, 250, 123),
+        Color::Rgb(241, 250, 140),
+        Color::Rgb(255, 85, 85),
+    ),
     // "solarized" — daylight base, warm gold over blue.
-    glass_light("solarized", Color::Rgb(181, 137, 0), Color::Rgb(38, 139, 210), Color::Rgb(133, 153, 0), Color::Rgb(203, 75, 22), Color::Rgb(220, 50, 47)),
+    glass_light(
+        "solarized",
+        Color::Rgb(181, 137, 0),
+        Color::Rgb(38, 139, 210),
+        Color::Rgb(133, 153, 0),
+        Color::Rgb(203, 75, 22),
+        Color::Rgb(220, 50, 47),
+    ),
     // "ocean" — deep teal glass.
-    glass_dark("ocean", Color::Rgb(0, 180, 216), Color::Rgb(0, 119, 182), Color::Rgb(2, 195, 154), AMBER, Color::Rgb(214, 40, 40)),
+    glass_dark(
+        "ocean",
+        Color::Rgb(0, 180, 216),
+        Color::Rgb(0, 119, 182),
+        Color::Rgb(2, 195, 154),
+        AMBER,
+        Color::Rgb(214, 40, 40),
+    ),
     // "nord" — frosty aurora blues.
-    glass_dark("nord", Color::Rgb(136, 192, 208), Color::Rgb(129, 161, 193), Color::Rgb(163, 190, 140), Color::Rgb(235, 203, 139), Color::Rgb(191, 97, 106)),
+    glass_dark(
+        "nord",
+        Color::Rgb(136, 192, 208),
+        Color::Rgb(129, 161, 193),
+        Color::Rgb(163, 190, 140),
+        Color::Rgb(235, 203, 139),
+        Color::Rgb(191, 97, 106),
+    ),
     // "gruvbox" — warm retro amber/orange.
-    glass_dark("gruvbox", Color::Rgb(250, 189, 47), Color::Rgb(254, 128, 25), Color::Rgb(184, 187, 38), Color::Rgb(250, 189, 47), Color::Rgb(251, 73, 52)),
+    glass_dark(
+        "gruvbox",
+        Color::Rgb(250, 189, 47),
+        Color::Rgb(254, 128, 25),
+        Color::Rgb(184, 187, 38),
+        Color::Rgb(250, 189, 47),
+        Color::Rgb(251, 73, 52),
+    ),
     // "tokyo-night" — indigo/neon city glow.
-    glass_dark("tokyo-night", Color::Rgb(122, 162, 247), Color::Rgb(187, 154, 247), Color::Rgb(115, 218, 202), Color::Rgb(224, 175, 104), Color::Rgb(247, 118, 142)),
+    glass_dark(
+        "tokyo-night",
+        Color::Rgb(122, 162, 247),
+        Color::Rgb(187, 154, 247),
+        Color::Rgb(115, 218, 202),
+        Color::Rgb(224, 175, 104),
+        Color::Rgb(247, 118, 142),
+    ),
     // "catppuccin" — pastel mocha.
-    glass_dark("catppuccin", Color::Rgb(203, 166, 247), Color::Rgb(245, 194, 231), Color::Rgb(166, 227, 161), Color::Rgb(249, 226, 175), Color::Rgb(243, 139, 168)),
+    glass_dark(
+        "catppuccin",
+        Color::Rgb(203, 166, 247),
+        Color::Rgb(245, 194, 231),
+        Color::Rgb(166, 227, 161),
+        Color::Rgb(249, 226, 175),
+        Color::Rgb(243, 139, 168),
+    ),
     // "rose" — dusky rose glass.
-    glass_dark("rose", Color::Rgb(235, 111, 146), Color::Rgb(196, 167, 231), Color::Rgb(156, 207, 176), Color::Rgb(240, 200, 130), Color::Rgb(235, 111, 146)),
+    glass_dark(
+        "rose",
+        Color::Rgb(235, 111, 146),
+        Color::Rgb(196, 167, 231),
+        Color::Rgb(156, 207, 176),
+        Color::Rgb(240, 200, 130),
+        Color::Rgb(235, 111, 146),
+    ),
 ];
 
 /// Switches to a named theme; returns `false` for unknown names.
@@ -302,9 +376,15 @@ pub fn apply_provider_accent(provider: &str) {
 #[allow(clippy::expect_used)] // safe: "default" and "mono" are always in NAMED_THEMES
 pub fn toggle() -> Theme {
     let next = if active().bg_primary == LIGHT_THEME.bg_primary {
-        *NAMED_THEMES.iter().find(|t| t.name == "default").expect("default theme exists")
+        *NAMED_THEMES
+            .iter()
+            .find(|t| t.name == "default")
+            .expect("default theme exists")
     } else {
-        *NAMED_THEMES.iter().find(|t| t.name == "mono").expect("mono theme exists")
+        *NAMED_THEMES
+            .iter()
+            .find(|t| t.name == "mono")
+            .expect("mono theme exists")
     };
     set(next);
     next

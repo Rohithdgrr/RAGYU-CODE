@@ -32,15 +32,26 @@
 - [x] Git tools: `git_diff`, `git_log`, `git_branch`, `git_commit`
 
 ## In progress
-- [ ] (nothing — tree is clean pending commit/push of docs)
+- [ ] SSE parser fuzzing; property tests for window/undo invariants
 
-## Next up (Phase 10)
-- [ ] File attachments / local RAG
-- [ ] Incremental symbol-index updates after `/apply`
-- [ ] Smarter compaction preserving recent tool rounds
+## Done (Phase 10 — 2026-08-27)
+- [x] File attachments / local RAG (token-aware `rag.rs`)
+- [x] Incremental symbol-index updates after `/apply` (debounced `symbols::ensure`)
+- [x] Smarter compaction preserving recent tool rounds (`auto_compact` 90/98)
 
-## Backlog (Phase 11+)
-- [ ] Streaming markdown rendering
-- [ ] Full-TUI mode
+## Done (Phase 11 — 2026-08-27)
+- [x] Streaming markdown rendering (`chat_pane` memo cache + `inline_spans`)
+- [x] Full-TUI mode (ratatui glassmorphism, split modules)
+- [x] Release packaging docs
+
+## Done (Phase 12 — OmniRouter hardening — 2026-08-27)
+- [x] RouterRole/OMNIROUTE_COMBOS, 3-strike failover, preflight, auto_compact, /router, model_rank, router_health, prompt_cache, max_tokens
+- [x] OmniRoute bootstrap tail + second-chance probe
+
+## Done (Phase 13 — Second-pass hardening — 2026-08-27)
+- [x] Rc→Arc, highlight bounds, preview symlink/OnceCell, session guards, shell audit, SSRF, preview token, chat cache, lsp spawn_blocking, worktree HEAD
+
+## Backlog (future)
 - [ ] Release packaging: cargo-dist, winget/Scoop/Homebrew
 - [ ] SSE parser fuzzing; property tests for window/undo invariants
+- [ ] WASM plugin system, vector DB, MCP protocol

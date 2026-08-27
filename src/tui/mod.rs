@@ -12,6 +12,7 @@ pub mod app;
 pub mod draw;
 pub mod icons;
 pub mod layout;
+pub mod provider_workflow;
 pub mod theme;
 pub mod widgets;
 
