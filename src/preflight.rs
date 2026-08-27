@@ -51,10 +51,17 @@ pub async fn probe_active(
     let resp = match tokio::time::timeout(PROBE_TIMEOUT, req.json(&body).send()).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
+            let mut msg = format!("{e}");
+            // Sanitize any leaked API key / bearer token from the error string.
+            if let Some(token) = bearer {
+                if !token.is_empty() {
+                    msg = msg.replace(token, "***");
+                }
+            }
             return ProbeResult {
                 model: model.to_owned(),
                 latency_ms: started.elapsed().as_millis() as u32,
-                status: ProbeStatus::Err(format!("transport: {e}")),
+                status: ProbeStatus::Err(format!("transport: {msg}")),
             };
         }
         Err(_) => {

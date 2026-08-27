@@ -78,19 +78,24 @@ impl ProjectMemory {
     }
 
     /// Appends a note to `.govinda/memory.md`.
+    ///
+    /// Uses atomic append via `OpenOptions::append` to avoid the
+    /// read-modify-write race that can lose data when multiple agent
+    /// instances call this concurrently.
     pub fn append_note(workspace: &Path, note: &str) -> Result<()> {
         let dir = workspace.join(".govinda");
         fs::create_dir_all(&dir)?;
         let path = dir.join("memory.md");
-        let existing = fs::read_to_string(&path).unwrap_or_default();
-        let separator = if existing.trim().is_empty() {
-            String::new()
-        } else {
-            "\n\n".to_owned()
-        };
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M");
-        let content = format!("{existing}{separator}## {timestamp}\n\n{note}\n");
-        fs::write(&path, content)?;
+        let section = format!("\n\n## {timestamp}\n\n{note}\n");
+        // Append atomically — concurrent appends interleave sections
+        // but never lose data (unlike the old read-modify-write).
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        use std::io::Write;
+        file.write_all(section.as_bytes())?;
         Ok(())
     }
 }

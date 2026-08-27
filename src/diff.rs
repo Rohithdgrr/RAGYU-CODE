@@ -33,14 +33,16 @@ fn lcs_ops<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<Op<'a>> {
         ops.extend(new.iter().map(|l| Op::Add(l)));
         return ops;
     }
-    // table[i][j] = LCS length of old[i..] vs new[j..]
-    let mut table = vec![vec![0u32; m + 1]; n + 1];
+    // Flat table: table[i * stride + j] = LCS length of old[i..] vs new[j..].
+    // A single contiguous allocation is more cache-friendly than Vec<Vec>.
+    let stride = m + 1;
+    let mut table = vec![0u32; (n + 1) * stride];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            table[i][j] = if old[i] == new[j] {
-                table[i + 1][j + 1] + 1
+            table[i * stride + j] = if old[i] == new[j] {
+                table[(i + 1) * stride + (j + 1)] + 1
             } else {
-                table[i][j + 1].max(table[i + 1][j])
+                table[i * stride + (j + 1)].max(table[(i + 1) * stride + j])
             }
         }
     }
@@ -52,7 +54,7 @@ fn lcs_ops<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<Op<'a>> {
             ops.push(Op::Same(old[i]));
             i += 1;
             j += 1;
-        } else if table[i + 1][j] >= table[i][j + 1] {
+        } else if table[(i + 1) * stride + j] >= table[i * stride + (j + 1)] {
             ops.push(Op::Del(old[i]));
             i += 1;
         } else {

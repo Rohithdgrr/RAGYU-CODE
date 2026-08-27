@@ -740,7 +740,13 @@ impl Tui {
                             }
                         }
                         ProviderWorkflow::Testing { .. } => {
-                            // Wait for async test to complete.
+                            // Allow Ctrl+C to cancel the connection test.
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                            {
+                                self.provider_workflow = None;
+                                self.notice("connection test cancelled.");
+                            }
                         }
                         ProviderWorkflow::Result { .. } => {
                             // Any key closes the result.
@@ -2812,6 +2818,7 @@ mod tests {
             theme: None,
             timeout_secs: 30,
             limit_mb: 16,
+            git_binary_path: None,
             protocol: crate::govinda_protocol::ProtocolConfig::default(),
         };
         let mut app = crate::commands::App::new(
@@ -2871,6 +2878,7 @@ mod tests {
             theme: None,
             timeout_secs: 30,
             limit_mb: 16,
+            git_binary_path: None,
             protocol: crate::govinda_protocol::ProtocolConfig::default(),
         };
         App::new(

@@ -6,10 +6,14 @@ use crossterm::{
 };
 use std::io::{IsTerminal, Write};
 use std::sync::{
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+
+/// Shared lock for spinner stdout writes to prevent interleaving when
+/// multiple spinner tasks or other code write to stdout concurrently.
+static SPINNER_STDOUT_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn stdout_is_tty() -> bool {
     std::io::stdout().is_terminal()
@@ -285,6 +289,9 @@ impl Spinner {
         let handle = tokio::spawn(async move {
             let mut i = 0usize;
             while !flag.load(Ordering::Relaxed) {
+                // Lock for the duration of each write to prevent interleaving
+                // with other spinner tasks or code writing to stdout.
+                let _guard = SPINNER_STDOUT_LOCK.lock();
                 let _ = execute!(
                     std::io::stdout(),
                     MoveToColumn(0),
@@ -294,9 +301,12 @@ impl Spinner {
                         paint(SPINNER_FRAMES[i % SPINNER_FRAMES.len()], accent())
                     ))
                 );
+                let _ = std::io::stdout().flush();
+                drop(_guard);
                 i += 1;
                 tokio::time::sleep(Duration::from_millis(80)).await;
             }
+            let _guard = SPINNER_STDOUT_LOCK.lock();
             let _ = execute!(
                 std::io::stdout(),
                 MoveToColumn(0),

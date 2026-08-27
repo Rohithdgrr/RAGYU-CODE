@@ -67,6 +67,23 @@ pub fn top_models_with_health(
     out
 }
 
+/// Wilson score interval lower bound — a Bayesian estimate of the
+/// "true" success rate that naturally penalizes models with few requests.
+/// A model with 1 request (100% success) scores ~0.21, while one with
+/// 1000 requests (99% success) scores ~0.98. `z` is the z-value for the
+/// desired confidence (1.96 = 95%).
+fn wilson_score(successes: f32, total: f32) -> f32 {
+    if total == 0.0 {
+        return 0.5;
+    }
+    let z = 1.96;
+    let p = successes / total;
+    let denominator = 1.0 + z * z / total;
+    let centre = p + z * z / (2.0 * total);
+    let width = z * ((p * (1.0 - p) + z * z / (4.0 * total)) / total).sqrt();
+    ((centre - width) / denominator).clamp(0.0, 1.0)
+}
+
 fn score_row(
     km: &KnownModel,
     sort: SortKey,
@@ -81,10 +98,11 @@ fn score_row(
     let score = match sort {
         SortKey::Quality => {
             if let Some(h) = health {
-                let total = h.total_requests.max(1) as f32;
-                let success_rate = (total - h.total_failures as f32) / total;
+                let total = h.total_requests as f32;
+                let successes = total - h.total_failures as f32;
+                let ws = wilson_score(successes, total);
                 let strike_factor = 1.0 - (h.strikes as f32 / 3.0).min(1.0);
-                0.5 * success_rate + 0.3 * strike_factor + 0.2 * context_norm
+                0.5 * ws + 0.3 * strike_factor + 0.2 * context_norm
             } else {
                 0.6 * context_norm + 0.4 * (if km.free { 1.0 } else { 0.5 })
             }

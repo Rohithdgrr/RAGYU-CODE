@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::router::Router;
+use serde_json::json;
 
 const LOG_NAME: &str = "router_health.jsonl";
 const MAX_BYTES: u64 = 1024 * 1024;
@@ -35,18 +36,15 @@ fn log_path() -> PathBuf {
 pub fn append(entry: &HealthEntry) {
     let path = log_path();
     rotate_if_needed(&path);
-    let line = format!(
-        "{{\"ts\":\"{}\",\"model\":\"{}\",\"latency_ms\":{},\"success\":{},\"error\":{}}}\n",
-        entry.ts,
-        entry.model,
-        entry.latency_ms,
-        entry.success,
-        entry
-            .error
-            .as_deref()
-            .map(|e| format!("\"{}\"", e.replace('"', "\\\"")))
-            .unwrap_or_else(|| "null".to_owned()),
-    );
+    let line = json!({
+        "ts": entry.ts,
+        "model": entry.model,
+        "latency_ms": entry.latency_ms,
+        "success": entry.success,
+        "error": entry.error,
+    })
+    .to_string()
+        + "\n";
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }

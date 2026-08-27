@@ -19,6 +19,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Maximum size of a skill file to prevent OOM from malicious or
+/// accidentally large files (e.g., a 1 GB log renamed to `.md`).
+const MAX_SKILL_FILE_BYTES: u64 = 128 * 1024; // 128 KB
+
 /// A loaded skill definition from a `.md` file.
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -72,6 +76,16 @@ pub fn load_skills() -> Vec<Skill> {
 
 /// Parses a single skill `.md` file.
 fn parse_skill_file(path: &Path) -> Result<Skill> {
+    // Reject files larger than the cap to prevent OOM.
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > MAX_SKILL_FILE_BYTES {
+            anyhow::bail!(
+                "skill file too large: {} bytes (max {})",
+                meta.len(),
+                MAX_SKILL_FILE_BYTES
+            );
+        }
+    }
     let raw =
         fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
 
