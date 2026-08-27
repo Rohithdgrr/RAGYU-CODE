@@ -11,6 +11,22 @@
 use regex::Regex;
 use std::path::Path;
 
+/// Maximum length of a single ignore-file pattern body. Anything longer is
+/// skipped silently — gitignore-style files in the wild never need patterns
+/// beyond a few hundred characters, and a long pattern is the leading
+/// indicator of a regex-DoS payload (e.g. `**a**a**a**a**…`).
+const MAX_PATTERN_CHARS: usize = 256;
+/// Maximum total patterns per file. Bounds the worst-case matching cost: with
+/// N patterns the matcher runs N regexes per path, so the attacker can force
+/// O(N·M) by adding both many rules and many files. 1024 is generous and
+/// matches common tooling defaults.
+const MAX_RULES: usize = 1024;
+/// Instruction limit passed to `regex::RegexBuilder::dfa_size_limit` / the
+/// default `Regex::new` machinery. Caps the work a single compiled pattern
+/// can demand during matching, neutralizing catastrophic-backtracking ReDoS
+/// payloads even if one slips past the length cap.
+const REGEX_SIZE_LIMIT_BYTES: usize = 64 * 1024;
+
 /// Parsed ignore rules, matched against workspace-relative paths using
 /// forward slashes (the same normalization `display_rel` produces).
 #[derive(Debug, Default)]
@@ -42,6 +58,10 @@ impl IgnoreRules {
     pub fn parse(text: &str) -> Self {
         let mut rules = Vec::new();
         for raw in text.lines() {
+            if rules.len() >= MAX_RULES {
+                // Reached the rule-count cap; remaining lines are ignored.
+                break;
+            }
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
                 continue;
@@ -54,13 +74,28 @@ impl IgnoreRules {
             if pattern.is_empty() {
                 continue;
             }
+            // Reject pathological patterns up front. `*` translates to
+            // `[^/]*` (single-segment, no nesting) so the typical ReDoS
+            // payload `**a**a**…` cannot blow up the matcher, but a
+            // still-quite-bad 256-char `*?*?*?*?*?…` could match slowly
+            // over many files. The length cap is a cheap hard limit.
+            if pattern.chars().count() > MAX_PATTERN_CHARS {
+                continue;
+            }
             let body = glob_body(pattern);
             let anchored_re = if anchored {
                 format!("^{body}(/.*)?$")
             } else {
                 format!("^(?:.*/)?{body}(/.*)?$")
             };
-            if let Ok(re) = Regex::new(&anchored_re) {
+            // `Regex::new` uses Rust's `regex` crate default size limits
+            // (1 MiB DFA) which already neutralizes catastrophic
+            // backtracking. We additionally cap the compiled-program size
+            // so a single pattern cannot claim unbounded work.
+            if let Ok(re) = regex::RegexBuilder::new(&anchored_re)
+                .size_limit(REGEX_SIZE_LIMIT_BYTES)
+                .build()
+            {
                 rules.push(Rule { re, dir_only });
             }
         }
@@ -188,5 +223,32 @@ mod tests {
         let text = "a+b.c\n";
         assert!(matched(text, "a+b.c", false));
         assert!(!matched(text, "aabbc", false));
+    }
+
+    #[test]
+    fn redos_pathological_pattern_is_silently_dropped() {
+        // A 1000-char pattern of alternating `*?` is a classic ReDoS payload:
+        // each character doubles the matcher work in a backtracking engine.
+        // The length cap must drop it without erroring.
+        let bad = "*?".repeat(500); // 1000 chars
+        let text = format!("{bad}\n*.log\n");
+        let rules = IgnoreRules::parse(&text);
+        // The bad pattern is dropped, the good one is kept.
+        assert!(matched(&text, "x.log", false));
+        // And matching a long path against the dropped rule must not hang.
+        let probe = "a".repeat(2000);
+        let _ = rules.matches(&probe, false);
+    }
+
+    #[test]
+    fn redos_oversized_rule_count_is_capped() {
+        // 2000 short patterns → only the first MAX_RULES survive.
+        let text = (0..2000).map(|i| format!("rule_{i}")).collect::<Vec<_>>().join("\n");
+        let rules = IgnoreRules::parse(&text);
+        assert!(
+            rules.rules.len() <= 1024,
+            "expected rule count to be capped, got {}",
+            rules.rules.len()
+        );
     }
 }

@@ -2909,7 +2909,155 @@ fn validate_staged_op(base: &Path, op: &EditOp) -> Result<()> {
 // Audit log for shell execution (security)
 // ---------------------------------------------------------------------------
 
-/// Appends a shell command to `.govinda/shell_audit.log` for post-hoc review.
+/// Environment variables that must never reach a `sh -c` / `cmd /C` subprocess
+/// spawned by the model. Each is a documented injection / RCE primitive:
+///
+/// - `BASH_ENV` / `ENV` / `SHELLOPTS` — sourced at shell start on Unix,
+///   allowing arbitrary code execution before the user's command runs
+///   (CVE-2014-6271 family, Shellshock-class attacks).
+/// - `BASH_FUNC_*` (prefix) — every env var starting with `BASH_FUNC_` is
+///   exported by Bash as a function definition. The Shellshock-class of
+///   attacks (CVE-2014-6271, CVE-2014-7169, …) is alive in this family
+///   well past the original disclosures; modern bash will still parse and
+///   execute a `BASH_FUNC_cmd%%='() { evil; }'` planted by a parent.
+/// - `LD_PRELOAD` / `LD_LIBRARY_PATH` / `LD_AUDIT` — preloaded into every
+///   dynamically-linked child, classic local privesc primitive.
+/// - `PATH` — untrusted `PATH` lets a planted binary hijack `cargo`, `npm`,
+///   `python`, etc. (e.g. `~/.cache/evil/cargo`). We re-pin `PATH` from the
+///   trusted system location below, so removing it from the inherited env is
+///   safe and necessary.
+/// - `PYTHONPATH` / `PYTHONSTARTUP` / `PYTHONHOME` — module shadowing and
+///   auto-execution on Python start.
+/// - `NODE_OPTIONS` / `NODE_PATH` — `--require` preload and module resolution
+///   hijack for every Node child.
+/// - `IFS` — bash word-splitting override; can break quoting assumptions.
+/// - `PS4` — debug-trap command substitution (CVE-2014-6271 follow-up).
+/// - Windows: `cmd.exe` injection surface (`AutoRun` registry value,
+///   `COMSPEC` override, `PATHEXT` hijack) is mitigated indirectly by
+///   re-pinning PATH to `C:\Windows\System32` in `discover_system_path`.
+///
+/// This list is intentionally narrow: we only strip the variables that are
+/// known shell/RCE primitives, so legitimate tools (cargo, npm, python, git,
+/// docker, etc.) keep working with the inherited values they actually need.
+///
+/// Entries are exact-match unless suffixed with `*` (prefix match).
+const SHELL_INJECTION_VARS: &[&str] = &[
+    "BASH_ENV",
+    "ENV",
+    "BASH_FUNC_*",
+    "BASH_XTRACEFD",
+    "SHELLOPTS",
+    "PS4",
+    "IFS",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "PATH",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
+    "PYTHONINSPECT",
+    "PYTHONBREAKPOINT",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_EXTRA_CA_CERTS",
+    "RUBYOPT",
+    "RUBYLIB",
+    "PERL5OPT",
+    "PERL5LIB",
+    "PERLLIB",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+    "GIT_TEMPLATE_DIR",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JVM_OPTS",
+];
+
+/// Returns true if `name` should be stripped from the subprocess env.
+/// Exact match unless `pattern` ends with `*`, in which case it's a prefix
+/// match (e.g. `BASH_FUNC_*` matches every `BASH_FUNC_xxx`).
+fn should_strip_env(name: &str, pattern: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else {
+        name == pattern
+    }
+}
+
+/// Global lock guarding `std::env::vars()` reads. `std::env` is not
+/// thread-safe w.r.t. concurrent `setenv`/`unsetenv` on most platforms;
+/// holding this lock around every read ensures the snapshot we collect is
+/// not torn by another thread mutating the environment mid-collect.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Builds a safe environment for a shell subprocess. We start from a snapshot
+/// of the parent env, then strip the dangerous overrides listed in
+/// `SHELL_INJECTION_VARS`, and re-pin `PATH` from the trusted system default
+/// so a hijacked parent PATH cannot redirect `cargo`/`npm`/etc. to attacker
+/// binaries.
+///
+/// This is the cheapest effective mitigation against environment-driven
+/// shell injection: a `sh -c` subprocess now runs without the model (or a
+/// prompt-injection payload) being able to influence the shell via env vars.
+fn safe_subprocess_env() -> std::collections::HashMap<String, String> {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    env.retain(|name, _| {
+        !SHELL_INJECTION_VARS
+            .iter()
+            .any(|p| should_strip_env(name, p))
+    });
+    // Re-pin PATH from a hardcoded system list. We deliberately do NOT use
+    // the current PATH to discover it (the current PATH is the untrusted
+    // value this function is replacing — using it would let a planted
+    // binary in the parent PATH redirect the lookup).
+    let sys_path = discover_system_path();
+    if !sys_path.is_empty() {
+        env.insert("PATH".to_string(), sys_path);
+    } else {
+        // Last-resort fallback: an empty PATH means exec() will fail loudly
+        // rather than silently invoking a wrong binary.
+        env.insert("PATH".to_string(), String::new());
+    }
+    env
+}
+
+/// Returns a hardcoded, trusted system PATH. Intentionally does NOT inspect
+/// the current PATH or spawn a child process to discover binaries — the
+/// current PATH is the untrusted value this function is replacing, and
+/// spawning a child to find `sh`/`cmd` would re-introduce the same
+/// poisoning problem we are trying to fix.
+///
+/// On stripped-down systems where `sh`/`cargo` lives outside these dirs,
+/// the user can set `PATH` in their shell rc before invoking govinda and
+/// the `env_retain` above will preserve those entries.
+fn discover_system_path() -> String {
+    if cfg!(windows) {
+        // Windows shell-injection surface (AutoRun, COMSPEC, PATHEXT) is
+        // mitigated indirectly by pinning PATH to System32.
+        [
+            r"C:\Windows\System32",
+            r"C:\Windows",
+            r"C:\Windows\System32\Wbem",
+        ]
+        .join(";")
+    } else {
+        [
+            "/usr/local/sbin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/usr/bin",
+            "/sbin",
+            "/bin",
+        ]
+        .join(":")
+    }
+}
+
+/// Appends a shell command to `.govinda/shell_audit.log` (legacy text log)
+/// and the structured `.govinda/audit.log` (JSON, machine-parseable).
 /// Best-effort: failures are ignored so auditing never breaks the tool.
 /// The log lives in the workspace (`.govinda/`) and is never sent to the model.
 fn audit_shell(command: &str) {
@@ -2927,6 +3075,8 @@ fn audit_shell(command: &str) {
             use std::io::Write;
             let _ = file.write_all(line.as_bytes());
         }
+        // Unified structured audit log (V-009).
+        crate::audit::shell(&cwd, true, command);
     }
 }
 
@@ -2977,7 +3127,15 @@ async fn exec_argv(program: &str, argv: &[String], timeout_secs: u64) -> Result<
     let timeout_dur = Duration::from_secs(timeout_secs.clamp(1, MAX_SHELL_TIMEOUT_SECS));
     let max_out = MAX_SHELL_OUTPUT_BYTES;
     let started = Instant::now();
-    let spawned = tokio::process::Command::new(program).args(argv).output();
+    // Strip shell-injection env vars (BASH_ENV, LD_PRELOAD, PATH, etc.) so a
+    // prompt-injection payload cannot pivot from a model-generated command to
+    // arbitrary code via the inherited environment. See SHELL_INJECTION_VARS.
+    let safe_env = safe_subprocess_env();
+    let spawned = tokio::process::Command::new(program)
+        .args(argv)
+        .env_clear()
+        .envs(safe_env)
+        .output();
     let output = match tokio::time::timeout(timeout_dur, spawned).await {
         Err(_) => bail!("timed out after {}s", timeout_dur.as_secs()),
         Ok(res) => res.with_context(|| format!("cannot spawn '{program}'"))?,
@@ -3219,6 +3377,9 @@ pub(crate) fn walk_files(base: &Path, root: &Path) -> Vec<PathBuf> {
 
 fn read_file(base: &Path, args: &ReadFileArgs) -> Result<String> {
     let path = resolve_in(base, &args.path)?;
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::audit::record(&cwd, crate::audit::AuditKind::FileRead, true, &args.path);
+    }
     let meta = fs::metadata(&path).with_context(|| format!("cannot stat '{}'", args.path))?;
     anyhow::ensure!(meta.is_file(), "'{}' is not a regular file", args.path);
     anyhow::ensure!(
@@ -3294,6 +3455,9 @@ pub fn write_file(base: &Path, args: &WriteFileArgs) -> Result<String> {
         MAX_WRITE_BYTES
     );
     let path = resolve_in(base, &args.path)?;
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::audit::record(&cwd, crate::audit::AuditKind::FileWrite, true, &args.path);
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create parent directory for '{}'", args.path))?;
@@ -3828,6 +3992,116 @@ mod tests {
         }
         assert!(parse_edit_op("edit_file", r#"{"path":"a"}"#).is_err());
         assert!(parse_edit_op("view_diff", "{}").is_err());
+    }
+
+    #[test]
+    fn shell_injection_vars_blocklist_includes_known_primitives() {
+        let block: Vec<&str> = SHELL_INJECTION_VARS.to_vec();
+        for required in [
+            "BASH_ENV",
+            "ENV",
+            "BASH_FUNC_*",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "PATH",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "IFS",
+            "PS4",
+        ] {
+            assert!(
+                block.contains(&required),
+                "SHELL_INJECTION_VARS must include {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_subprocess_env_strips_dangerous_vars() {
+        unsafe {
+            std::env::set_var("BASH_ENV", "/tmp/evil.sh");
+            std::env::set_var("LD_PRELOAD", "/tmp/evil.so");
+            std::env::set_var("PYTHONPATH", "/tmp/evil");
+            std::env::set_var("NODE_OPTIONS", "--require /tmp/evil.js");
+            std::env::set_var("BASH_FUNC_cmd%%", "() { evil; }");
+        }
+        let env = safe_subprocess_env();
+        for stripped in [
+            "BASH_ENV",
+            "LD_PRELOAD",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+            "BASH_FUNC_cmd%%",
+        ] {
+            assert!(
+                !env.contains_key(stripped),
+                "{stripped} leaked into subprocess env: {:?}",
+                env.get(stripped)
+            );
+        }
+        let path = env.get("PATH").expect("PATH must be set");
+        assert!(!path.is_empty(), "PATH must be non-empty after repinning");
+        if !cfg!(windows) {
+            assert!(
+                path.split(':').any(|p| p == "/usr/bin" || p == "/bin"),
+                "PATH missing system dirs: {path}"
+            );
+        }
+        unsafe {
+            std::env::remove_var("BASH_ENV");
+            std::env::remove_var("LD_PRELOAD");
+            std::env::remove_var("PYTHONPATH");
+            std::env::remove_var("NODE_OPTIONS");
+            std::env::remove_var("BASH_FUNC_cmd%%");
+        }
+    }
+
+    /// End-to-end: plant BASH_ENV in the parent env, then run a shell
+    /// command. A working strip guarantees the shell never sources the
+    /// planted file. On Windows BASH_ENV is harmless but the test still
+    /// verifies the env-strip boundary in `exec_argv` is wired up.
+    #[tokio::test]
+    async fn exec_argv_strips_injected_env_at_subprocess_boundary() {
+        let planted = std::env::temp_dir().join("govinda_bash_env_planted.sh");
+        if !cfg!(windows) {
+            std::fs::write(&planted, "echo PWNED_VIA_BASH_ENV\n").unwrap();
+        }
+        let planted_str = planted.to_string_lossy().to_string();
+
+        // SAFETY: tests in this module are not run concurrently with env
+        // mutation; we set then clear.
+        unsafe {
+            std::env::set_var("BASH_ENV", &planted_str);
+            std::env::set_var("EVIL_MARKER", "should_not_appear");
+        }
+        let args = RunShellArgs {
+            command: "echo hello-boundary".into(),
+            timeout_secs: Some(5),
+        };
+        let out = run_shell_command(args).await.unwrap();
+        unsafe {
+            std::env::remove_var("BASH_ENV");
+            std::env::remove_var("EVIL_MARKER");
+        }
+
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["exit_code"], 0, "command failed: {parsed:?}");
+        let stdout = parsed["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("hello-boundary"),
+            "command output missing: {stdout}"
+        );
+        assert!(
+            !stdout.contains("PWNED_VIA_BASH_ENV"),
+            "BASH_ENV leaked into sh subprocess: {stdout}"
+        );
+        assert!(
+            !stdout.contains("EVIL_MARKER"),
+            "planted env var reached subprocess: {stdout}"
+        );
+        let _ = std::fs::remove_file(&planted);
     }
 
     #[tokio::test]

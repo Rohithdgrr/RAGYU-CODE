@@ -165,6 +165,15 @@ async fn handle_conn(mut stream: TcpStream, root: PathBuf, token: String, addr: 
     if !has_valid_token && !has_valid_origin && !has_valid_referer {
         // No token and no same-origin header — likely a cross-origin probe.
         // The initial browser navigation always has the token, so this is safe.
+        // Audit the rejection (V-009: forensic trail of all preview access).
+        if let Ok(cwd) = std::env::current_dir() {
+            crate::audit::record(
+                &cwd,
+                crate::audit::AuditKind::Preview,
+                false,
+                &format!("rejected (no token, no same-origin): {url_path_full}"),
+            );
+        }
         let body = b"403 Forbidden: invalid preview token or origin\n";
         let head = format!(
             "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -177,6 +186,15 @@ async fn handle_conn(mut stream: TcpStream, root: PathBuf, token: String, addr: 
     }
     // Strip query string (`?token=...` / `?v=1` cache busters) before resolving.
     let url_path = url_path_full.split('?').next().unwrap_or(url_path_full);
+    // Audit every successful preview access for the forensic trail (V-009).
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::audit::record(
+            &cwd,
+            crate::audit::AuditKind::Preview,
+            true,
+            url_path,
+        );
+    }
     let (status, body, ctype) = match resolve_safe(&root, url_path) {
         Some(file) => match tokio::fs::read(&file).await {
             Ok(bytes) => ("200 OK".to_owned(), bytes, content_type(&file).to_owned()),

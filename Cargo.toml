@@ -5,11 +5,14 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+argon2 = "0.5"
+chacha20poly1305 = { version = "0.11", features = ["alloc"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 ratatui = "0.30"
+rand = "0.8"
 reedline = "0.50.0"
 regex = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream"], default-features = false }

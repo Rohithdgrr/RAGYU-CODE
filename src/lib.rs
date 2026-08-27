@@ -8,6 +8,7 @@ pub static TEST_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub mod agent_loop;
 pub mod api;
+pub mod audit;
 pub mod auto_compact;
 pub mod checkpoint;
 pub mod clock;

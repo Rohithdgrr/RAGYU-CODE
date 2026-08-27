@@ -21,8 +21,29 @@ pub enum Method {
     Patch,
 }
 
+impl Method {
+    pub fn method_name(&self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Put => "PUT",
+            Method::Delete => "DELETE",
+            Method::Patch => "PATCH",
+        }
+    }
+}
+
 pub async fn run(args: Args) -> anyhow::Result<String> {
     crate::ssrf::ensure_safe_url(&args.url)?;
+    // Forensic trail: every outbound HTTP request is recorded (V-009).
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::audit::record(
+            &cwd,
+            crate::audit::AuditKind::Network,
+            true,
+            &format!("{} {}", args.method.method_name(), args.url),
+        );
+    }
     let timeout = args.timeout_secs.unwrap_or(30).clamp(1, 120);
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
