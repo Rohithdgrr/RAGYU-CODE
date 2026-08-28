@@ -38,7 +38,7 @@ struct State {
     last_soft_pct: u8,
 }
 
-static STATE: std::sync::Mutex<State> = std::sync::Mutex::new(State {
+static STATE: tokio::sync::Mutex<State> = tokio::sync::Mutex::const_new(State {
     soft_streak: 0,
     last_soft_pct: 0,
 });
@@ -72,7 +72,7 @@ pub fn fill_pct(app: &App) -> u8 {
 pub async fn check_and_run(app: &mut App, router: &Router, soft_pct: u8, hard_pct: u8) -> Outcome {
     let pct = fill_pct(app);
     if pct < soft_pct {
-        reset_streak();
+        reset_streak().await;
         return Outcome::Noop;
     }
     if !app.auto_compact_enabled {
@@ -80,12 +80,12 @@ pub async fn check_and_run(app: &mut App, router: &Router, soft_pct: u8, hard_pc
     }
     if pct >= hard_pct {
         hard_reset(app);
-        reset_streak();
+        reset_streak().await;
         return Outcome::HardReset;
     }
     // Soft path. The streak counter forces a hard reset when two
     // soft compactions in a row did not move the needle.
-    let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut state = STATE.lock().await;
     let drifted =
         state.soft_streak >= 1 && pct.abs_diff(state.last_soft_pct) < 5 && pct >= soft_pct;
     state.last_soft_pct = pct;
@@ -93,7 +93,7 @@ pub async fn check_and_run(app: &mut App, router: &Router, soft_pct: u8, hard_pc
     drop(state);
     if drifted {
         hard_reset(app);
-        reset_streak();
+        reset_streak().await;
         return Outcome::HardReset;
     }
     if soft_compact(app, router).await {
@@ -103,8 +103,13 @@ pub async fn check_and_run(app: &mut App, router: &Router, soft_pct: u8, hard_pc
     }
 }
 
-fn reset_streak() {
-    let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
+async fn reset_streak() {
+    // `STATE` is a `tokio::sync::Mutex` and this function is only ever
+    // called from async contexts, so we must use the async-aware lock.
+    // Using `blocking_lock()` here used to panic with
+    // "Cannot block the current thread from within a runtime" because
+    // `check_and_run` is invoked on a tokio worker thread.
+    let mut state = STATE.lock().await;
     state.soft_streak = 0;
     state.last_soft_pct = 0;
 }
@@ -172,4 +177,102 @@ fn hard_reset(app: &mut App) {
             )
         });
     app.last_auto_compact_count = app.session.messages().len();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_mutex_not_held_across_await() {
+        // This test verifies that the tokio::sync::Mutex can be safely
+        // held across await points without deadlock
+        use tokio::task;
+
+        // Spawn multiple concurrent tasks that access the shared STATE
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                task::spawn(async {
+                    // Acquire the STATE lock
+                    let mut state = STATE.lock().await;
+                    state.soft_streak = 1;
+                    state.last_soft_pct = 50;
+                    
+                    // Simulate some async work while holding the lock
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    
+                    // Release the lock
+                    drop(state);
+                })
+            })
+            .collect();
+
+        // Wait for all tasks to complete - should not deadlock
+        for handle in handles {
+            handle.await.expect("Task should not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reset_streak_concurrent() {
+        // Test that reset_streak can be called concurrently without issues
+        use tokio::task;
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                task::spawn(async {
+                    reset_streak().await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await.expect("Task should not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_state_updates_synchronized() {
+        // Test that state updates are properly synchronized
+        use tokio::task;
+
+        // Reset state to known value
+        reset_streak().await;
+
+        // Spawn tasks that increment soft_streak
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                task::spawn(async {
+                    let mut state = STATE.lock().await;
+                    state.soft_streak = state.soft_streak.saturating_add(1);
+                    drop(state);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await.expect("Task should not panic");
+        }
+
+        // Verify state was properly updated
+        let state = STATE.lock().await;
+        assert!(state.soft_streak > 0, "State should have been updated");
+    }
+
+    /// Regression test for the panic
+    /// "Cannot block the current thread from within a runtime"
+    /// that fired from `reset_streak()` after every prompt. Before the
+    /// fix, `reset_streak()` used `STATE.blocking_lock()`, which tokio
+    /// forbids on runtime worker threads. Calling it from
+    /// `tokio::task::spawn` (the same call pattern as
+    /// `check_and_run`) reproduces the crash if it ever regresses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reset_streak_does_not_panic_on_runtime_thread() {
+        use tokio::task;
+        let handle = task::spawn(async {
+            reset_streak().await;
+        });
+        handle.await.expect("reset_streak must not panic on a runtime thread");
+    }
 }

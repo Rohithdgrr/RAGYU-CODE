@@ -1,0 +1,106 @@
+   Compiling govinda-cli v0.1.0 (C:\Users\saipr\Music\Rohith\RAGYU-CODE)
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:211:46
+    |
+211 |     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    |                                              ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:214:21
+    |
+214 |             XNonce::from_slice(&rng_bytes),
+    |                     ^^^^^^^^^^
+
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:238:46
+    |
+238 |     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    |                                              ^^^^^^^^^^
+
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:241:21
+    |
+241 |             XNonce::from_slice(nonce),
+    |                     ^^^^^^^^^^
+
+error[E0063]: missing field `git_binary_path` in initializer of `Config`
+    --> src\tui\app.rs:2801:22
+     |
+2801 |         let config = crate::config::Config {
+     |                      ^^^^^^^^^^^^^^^^^^^^^ missing `git_binary_path`
+
+error[E0063]: missing field `git_binary_path` in initializer of `Config`
+    --> src\tui\app.rs:2860:22
+     |
+2860 |         let config = crate::config::Config {
+     |                      ^^^^^^^^^^^^^^^^^^^^^ missing `git_binary_path`
+
+For more information about this error, try `rustc --explain E0063`.
+warning: `govinda-cli` (lib test) generated 4 warnings
+error: could not compile `govinda-cli` (lib test) due to 2 previous errors; 4 warnings emitted
+   Compiling govinda-cli v0.1.0 (C:\Users\saipr\Music\Rohith\RAGYU-CODE)
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:211:46
+    |
+211 |     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    |                                              ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:214:21
+    |
+214 |             XNonce::from_slice(&rng_bytes),
+    |                     ^^^^^^^^^^
+
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:238:46
+    |
+238 |     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    |                                              ^^^^^^^^^^
+
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:241:21
+    |
+241 |             XNonce::from_slice(nonce),
+    |                     ^^^^^^^^^^
+
+warning: function `show_tools` is never used
+   --> src\commands\display.rs:102:15
+    |
+102 | pub(super) fn show_tools(arg: &str, app: &mut App) {
+    |               ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `show_config` is never used
+   --> src\commands\display.rs:296:15
+    |
+296 | pub(super) fn show_config(app: &App) {
+    |               ^^^^^^^^^^^
+
+warning: `govinda-cli` (lib) generated 6 warnings
+warning: unused variable: `path_buf`
+   --> tests\git_security_test.rs:130:17
+    |
+130 |             let path_buf = PathBuf::from(path);
+    |                 ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_path_buf`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `govinda-cli` (test "git_security_test") generated 1 warning (run `cargo fix --test "git_security_test" -p govinda-cli` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.10s
+     Running tests\git_security_test.rs (target\debug\deps\git_security_test-e197f083be4ccb7b.exe)
+
+running 6 tests
+test bug_037_git_path_validation::test_path_manipulation_scenarios ... ok
+test bug_037_git_path_validation::test_trusted_locations_list_is_comprehensive ... ok
+test bug_037_git_path_validation::test_untrusted_path_would_be_rejected ... ok
+test bug_037_git_path_validation::test_windows_standard_locations_included ... ok
+test bug_037_git_path_validation::test_git_command_is_available ... ok
+test bug_037_git_path_validation::test_git_operations_use_validated_binary ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+

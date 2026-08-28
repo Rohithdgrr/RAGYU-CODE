@@ -188,6 +188,9 @@ pub struct App {
     /// `/variants`. Separate from the global `prompt_cache::GLOBAL` so
     /// borrow conflicts are reduced and tests can inject an isolated cache.
     pub prompt_cache: crate::prompt_cache::PromptCache,
+    /// Tracks whether we already tried the OpenCode fallback for this
+    /// turn. Reset each turn so the probe only fires once.
+    pub opencode_fallback_attempted: bool,
 }
 
 #[derive(Default)]
@@ -226,6 +229,7 @@ impl App {
             provider,
             source_path: None,
             provider_explicit: false,
+            model_explicit: true,
             shell_tools: Vec::new(),
             theme: None,
             timeout_secs: 30,
@@ -286,6 +290,7 @@ impl App {
             total_lines_emitted: 0,
             project_type,
             prompt_cache: crate::prompt_cache::PromptCache::new(),
+            opencode_fallback_attempted: false,
             config,
             http,
             session,
@@ -668,6 +673,7 @@ pub(crate) fn todo_app_for_tools() -> App {
         provider,
         source_path: None,
         provider_explicit: false,
+        model_explicit: true,
         shell_tools: Vec::new(),
         theme: None,
         timeout_secs: 30,
@@ -1336,6 +1342,7 @@ mod tests {
             provider,
             source_path: None,
             provider_explicit: false,
+            model_explicit: true,
             shell_tools: Vec::new(),
             theme: None,
             timeout_secs: 30,

@@ -572,6 +572,68 @@ pub async fn status_line(http: &reqwest::Client) -> String {
     }
 }
 
+/// Tries to start the OpenCode server if it's installed but not running.
+/// Returns `true` if the server is now reachable, `false` otherwise.
+pub async fn try_start_server(http: &reqwest::Client) -> bool {
+    // Already running?
+    if probe(http).await.is_some() {
+        return true;
+    }
+    // Try `opencode serve` in the background.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("opencode")
+            .arg("serve")
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("opencode")
+            .arg("serve")
+            .spawn();
+    }
+    // Wait up to 15 seconds for the server to come up.
+    for _ in 0..15 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if probe(http).await.is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Ensures the opencode CLI is installed. Tries `npm install -g opencode`
+/// if the binary is not found. Returns `true` if installed or successfully
+/// installed, `false` if npm is unavailable or the install fails.
+pub async fn ensure_installed() -> bool {
+    // Already available?
+    if tokio::process::Command::new("opencode")
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    // Try to install via npm.
+    #[cfg(windows)]
+    let argv = vec!["cmd".to_string(), "/C".to_string(), "npm install -g opencode --no-audit --no-fund".to_string()];
+    #[cfg(not(windows))]
+    let argv = vec!["npm".to_string(), "install".to_string(), "-g".to_string(), "opencode".to_string()];
+    let status = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    status.map(|s| s.success()).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,13 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 pub const DEFAULT_PROVIDER: &str = "omniroute";
-pub const DEFAULT_MODEL: &str = "auto";
+/// Default active model when the user has not pinned one in
+/// `config.toml` or `GOVINDA_MODEL`. The bare `auto` is **not** a
+/// served model id on the OmniRoute gateway (only `auto/coding`,
+/// `auto/smart`, `auto/chat`, etc. are); we default to the
+/// coding-optimized combo because the CLI is positioned for code /
+/// debug / agent work and `auto/coding` is always reachable.
+pub const DEFAULT_MODEL: &str = "auto/coding";
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant. Answer concisely.";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_RENDER_MARKDOWN: bool = true;
@@ -51,6 +57,9 @@ struct FileConfig {
     timeout_secs: Option<u64>,
     /// Response size cap in MB (1-64).
     limit_mb: Option<u64>,
+    /// Absolute path to git binary (security: prevents PATH manipulation attacks).
+    /// When unset, validates git resolves to a trusted system location.
+    git_binary_path: Option<PathBuf>,
     /// GOVINDA Protocol enforcement mechanism (v7.0 "No Shortcuts").
     /// When true, the master system prompt and per-turn header are
     /// injected, and the model is required to call `quality_gate_check`
@@ -86,6 +95,11 @@ pub struct Config {
     /// True when the provider came from env/TOML rather than defaults;
     /// gates the OpenCode auto-connect so explicit choices always win.
     pub provider_explicit: bool,
+    /// True when the model came from env/TOML rather than the
+    /// [`DEFAULT_MODEL`] default. Gates the smart `auto` model picker
+    /// (`auto_model::pick_best`) so a user-pinned model is never
+    /// silently overridden at startup.
+    pub model_explicit: bool,
     /// Validated user-defined shell tools from `[[tools]]` blocks.
     pub shell_tools: Vec<crate::tools::ShellToolDef>,
     /// Default theme name (applied by the caller at startup).
@@ -94,6 +108,8 @@ pub struct Config {
     pub timeout_secs: u64,
     /// Response size cap in MB, clamped 1-64.
     pub limit_mb: u64,
+    /// Validated git binary path (from config or trusted system location).
+    pub git_binary_path: Option<PathBuf>,
     /// GOVINDA Protocol settings — see `govinda_protocol::ProtocolConfig`.
     pub protocol: crate::govinda_protocol::ProtocolConfig,
 }
@@ -163,8 +179,9 @@ impl Config {
 
         let model = env_override("GOVINDA_MODEL")
             .or_else(|| env_override("MISTRAL_MODEL"))
-            .or(file.model)
-            .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+            .or(file.model);
+        let model_explicit = model.is_some();
+        let model = model.unwrap_or_else(|| DEFAULT_MODEL.to_owned());
 
         let temperature = match env_override("GOVINDA_TEMPERATURE")
             .or_else(|| env_override("MISTRAL_TEMPERATURE"))
@@ -234,10 +251,12 @@ impl Config {
             provider,
             source_path,
             provider_explicit,
+            model_explicit,
             shell_tools: file.tools,
             theme: file.theme,
             timeout_secs,
             limit_mb,
+            git_binary_path: file.git_binary_path,
             protocol,
         })
     }

@@ -1,0 +1,43 @@
+   Compiling govinda-cli v0.1.0 (C:\Users\saipr\Music\Rohith\RAGYU-CODE)
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:211:46
+    |
+211 |     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    |                                              ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:214:21
+    |
+214 |             XNonce::from_slice(&rng_bytes),
+    |                     ^^^^^^^^^^
+
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:238:46
+    |
+238 |     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    |                                              ^^^^^^^^^^
+
+warning: use of deprecated associated function `chacha20poly1305::aead::hybrid_array::Array::<T, U>::from_slice`: use `TryFrom` instead
+   --> src\checkpoint.rs:241:21
+    |
+241 |             XNonce::from_slice(nonce),
+    |                     ^^^^^^^^^^
+
+warning: function `show_tools` is never used
+   --> src\commands\display.rs:102:15
+    |
+102 | pub(super) fn show_tools(arg: &str, app: &mut App) {
+    |               ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `show_config` is never used
+   --> src\commands\display.rs:296:15
+    |
+296 | pub(super) fn show_config(app: &App) {
+    |               ^^^^^^^^^^^
+
+warning: `govinda-cli` (lib) generated 6 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.64s

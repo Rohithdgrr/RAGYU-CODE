@@ -204,11 +204,23 @@ async fn handle_conn(mut stream: TcpStream, root: PathBuf, token: String, addr: 
                 "text/plain".to_owned(),
             ),
         },
-        None => (
-            "404 Not Found".to_owned(),
-            b"not found\n".to_vec(),
-            "text/plain".to_owned(),
-        ),
+        None => {
+            // BUG-007 fix: Return 403 Forbidden for path traversal attempts instead of 404
+            // to distinguish security violations from missing files and enable security logging
+            if let Ok(cwd) = std::env::current_dir() {
+                crate::audit::record(
+                    &cwd,
+                    crate::audit::AuditKind::Preview,
+                    false,
+                    &format!("path_traversal_rejected: {url_path}"),
+                );
+            }
+            (
+                "403 Forbidden".to_owned(),
+                b"403 Forbidden: path outside workspace\n".to_vec(),
+                "text/plain".to_owned(),
+            )
+        },
     };
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

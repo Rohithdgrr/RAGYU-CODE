@@ -3197,12 +3197,118 @@ fn apply_edits_atomic(base: &Path, ops: &[EditOp]) -> Result<String> {
     crate::commands::apply_pending(base, &app)
 }
 
+/// Parses a command string into an argv array, handling quotes and escapes.
+/// 
+/// This function splits a command string into program and arguments without
+/// using shell interpretation, preventing shell injection attacks.
+/// 
+/// Security: Rejects unquoted shell metacharacters that could enable injection.
+/// 
+/// # Examples
+/// 
+/// ```ignore
+/// parse_command_to_argv("cargo test") => Ok(["cargo", "test"])
+/// parse_command_to_argv(r#"echo "hello world""#) => Ok(["echo", "hello world"])
+/// parse_command_to_argv("echo test; rm -rf /") => Err (contains unquoted ';')
+/// ```
+fn parse_command_to_argv(command: &str) -> Result<Vec<String>> {
+    let mut argv = Vec::new();
+    let mut current_arg = String::new();
+    let mut chars = command.chars().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    
+    // Shell metacharacters that are dangerous if unquoted
+    const DANGEROUS_METACHARACTERS: &[char] = &[
+        ';', '|', '&', '$', '`', '<', '>', '\n', '\r',
+        '(', ')', '{', '}', '[', ']', '*', '?', '~', '!',
+    ];
+    
+    while let Some(ch) = chars.next() {
+        match ch {
+            // Handle escapes
+            '\\' if !in_single_quote => {
+                if let Some(next) = chars.next() {
+                    // In double quotes or unquoted, only escape special chars
+                    if in_double_quote {
+                        match next {
+                            '"' | '\\' | '$' | '`' => current_arg.push(next),
+                            _ => {
+                                current_arg.push('\\');
+                                current_arg.push(next);
+                            }
+                        }
+                    } else {
+                        // Unquoted: escape any character
+                        current_arg.push(next);
+                    }
+                } else {
+                    bail!("trailing backslash in command");
+                }
+            }
+            
+            // Single quotes: literal until closing quote
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+            }
+            
+            // Double quotes: allow escapes until closing quote
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+            }
+            
+            // Whitespace: argument separator when not quoted
+            ' ' | '\t' if !in_single_quote && !in_double_quote => {
+                if !current_arg.is_empty() {
+                    argv.push(current_arg.clone());
+                    current_arg.clear();
+                }
+            }
+            
+            // Regular character
+            _ => {
+                // Check for dangerous metacharacters when not quoted
+                if !in_single_quote && !in_double_quote && DANGEROUS_METACHARACTERS.contains(&ch) {
+                    bail!(
+                        "command contains unquoted shell metacharacter '{}' which could enable injection attacks; \
+                        quote arguments or use a safer approach",
+                        ch
+                    );
+                }
+                current_arg.push(ch);
+            }
+        }
+    }
+    
+    // Check for unclosed quotes
+    if in_single_quote {
+        bail!("unclosed single quote in command");
+    }
+    if in_double_quote {
+        bail!("unclosed double quote in command");
+    }
+    
+    // Add final argument if present
+    if !current_arg.is_empty() {
+        argv.push(current_arg);
+    }
+    
+    if argv.is_empty() {
+        bail!("command is empty after parsing");
+    }
+    
+    Ok(argv)
+}
+
 /// `run_shell`: an arbitrary shell command in the project directory.
 ///
 /// Requires user confirmation via `ToolExecutor::requires_confirmation`.
 /// Under `--build` (`GatePolicy::AutoRun`) the confirmation is auto-approved
 /// but the command is still audit-logged to `.govinda/shell_audit.log` so
 /// every shell execution leaves a trace.
+///
+/// Security: Commands are parsed into argv and executed directly without
+/// shell interpretation to prevent shell injection attacks.
 async fn run_shell_command(args: RunShellArgs) -> Result<String> {
     let command = args.command.trim();
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
@@ -3211,17 +3317,33 @@ async fn run_shell_command(args: RunShellArgs) -> Result<String> {
         "command too long (cap {MAX_ARG_VALUE_CHARS} chars)"
     );
     anyhow::ensure!(!command.contains('\0'), "command contains NUL bytes");
+    
     // Audit every shell invocation, including --build auto-approve.
     audit_shell(command);
+    
+    // Parse command into argv to prevent shell injection
+    let argv = parse_command_to_argv(command)
+        .context("failed to parse command safely")?;
+    
+    anyhow::ensure!(!argv.is_empty(), "parsed command is empty");
+    
+    let program = &argv[0];
+    let args_slice = &argv[1..];
+    
+    // Validate that the program exists (basic check)
+    // Note: which::which checks PATH on Unix/Windows appropriately
+    if which::which(program).is_err() && !PathBuf::from(program).exists() {
+        bail!("program '{}' not found in PATH or as executable file", program);
+    }
+    
     let timeout = args
         .timeout_secs
         .unwrap_or(DEFAULT_RUN_SHELL_TIMEOUT_SECS)
         .clamp(1, MAX_SHELL_TIMEOUT_SECS);
-    if cfg!(windows) {
-        exec_argv("cmd", &["/C".to_owned(), command.to_owned()], timeout).await
-    } else {
-        exec_argv("sh", &["-c".to_owned(), command.to_owned()], timeout).await
-    }
+    
+    // Execute directly without shell intermediary
+    let args_vec: Vec<String> = args_slice.iter().map(|s| s.to_owned()).collect();
+    exec_argv(program, &args_vec, timeout).await
 }
 
 /// Builds the argv for the workspace's test runner.
@@ -4913,5 +5035,152 @@ mod tests {
             "list_files should handle deep paths: {result:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -- shell injection prevention tests ----------------------------------
+
+    #[test]
+    fn parse_command_to_argv_handles_simple_commands() {
+        let argv = parse_command_to_argv("cargo test").unwrap();
+        assert_eq!(argv, vec!["cargo", "test"]);
+
+        let argv = parse_command_to_argv("echo hello world").unwrap();
+        assert_eq!(argv, vec!["echo", "hello", "world"]);
+
+        let argv = parse_command_to_argv("cargo build --release").unwrap();
+        assert_eq!(argv, vec!["cargo", "build", "--release"]);
+    }
+
+    #[test]
+    fn parse_command_to_argv_handles_quoted_strings() {
+        let argv = parse_command_to_argv(r#"echo "hello world""#).unwrap();
+        assert_eq!(argv, vec!["echo", "hello world"]);
+
+        let argv = parse_command_to_argv(r#"echo 'single quotes'"#).unwrap();
+        assert_eq!(argv, vec!["echo", "single quotes"]);
+
+        let argv = parse_command_to_argv(r#"cmd "arg with spaces" another"#).unwrap();
+        assert_eq!(argv, vec!["cmd", "arg with spaces", "another"]);
+    }
+
+    #[test]
+    fn parse_command_to_argv_handles_escapes() {
+        let argv = parse_command_to_argv(r#"echo \"escaped\""#).unwrap();
+        assert_eq!(argv, vec!["echo", r#""escaped""#]);
+
+        let argv = parse_command_to_argv(r#"echo \\backslash"#).unwrap();
+        assert_eq!(argv, vec!["echo", r#"\backslash"#]);
+    }
+
+    #[test]
+    fn parse_command_to_argv_rejects_dangerous_metacharacters() {
+        // Semicolon - command chaining
+        let err = parse_command_to_argv("echo hello; rm -rf /").unwrap_err();
+        assert!(err.to_string().contains("';'"), "{err}");
+        assert!(err.to_string().contains("metacharacter"), "{err}");
+
+        // Pipe - command chaining
+        let err = parse_command_to_argv("ls | grep test").unwrap_err();
+        assert!(err.to_string().contains("'|'"), "{err}");
+
+        // Command substitution - dollar sign
+        let err = parse_command_to_argv("ls $(whoami)").unwrap_err();
+        assert!(err.to_string().contains("'$'"), "{err}");
+
+        // Backticks - command substitution
+        let err = parse_command_to_argv("echo `whoami`").unwrap_err();
+        assert!(err.to_string().contains("'`'"), "{err}");
+
+        // Background execution
+        let err = parse_command_to_argv("sleep 10 &").unwrap_err();
+        assert!(err.to_string().contains("'&'"), "{err}");
+
+        // Redirection
+        let err = parse_command_to_argv("cat file > output").unwrap_err();
+        assert!(err.to_string().contains("'>'"), "{err}");
+    }
+
+    #[test]
+    fn parse_command_to_argv_allows_quoted_metacharacters() {
+        // Metacharacters inside quotes should be safe
+        let argv = parse_command_to_argv(r#"echo "hello; world""#).unwrap();
+        assert_eq!(argv, vec!["echo", "hello; world"]);
+
+        let argv = parse_command_to_argv(r#"echo 'pipe | test'"#).unwrap();
+        assert_eq!(argv, vec!["echo", "pipe | test"]);
+
+        let argv = parse_command_to_argv(r#"echo "$HOME is safe in quotes""#).unwrap();
+        assert_eq!(argv, vec!["echo", "$HOME is safe in quotes"]);
+    }
+
+    #[test]
+    fn parse_command_to_argv_rejects_unclosed_quotes() {
+        let err = parse_command_to_argv(r#"echo "unclosed"#).unwrap_err();
+        assert!(err.to_string().contains("unclosed"), "{err}");
+
+        let err = parse_command_to_argv(r#"echo 'unclosed"#).unwrap_err();
+        assert!(err.to_string().contains("unclosed"), "{err}");
+    }
+
+    #[test]
+    fn parse_command_to_argv_handles_multiple_spaces() {
+        let argv = parse_command_to_argv("echo    hello     world").unwrap();
+        assert_eq!(argv, vec!["echo", "hello", "world"]);
+    }
+
+    #[test]
+    fn parse_command_to_argv_rejects_empty() {
+        let err = parse_command_to_argv("   ").unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_rejects_shell_injection_attempts() {
+        // Commands with unquoted metacharacters should be rejected
+        let args = RunShellArgs {
+            command: "echo test; whoami".into(),
+            timeout_secs: Some(5),
+        };
+        let err = run_shell_command(args).await.unwrap_err();
+        assert!(err.to_string().contains("metacharacter") || err.to_string().contains("';'"), "{err}");
+
+        let args = RunShellArgs {
+            command: "ls $(pwd)".into(),
+            timeout_secs: Some(5),
+        };
+        let err = run_shell_command(args).await.unwrap_err();
+        assert!(err.to_string().contains("metacharacter") || err.to_string().contains("'$'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_allows_safe_commands() {
+        // Simple commands without metacharacters should work
+        let args = RunShellArgs {
+            command: "echo hello-safe-command".into(),
+            timeout_secs: Some(10),
+        };
+        let out = run_shell_command(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["exit_code"], 0, "command failed: {parsed:?}");
+        let stdout = parsed["stdout"].as_str().unwrap();
+        assert!(stdout.contains("hello-safe-command"), "output: {stdout}");
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_allows_quoted_arguments() {
+        // Arguments with spaces should work when properly quoted
+        if cfg!(windows) {
+            // Windows echo doesn't preserve quotes the same way
+            return;
+        }
+        let args = RunShellArgs {
+            command: r#"echo "hello world with spaces""#.into(),
+            timeout_secs: Some(10),
+        };
+        let out = run_shell_command(args).await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["exit_code"], 0, "command failed: {parsed:?}");
+        let stdout = parsed["stdout"].as_str().unwrap();
+        assert!(stdout.contains("hello world with spaces"), "output: {stdout}");
     }
 }

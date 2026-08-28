@@ -201,15 +201,70 @@ async fn main() -> Result<()> {
         let _ = govinda_cli::tui::theme::set_by_name(theme);
     }
 
+    // Smart "auto" model selection. When the user has not pinned a
+    // specific model in `config.toml` or `GOVINDA_MODEL`, walk the
+    // live preference list (`auto_model`) and pick the first model
+    // that actually answers the gateway. The list is ordered by
+    // capability (best first: Claude Opus 4.8, Sonnet 5, GPT-5.6,
+    // Gemini 3.1 Pro, GLM 5.2, Kimi K2.7, DeepSeek V4, …, with the
+    // gateway's `auto/*` smart-routing combos as last-resort
+    // fallbacks). A user-pinned model is never overridden.
+    let mut auto_chain: Vec<String> = Vec::new();
+    if !config.model_explicit && config.provider.key().as_ref() == "omniroute" {
+        let pick = govinda_cli::auto_model::pick_best(&http, config.provider.as_ref()).await;
+        auto_chain = pick.chain.clone();
+        if !pick.model.is_empty() {
+            println!(
+                "{}",
+                paint(
+                    format!(
+                        "preflight: chose {} ({} ms, {}/{} tried)",
+                        pick.model, pick.latency_ms, pick.tried + 1, pick.total
+                    ),
+                    govinda_cli::render::dim_color()
+                )
+            );
+            config.model = pick.model;
+        } else if !auto_chain.is_empty() {
+            println!(
+                "{}",
+                paint(
+                    format!(
+                        "preflight: every auto candidate failed ({} tried) — falling back to {}",
+                        pick.total, config.model
+                    ),
+                    govinda_cli::render::dim_color()
+                )
+            );
+        } else {
+            println!(
+                "{}",
+                paint(
+                    "preflight: gateway /v1/models unreachable; using configured model".to_owned(),
+                    govinda_cli::render::dim_color()
+                )
+            );
+        }
+    }
+
     // Pre-flight: probe the active model once so we surface a clean
     // error (wrong id, auth, network) before the user invests in a
     // long prompt. Only the active model is probed; fallbacks are
     // tested lazily by the router's 3-strike logic.
+    // If the active probe warns (empty body) or errors, try the next
+    // live candidates before giving up — this prevents the "explain
+    // code base → (empty response)" flow where `auto/chat` was elected
+    // via a 200-empty shim.
     {
         let probe =
             govinda_cli::preflight::probe_active(&http, config.provider.as_ref(), &config.model)
                 .await;
-        match probe.status {
+        let needs_fallback = matches!(
+            probe.status,
+            govinda_cli::preflight::ProbeStatus::Warn(_)
+                | govinda_cli::preflight::ProbeStatus::Err(_)
+        );
+        match &probe.status {
             govinda_cli::preflight::ProbeStatus::Ok => println!(
                 "{}",
                 paint(
@@ -237,6 +292,49 @@ async fn main() -> Result<()> {
                     govinda_cli::render::dim_color()
                 )
             ),
+        }
+        if needs_fallback && !auto_chain.is_empty() {
+            // Find position of the active model in the seeded chain and try
+            // subsequent entries in order.
+            if let Some(pos) = auto_chain.iter().position(|m| m == &probe.model) {
+                let mut switched = None;
+                for candidate in auto_chain.iter().skip(pos + 1) {
+                    let p = govinda_cli::preflight::probe_active(
+                        &http,
+                        config.provider.as_ref(),
+                        candidate,
+                    )
+                    .await;
+                    if matches!(p.status, govinda_cli::preflight::ProbeStatus::Ok) {
+                        switched = Some((candidate.clone(), p.latency_ms));
+                        break;
+                    }
+                }
+                if let Some((next, latency)) = switched {
+                    println!(
+                        "{}",
+                        paint(
+                            format!(
+                                "preflight: auto-fallback to {} ({} ms) after {} issue",
+                                next, latency, probe.model
+                            ),
+                            govinda_cli::render::dim_color()
+                        )
+                    );
+                    config.model = next;
+                } else {
+                    eprintln!(
+                        "{}",
+                        paint(
+                            format!(
+                                "preflight: no live fallback found after {} — try /models and /model <id>",
+                                probe.model
+                            ),
+                            govinda_cli::render::dim_color()
+                        )
+                    );
+                }
+            }
         }
     }
 
@@ -292,6 +390,23 @@ async fn main() -> Result<()> {
         app.session_name = Some(name.clone());
     }
     commands::specialize_system(&mut app);
+
+    // Seed the router's fallback chain with the live preference
+    // list so the 3-strike failover walks the same models we just
+    // probed. Quarantines and health counters are preserved; the
+    // active model is kept at index 0 and deduped from the rest.
+    if !auto_chain.is_empty() {
+        let active = app.config.model.clone();
+        let chain_for_seed = std::iter::once(active).chain(auto_chain.into_iter());
+        app.router.seed_entries(
+            chain_for_seed,
+            |m| govinda_cli::auto_model::role_for(m),
+            |m| govinda_cli::provider::context_window_for(
+                app.config.provider.key().as_ref(),
+                m,
+            ),
+        );
+    }
 
     // One-prompt build pipeline: plan phases, confirm once, execute
     // autonomously, verify, report. Non-TUI by definition.

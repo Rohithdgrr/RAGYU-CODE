@@ -10,6 +10,7 @@ pub mod agent_loop;
 pub mod api;
 pub mod audit;
 pub mod auto_compact;
+pub mod auto_model;
 pub mod checkpoint;
 pub mod clock;
 pub mod commands;

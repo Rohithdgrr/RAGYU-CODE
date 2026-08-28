@@ -74,9 +74,19 @@ impl Router {
             context_window: active_window,
         });
         if provider == "omniroute" {
-            // Combo order for failover: smart, coding, fast, cheap, offline.
-            // Skip the active model if it is itself a combo.
-            const COMBO_ORDER: &[&str] = &["/smart", "/coding", "/fast", "/cheap", "/offline"];
+            // Combo order for failover: smart, coding, chat, fast, cheap, offline.
+            // Skip the active model if it is itself a combo. The ids
+            // must match what the gateway actually serves (e.g.
+            // "auto/coding", not "/coding") so a failover lands on a
+            // real model instead of a 429.
+            const COMBO_ORDER: &[&str] = &[
+                "auto/smart",
+                "auto/coding",
+                "auto/chat",
+                "auto/fast",
+                "auto/cheap",
+                "auto/offline",
+            ];
             for id in COMBO_ORDER {
                 if *id == model {
                     continue;
@@ -199,6 +209,56 @@ impl Router {
         *self = new;
     }
 
+    /// Replaces the fallback list with `chain` while preserving the
+    /// active model, all health counters, all quarantines, and the
+    /// `failover_enabled` flag. The active model is kept at index 0;
+    /// the chain (which already contains the active id in most cases)
+    /// is de-duplicated and the active id is removed from any other
+    /// position so it can't be promoted to itself. Existing health
+    /// entries for models that are no longer in the chain are kept
+    /// in `health` (harmless) but quarantines are dropped for models
+    /// the chain no longer references so a stale quarantine cannot
+    /// permanently hide a fresh candidate.
+    ///
+    /// `role_for` lets the caller attach a `RouterRole` to each model
+    /// id. `context_window_for` resolves the input-token limit; pass
+    /// 0 to leave the default 0 (the router does not require a
+    /// non-zero window for failover).
+    pub fn seed_entries(
+        &mut self,
+        chain: impl IntoIterator<Item = String>,
+        role_for: impl Fn(&str) -> crate::provider::RouterRole,
+        context_window_for: impl Fn(&str) -> usize,
+    ) {
+        let active = self.active_model().to_owned();
+        let mut seen = std::collections::HashSet::new();
+        let mut entries: Vec<RouterEntry> = Vec::new();
+        // Active first, with the role the caller assigns to it.
+        seen.insert(active.clone());
+        entries.push(RouterEntry {
+            model: active.clone(),
+            role: role_for(&active),
+            context_window: context_window_for(&active),
+        });
+        for m in chain {
+            if seen.insert(m.clone()) {
+                entries.push(RouterEntry {
+                    role: role_for(&m),
+                    context_window: context_window_for(&m),
+                    model: m,
+                });
+            }
+        }
+        // Drop quarantines for models that are no longer in the
+        // chain so we don't permanently lock out a candidate that
+        // just got re-introduced.
+        let keep: std::collections::HashSet<String> =
+            entries.iter().map(|e| e.model.clone()).collect();
+        self.quarantined.retain(|m| keep.contains(m));
+        self.entries = entries;
+        self.active_idx = 0;
+    }
+
     /// Promotes to the next non-quarantined entry. Returns `None` if
     /// every entry is quarantined or `failover_enabled` is `false`.
     /// The caller is expected to call this only once per turn.
@@ -255,10 +315,10 @@ mod tests {
             r.record_failure("auto", FailureKind::Server, msg);
         }
         assert!(r.is_quarantined("auto"));
-        // Promote should land on the first non-quarantined entry: /smart.
+        // Promote should land on the first non-quarantined entry: auto/smart.
         let next = r.promote().expect("promote succeeds");
-        assert_eq!(next.model, "/smart");
-        assert_eq!(r.active().model, "/smart");
+        assert_eq!(next.model, "auto/smart");
+        assert_eq!(r.active().model, "auto/smart");
     }
 
     #[test]
@@ -295,21 +355,21 @@ mod tests {
     #[test]
     fn next_summarizer_prefers_fast_then_cheap_then_active() {
         let r = fixture();
-        // No quarantines yet: first Fast wins. /fast is at index 3
-        // in the fixture (active=auto, /smart, /coding, /fast, …).
-        assert_eq!(r.next_summarizer().model, "/fast");
+        // No quarantines yet: first Fast wins. auto/fast is at index 3
+        // in the fixture (active=auto, auto/smart, auto/coding, auto/fast, …).
+        assert_eq!(r.next_summarizer().model, "auto/fast");
         let mut r = fixture();
-        // Quarantine /fast, /coding, /smart: Cheap wins.
-        r.record_failure("/fast", FailureKind::Server, "x");
-        r.record_failure("/fast", FailureKind::Server, "x");
-        r.record_failure("/fast", FailureKind::Server, "x");
-        r.record_failure("/coding", FailureKind::Server, "x");
-        r.record_failure("/coding", FailureKind::Server, "x");
-        r.record_failure("/coding", FailureKind::Server, "x");
-        r.record_failure("/smart", FailureKind::Server, "x");
-        r.record_failure("/smart", FailureKind::Server, "x");
-        r.record_failure("/smart", FailureKind::Server, "x");
-        assert_eq!(r.next_summarizer().model, "/cheap");
+        // Quarantine auto/fast, auto/coding, auto/smart: Cheap wins.
+        r.record_failure("auto/fast", FailureKind::Server, "x");
+        r.record_failure("auto/fast", FailureKind::Server, "x");
+        r.record_failure("auto/fast", FailureKind::Server, "x");
+        r.record_failure("auto/coding", FailureKind::Server, "x");
+        r.record_failure("auto/coding", FailureKind::Server, "x");
+        r.record_failure("auto/coding", FailureKind::Server, "x");
+        r.record_failure("auto/smart", FailureKind::Server, "x");
+        r.record_failure("auto/smart", FailureKind::Server, "x");
+        r.record_failure("auto/smart", FailureKind::Server, "x");
+        assert_eq!(r.next_summarizer().model, "auto/cheap");
     }
 
     #[test]

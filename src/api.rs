@@ -193,6 +193,11 @@ pub struct SseParser {
     /// Partial tool calls, indexed by the `index` field of streamed
     /// `delta.tool_calls` fragments; id/name arrive once, arguments append.
     pending_tools: Vec<Option<PartialToolCall>>,
+    /// Whether we've received at least one real content delta or tool-call
+    /// fragment. Used to distinguish OmniRoute keepalive chunks (empty delta
+    /// + finish_reason: null) from genuine stream termination. Keepalives
+    /// must NOT emit `Done` because the real response hasn't arrived yet.
+    has_content: bool,
 }
 
 /// Hard cap on simultaneous tool-call slots. A hostile or broken server can
@@ -271,9 +276,11 @@ impl SseParser {
             if let Some(text) = delta.get("content").and_then(Value::as_str)
                 && !text.is_empty()
             {
+                self.has_content = true;
                 events.push(SseEvent::Delta(text.to_owned()));
             }
             if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
+                self.has_content = true;
                 for frag in fragments {
                     match self.apply_tool_fragment(frag) {
                         Ok(()) => {}
@@ -283,11 +290,13 @@ impl SseParser {
             }
         }
         if choice.get("finish_reason").is_some_and(|v| v.is_null()) {
-            // Explicit `finish_reason: null` — some providers send null at
-            // termination instead of "stop". Standard OpenAI streams use null
-            // for intermediate chunks that carry deltas, so we must not emit
-            // Done when the chunk also carries content/tool fragments; only
-            // an empty delta with explicit null signals completion.
+            // `finish_reason: null` means "stream not finished" per the
+            // OpenAI SSE spec. However, some providers (notably OmniRoute)
+            // use it for keepalive chunks with an empty delta while the
+            // upstream is still generating. We only emit `Done` when we've
+            // already received real content and the delta is empty — that
+            // signals genuine termination. A keepalive before any content
+            // arrives must be silently skipped.
             let has_delta = choice
                 .get("delta")
                 .and_then(|d| d.get("content"))
@@ -297,12 +306,17 @@ impl SseParser {
                     .get("delta")
                     .and_then(|d| d.get("tool_calls"))
                     .is_some();
-            if !has_delta {
+            if has_delta {
+                self.has_content = true;
+            } else if self.has_content {
+                // We already got content and now see an empty chunk with
+                // finish_reason: null — treat as stream end.
                 if let Some(calls) = self.take_tool_calls() {
                     events.push(calls);
                 }
                 events.push(SseEvent::Done);
             }
+            // else: keepalive or pre-content null — skip silently.
         } else if let Some(reason) = choice["finish_reason"].as_str() {
             match reason {
                 "tool_calls" => {
@@ -599,6 +613,17 @@ async fn attempt_once(
                 if let Some(SseEvent::ToolCalls(calls)) = parser.take_tool_calls() {
                     sink.tool_calls.extend(calls);
                 }
+                // Guard against quota-shimmed 200s that carry empty choices.
+                // An empty close without deltas/tool-calls is not a success — it
+                // is the "empty response" seen as `"(empty response)"` in the TUI.
+                // Mark as Fatal (not Retryable) so the agent loop's failover
+                // immediately promotes to the next healthy model instead of
+                // wasting retries on the same broken one.
+                if !sink.has_output() {
+                    return Ok(Attempt::Fatal(anyhow::anyhow!(
+                        "empty response from model [{req_id}] — gateway returned 200 with no content or tool calls (model may be quota-exhausted or mis-routed; try /model to switch)"
+                    )));
+                }
                 return Ok(Attempt::Ok);
             }
         };
@@ -616,7 +641,14 @@ async fn attempt_once(
                     on_delta(&text);
                 }
                 SseEvent::ToolCalls(calls) => sink.tool_calls.extend(calls),
-                SseEvent::Done => return Ok(Attempt::Ok),
+                SseEvent::Done => {
+                    if !sink.has_output() {
+                        return Ok(Attempt::Fatal(anyhow::anyhow!(
+                            "empty response from model [{req_id}] — stream finished with no content or tool calls (gateway returned 200 with empty delta; try /model to switch)"
+                        )));
+                    }
+                    return Ok(Attempt::Ok);
+                }
                 SseEvent::ApiError(msg) => {
                     return Ok(Attempt::Fatal(anyhow::anyhow!("API error: {msg}")));
                 }
@@ -636,8 +668,14 @@ async fn attempt_once(
                         )));
                     }
                     other => {
-                        // Unknown finish reason — log and treat as completion.
+                        // Unknown finish reason — log and treat as completion
+                        // unless we have no output, in which case it is an empty shim.
                         eprintln!("warning: unknown finish_reason '{other}' — treating as done");
+                        if !sink.has_output() {
+                            return Ok(Attempt::Fatal(anyhow::anyhow!(
+                                "empty response from model [{req_id}] — finish_reason '{other}' with no content"
+                            )));
+                        }
                         return Ok(Attempt::Ok);
                     }
                 },

@@ -195,6 +195,7 @@ pub async fn run_turn(
     };
     app.session.push_user(input_ref);
     app.last_turn_had_failure = false;
+    app.opencode_fallback_attempted = false;
 
     // Protocol-driven round caps: when enforcement is on, allow the model
     // enough rounds to actually reach the 10k-line target the master
@@ -252,8 +253,18 @@ pub async fn run_turn(
     // explicit `TurnState` so the current phase is inspectable.
     let mut turn_state = TurnState::Streaming;
 
+    // Most recent chat error from a streamed round. When the round
+    // eventually returns `Ok(())` with an empty body (e.g. the model
+    // returned zero deltas, or every retry returned 200 with an empty
+    // `choices[0]`) the user used to see only the generic
+    // "(empty response)" placeholder. We now surface the last error
+    // so the real reason is not hidden.
+    let mut last_round_error: Option<String> = None;
     loop {
-        round_no += 1;
+        // Round counter is bumped below, only when the model actually
+        // produced output (non-empty response or tool calls). Failover
+        // retries and self-correction continues do NOT count as rounds
+        // because the model never produced a usable turn in those cases.
         if round_no > max_rounds + fixes_granted {
             turn_state = TurnState::RoundLimited;
             ui.notice(&format!(
@@ -323,6 +334,7 @@ pub async fn run_turn(
 
         match result {
             Ok(()) if !tool_calls.is_empty() && app.tools_enabled => {
+                round_no += 1;
                 turn_state = TurnState::ExecutingTools;
                 show_prose(ui, &out);
                 // GOVINDA protocol: track the current phase from the
@@ -348,6 +360,83 @@ pub async fn run_turn(
                 continue; // stream again so the model sees the results
             }
             Ok(()) => {
+                // Defense-in-depth: api.rs now treats empty 200s as
+                // Retryable errors, but older gateways or future code paths
+                // may still surface Ok(()) with empty content. Treat it as a
+                // retryable Empty failure rather than a silent success so the
+                // user never sees bare "(empty response)" without diagnostics.
+                if out.trim().is_empty() {
+                    let empty_err = anyhow::anyhow!(
+                        "empty response from model — gateway returned no content or tool calls (model may be quota-exhausted or mis-routed)"
+                    );
+                    let msg = format!("{empty_err:#}");
+                    last_round_error = Some(msg.clone());
+                    app.record_error();
+                    let active = app.config.model.clone();
+                    app.router.record_failure(
+                        &active,
+                        crate::router::FailureKind::Empty,
+                        &msg,
+                    );
+                    crate::router_health::append(&crate::router_health::HealthEntry {
+                        ts: chrono::Utc::now().to_rfc3339(),
+                        model: active.clone(),
+                        latency_ms: started.elapsed().as_millis() as u32,
+                        success: false,
+                        error: Some(msg.clone()),
+                    });
+                    if failover_attempts < 5 {
+                        let next_model = {
+                            let r = &mut app.router;
+                            r.promote().map(|e| e.model.clone())
+                        };
+                        if let Some(next) = next_model {
+                            failover_attempts += 1;
+                            let active_clone = active.clone();
+                            app.config.model = next.clone();
+                            ui.notice(&format!(
+                                "router: failover to {} after empty response on {} ({}/5 attempts)",
+                                next, active_clone, failover_attempts
+                            ));
+                            app.session
+                                .truncate_messages(resume_len.min(app.session.messages().len()));
+                            turn_state = TurnState::Streaming;
+                            continue;
+                        }
+                    }
+                    // No failover available — try OpenCode as last resort.
+                    if let Some(next) = try_opencode_fallback(app, &app.http.clone()).await {
+                        failover_attempts += 1;
+                        let active_clone = active.clone();
+                        app.config.model = next.clone();
+                        ui.notice(&format!(
+                            "router: failover to opencode:{} after empty response on {} ({} failovers tried)",
+                            next, active_clone, failover_attempts
+                        ));
+                        app.session
+                            .truncate_messages(resume_len.min(app.session.messages().len()));
+                        turn_state = TurnState::Streaming;
+                        continue;
+                    }
+                    // No failover available — surface the empty with diagnostics.
+                    finish_answer(app, ui, out, last_round_error.as_deref());
+                    // Emit a structured error card with suggestion so TUI/CLI
+                    // users see an actionable fix instead of a silent notice.
+                    ui.error(&format!(
+                        "empty response from {} — all fallback models exhausted ({} failovers tried)\nModel: {} · Provider: {}\nSuggestion: run /models to list live models, then /model <id> to switch (e.g. /model auto/smart or /model auto/coding)",
+                        active,
+                        failover_attempts,
+                        active,
+                        app.config.provider.key()
+                    ));
+                    ui.timeline(app.config.model.as_str(), started.elapsed());
+                    // Do NOT record success for empty — count as RoundLimit so
+                    // callers can retry and metrics stay honest.
+                    if turn_state != TurnState::Cancelled {
+                        turn_state = TurnState::RoundLimited;
+                    }
+                    return Ok(TurnResult::RoundLimit);
+                }
                 // GOVINDA protocol: if the model claims completion without
                 // reaching FINAL_VALIDATION, push back and grant a fix
                 // round. This is the "self-correction pressure" the
@@ -391,8 +480,9 @@ pub async fn run_turn(
                         );
                     }
                 }
+                round_no += 1;
                 turn_state = TurnState::Completed;
-                finish_answer(app, ui, out);
+                finish_answer(app, ui, out, last_round_error.as_deref());
                 ui.timeline(app.config.model.as_str(), started.elapsed());
                 app.record_turn(started.elapsed());
                 {
@@ -444,16 +534,37 @@ pub async fn run_turn(
                 } else {
                     // Preserve previous state; will become RoundLimited if we bail.
                 }
+                last_round_error = Some(format!("{e:#}"));
                 app.record_error();
                 // Record the failure against the active model and
                 // try the next non-quarantined entry once before
                 // giving up.
                 let active = app.config.model.clone();
-                app.router.record_failure(
-                    &active,
-                    crate::router::FailureKind::Server,
-                    &format!("{e:#}"),
-                );
+                let err_str = format!("{e:#}");
+                let lower = err_str.to_ascii_lowercase();
+                let kind = if lower.contains("empty response") {
+                    crate::router::FailureKind::Empty
+                } else if lower.contains("rate limit")
+                    || lower.contains("429")
+                    || lower.contains("too many requests")
+                {
+                    crate::router::FailureKind::RateLimit
+                } else if lower.contains("401")
+                    || lower.contains("unauthorized")
+                    || lower.contains("auth")
+                {
+                    crate::router::FailureKind::Auth
+                } else if lower.contains("timeout") {
+                    crate::router::FailureKind::Timeout
+                } else if lower.contains("404")
+                    || lower.contains("not found")
+                    || lower.contains("bad model")
+                {
+                    crate::router::FailureKind::BadModel
+                } else {
+                    crate::router::FailureKind::Server
+                };
+                app.router.record_failure(&active, kind, &err_str);
                 crate::router_health::append(&crate::router_health::HealthEntry {
                     ts: chrono::Utc::now().to_rfc3339(),
                     model: active.clone(),
@@ -461,7 +572,7 @@ pub async fn run_turn(
                     success: false,
                     error: Some(format!("{e:#}")),
                 });
-                if failover_attempts < 1 {
+                if failover_attempts < 5 {
                     let next_model = {
                         let r = &mut app.router;
                         r.promote().map(|e| e.model.clone())
@@ -471,8 +582,8 @@ pub async fn run_turn(
                         let active_clone = active.clone();
                         app.config.model = next.clone();
                         ui.notice(&format!(
-                            "router: failover to {} after strike on {}",
-                            next, active_clone
+                            "router: failover to {} after strike on {} ({}/5 attempts)",
+                            next, active_clone, failover_attempts
                         ));
                         // Roll back the partial assistant turn so the
                         // next request starts cleanly.
@@ -481,6 +592,20 @@ pub async fn run_turn(
                         turn_state = TurnState::Streaming;
                         continue;
                     }
+                }
+                // No more router entries — try OpenCode as last resort.
+                if let Some(next) = try_opencode_fallback(app, &app.http.clone()).await {
+                    failover_attempts += 1;
+                    let active_clone = active.clone();
+                    app.config.model = next.clone();
+                    ui.notice(&format!(
+                        "router: failover to opencode:{} after strike on {} ({} failovers tried)",
+                        next, active_clone, failover_attempts
+                    ));
+                    app.session
+                        .truncate_messages(resume_len.min(app.session.messages().len()));
+                    turn_state = TurnState::Streaming;
+                    continue;
                 }
                 let fail_fast = ui.fail_fast();
                 handle_round_error(app, ui, out, resume_len, e);
@@ -659,10 +784,21 @@ fn show_prose(ui: &dyn AgentUi, text: &str) {
     }
 }
 
-/// Commits a final text answer (empty answers render a placeholder).
-fn finish_answer(app: &mut App, ui: &dyn AgentUi, out: String) {
+/// Commits a final text answer. Empty answers render a placeholder
+/// and, when available, forward the most recent round error so the
+/// user sees the real reason (HTTP 429, transport failure, etc.)
+/// instead of a silent "(empty response)" that hides the cause.
+fn finish_answer(
+    app: &mut App,
+    ui: &dyn AgentUi,
+    out: String,
+    last_round_error: Option<&str>,
+) {
     if out.trim().is_empty() {
         ui.notice("(empty response)");
+        if let Some(reason) = last_round_error {
+            ui.error(&format!("empty response: {reason}"));
+        }
         return;
     }
     ui.answer(&out);
@@ -744,6 +880,68 @@ fn truncate_result(s: &str) -> String {
         let cut: String = s.chars().take(MAX_TOOL_RESULT_CHARS).collect();
         format!("{cut}\n…(truncated)")
     }
+}
+
+/// Attempts to connect to OpenCode as a last-resort fallback when all
+/// OmniRoute models have been exhausted. Probes for a running server
+/// (or discovers credentials from disk), then seeds the router with
+/// every connectable model. Returns the first available model name on
+/// success, `None` if OpenCode is unreachable or has no providers.
+///
+/// When the server is not running, this function tries to start it.
+/// When the CLI is not installed, this function tries to install it via npm.
+async fn try_opencode_fallback(
+    app: &mut App,
+    http: &reqwest::Client,
+) -> Option<String> {
+    // Only try once per turn to avoid repeated expensive probes.
+    if app.opencode_fallback_attempted {
+        return None;
+    }
+    app.opencode_fallback_attempted = true;
+
+    // Step 1: try the server, then local files.
+    let catalog = match crate::opencode::fetch_catalog(http).await {
+        Ok(c) if !c.is_empty() => c,
+        _ => {
+            // Server not reachable and no local files — try to start it.
+            if crate::opencode::try_start_server(http).await {
+                match crate::opencode::fetch_catalog(http).await {
+                    Ok(c) if !c.is_empty() => c,
+                    _ => return None,
+                }
+            } else {
+                // Server didn't come up — try installing the CLI.
+                if crate::opencode::ensure_installed().await {
+                    // Installed but server didn't start yet — give it one more shot.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    match crate::opencode::fetch_catalog(http).await {
+                        Ok(c) if !c.is_empty() => c,
+                        _ => return None,
+                    }
+                } else {
+                    return None;
+                }
+            }
+        }
+    };
+
+    // Step 2: pick the first provider with models and swap the active backend.
+    for entry in &catalog.entries {
+        let provider = std::sync::Arc::new(crate::opencode::OcProvider::new(
+            entry.pid.clone(),
+            entry.base_url.clone(),
+            entry.auth.clone(),
+        ));
+        if let Some(first_model) = entry.models.first() {
+            app.config.adopt_provider(provider);
+            app.config.model = first_model.clone();
+            app.router.sync_active(&app.config.provider.key(), &app.config.model);
+            return Some(first_model.clone());
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
