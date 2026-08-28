@@ -2052,8 +2052,8 @@ async fn event_loop(
                             move |_: &str| Some(k.clone())
                         })
                     {
-                        app.config.provider = p;
-                        app.config.model = model.clone();
+                        app.config.adopt_provider(p);
+                        app.config.set_model(model.clone());
                     }
                     tui.provider_workflow = Some(ProviderWorkflow::Result {
                         provider,

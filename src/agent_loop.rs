@@ -373,11 +373,8 @@ pub async fn run_turn(
                     last_round_error = Some(msg.clone());
                     app.record_error();
                     let active = app.config.model.clone();
-                    app.router.record_failure(
-                        &active,
-                        crate::router::FailureKind::Empty,
-                        &msg,
-                    );
+                    let kind = crate::router::FailureKind::Empty;
+                    app.router.record_failure(&active, kind, &msg);
                     crate::router_health::append(&crate::router_health::HealthEntry {
                         ts: chrono::Utc::now().to_rfc3339(),
                         model: active.clone(),
@@ -385,30 +382,83 @@ pub async fn run_turn(
                         success: false,
                         error: Some(msg.clone()),
                     });
-                    if failover_attempts < 5 {
-                        let next_model = {
-                            let r = &mut app.router;
-                            r.promote().map(|e| e.model.clone())
-                        };
-                        if let Some(next) = next_model {
-                            failover_attempts += 1;
+                    let should_promote = app.router.should_promote(&active, kind);
+                    if !should_promote {
+                        let strikes = app.router.health(&active).map(|h| h.strikes).unwrap_or(1) as u64;
+                        let wait = Duration::from_millis(700 * strikes);
+                        ui.notice(&format!(
+                            "router: empty response strike {}/{} on {} — backing off {:.1}s before retry",
+                            strikes,
+                            crate::router::STRIKES_TO_QUARANTINE,
+                            active,
+                            wait.as_secs_f32()
+                        ));
+                        tokio::time::sleep(wait).await;
+                        app.session
+                            .truncate_messages(resume_len.min(app.session.messages().len()));
+                        turn_state = TurnState::Streaming;
+                        continue;
+                    }
+                    let max_failovers = app.router.iter().count().saturating_sub(1).max(5) as u8;
+                    if failover_attempts < max_failovers {
+                        let http_clone = app.http.clone();
+                        let mut promoted: Option<String> = None;
+                        let mut attempts_probe = 0u8;
+                        let candidates = app.router.iter().count();
+                        for _ in 0..candidates {
+                            let candidate = {
+                                let r = &mut app.router;
+                                r.promote().map(|e| e.model.clone())
+                            };
+                            let Some(cand) = candidate else { break };
+                            attempts_probe += 1;
+                            let probe = crate::preflight::probe_active(
+                                &http_clone,
+                                app.config.provider.as_ref(),
+                                &cand,
+                            )
+                            .await;
+                            match probe.status {
+                                crate::preflight::ProbeStatus::Ok
+                                | crate::preflight::ProbeStatus::Warn(_) => {
+                                    promoted = Some(cand);
+                                    break;
+                                }
+                                crate::preflight::ProbeStatus::Err(ref reason) => {
+                                    ui.notice(&format!(
+                                        "router: candidate {cand} preflight failed ({reason}) — trying next"
+                                    ));
+                                    app.router.record_failure(
+                                        &cand,
+                                        crate::router::FailureKind::Server,
+                                        reason,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(next) = promoted {
+                            failover_attempts = failover_attempts.saturating_add(attempts_probe);
                             let active_clone = active.clone();
-                            app.config.model = next.clone();
+                            app.config.set_model(next.clone());
+                            app.router.sync_active(&app.config.provider.key().to_string(), &app.config.model);
                             ui.notice(&format!(
-                                "router: failover to {} after empty response on {} ({}/5 attempts)",
-                                next, active_clone, failover_attempts
+                                "router: failover to {} after empty response on {} ({}/{} attempts)",
+                                next, active_clone, failover_attempts, max_failovers
                             ));
                             app.session
                                 .truncate_messages(resume_len.min(app.session.messages().len()));
                             turn_state = TurnState::Streaming;
                             continue;
+                        } else if attempts_probe > 0 {
+                            failover_attempts = failover_attempts.saturating_add(attempts_probe);
                         }
                     }
                     // No failover available — try OpenCode as last resort.
                     if let Some(next) = try_opencode_fallback(app, &app.http.clone()).await {
                         failover_attempts += 1;
                         let active_clone = active.clone();
-                        app.config.model = next.clone();
+                        app.config.set_model(next.clone());
                         ui.notice(&format!(
                             "router: failover to opencode:{} after empty response on {} ({} failovers tried)",
                             next, active_clone, failover_attempts
@@ -544,6 +594,14 @@ pub async fn run_turn(
                 let lower = err_str.to_ascii_lowercase();
                 let kind = if lower.contains("empty response") {
                     crate::router::FailureKind::Empty
+                } else if lower.contains("structure_limit")
+                    || lower.contains("chat_admission_busy")
+                    || lower.contains("admission busy")
+                    || lower.contains("overloaded")
+                    || lower.contains("capacity")
+                    || lower.contains("busy")
+                {
+                    crate::router::FailureKind::Busy
                 } else if lower.contains("rate limit")
                     || lower.contains("429")
                     || lower.contains("too many requests")
@@ -572,18 +630,91 @@ pub async fn run_turn(
                     success: false,
                     error: Some(format!("{e:#}")),
                 });
-                if failover_attempts < 5 {
-                    let next_model = {
-                        let r = &mut app.router;
-                        r.promote().map(|e| e.model.clone())
+                // Three-strike gate: retry same model with backoff until
+                // strikes reach quarantine threshold, unless Auth/BadModel.
+                let should_promote = app.router.should_promote(&active, kind);
+                if !should_promote && kind.is_retryable_on_same_model() {
+                    // Backoff before retrying same model. Busy gets longer sleep.
+                    let strikes = app.router.health(&active).map(|h| h.strikes).unwrap_or(1) as u64;
+                    let base_ms = if kind == crate::router::FailureKind::Busy { 1500 } else { 600 };
+                    let wait = Duration::from_millis(base_ms * strikes);
+                    let msg = if kind == crate::router::FailureKind::Busy {
+                        format!(
+                            "router: {active} busy (strike {}/{}) — backing off {:.1}s before retry",
+                            strikes,
+                            crate::router::STRIKES_TO_QUARANTINE,
+                            wait.as_secs_f32()
+                        )
+                    } else {
+                        format!(
+                            "router: strike {}/{} on {} ({kind:?}) — backing off {:.1}s before retry",
+                            strikes,
+                            crate::router::STRIKES_TO_QUARANTINE,
+                            active,
+                            wait.as_secs_f32()
+                        )
                     };
-                    if let Some(next) = next_model {
-                        failover_attempts += 1;
+                    ui.notice(&msg);
+                    tokio::time::sleep(wait).await;
+                    app.session
+                        .truncate_messages(resume_len.min(app.session.messages().len()));
+                    turn_state = TurnState::Streaming;
+                    continue;
+                }
+                // Promote with preflight check: skip candidates that fail a probe.
+                let max_failovers = app.router.iter().count().saturating_sub(1).max(5) as u8;
+                if failover_attempts < max_failovers {
+                    let http_clone = app.http.clone();
+                    let mut promoted: Option<String> = None;
+                    let mut attempts_probe = 0u8;
+                    let candidates = app.router.iter().count();
+                    for _ in 0..candidates {
+                        let candidate = {
+                            let r = &mut app.router;
+                            r.promote().map(|e| e.model.clone())
+                        };
+                        let Some(cand) = candidate else { break };
+                        attempts_probe += 1;
+                        // Preflight probe the candidate before spending a full turn.
+                        let probe = crate::preflight::probe_active(
+                            &http_clone,
+                            app.config.provider.as_ref(),
+                            &cand,
+                        )
+                        .await;
+                        match probe.status {
+                            crate::preflight::ProbeStatus::Ok => {
+                                promoted = Some(cand);
+                                break;
+                            }
+                            crate::preflight::ProbeStatus::Warn(_) => {
+                                // Warn still usable — accept it.
+                                promoted = Some(cand);
+                                break;
+                            }
+                            crate::preflight::ProbeStatus::Err(ref reason) => {
+                                ui.notice(&format!(
+                                    "router: candidate {cand} preflight failed ({reason}) — trying next"
+                                ));
+                                // Record a soft strike so we don't loop forever on this candidate.
+                                app.router.record_failure(
+                                    &cand,
+                                    crate::router::FailureKind::Server,
+                                    reason,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(next) = promoted {
+                        // Account for any probed skips.
+                        failover_attempts = failover_attempts.saturating_add(attempts_probe);
                         let active_clone = active.clone();
-                        app.config.model = next.clone();
+                        app.config.set_model(next.clone());
+                        app.router.sync_active(&app.config.provider.key().to_string(), &app.config.model);
                         ui.notice(&format!(
-                            "router: failover to {} after strike on {} ({}/5 attempts)",
-                            next, active_clone, failover_attempts
+                            "router: failover to {} after {} strikes on {} ({}/{} attempts)",
+                            next, app.router.health(&active).map(|h| h.strikes).unwrap_or(0), active_clone, failover_attempts, max_failovers
                         ));
                         // Roll back the partial assistant turn so the
                         // next request starts cleanly.
@@ -591,13 +722,16 @@ pub async fn run_turn(
                             .truncate_messages(resume_len.min(app.session.messages().len()));
                         turn_state = TurnState::Streaming;
                         continue;
+                    } else if attempts_probe > 0 {
+                        // We exhausted candidates via preflight, count them.
+                        failover_attempts = failover_attempts.saturating_add(attempts_probe);
                     }
                 }
                 // No more router entries — try OpenCode as last resort.
                 if let Some(next) = try_opencode_fallback(app, &app.http.clone()).await {
                     failover_attempts += 1;
                     let active_clone = active.clone();
-                    app.config.model = next.clone();
+                    app.config.set_model(next.clone());
                     ui.notice(&format!(
                         "router: failover to opencode:{} after strike on {} ({} failovers tried)",
                         next, active_clone, failover_attempts
@@ -926,8 +1060,34 @@ async fn try_opencode_fallback(
         }
     };
 
-    // Step 2: pick the first provider with models and swap the active backend.
+    // Step 2: prefer OpenCode's own default (respects user's chosen provider/model
+    // and auth), otherwise pick the first entry with a usable credential and models.
+    if let Some((entry, model)) = catalog.pick_default() {
+        let is_local = entry.base_url.starts_with("http://127.0.0.1")
+            || entry.base_url.starts_with("http://localhost");
+        let has_auth = !matches!(entry.auth, crate::provider::Auth::None);
+        if (has_auth || is_local) && !model.is_empty() {
+            let provider = std::sync::Arc::new(crate::opencode::OcProvider::new(
+                entry.pid.clone(),
+                entry.base_url.clone(),
+                entry.auth.clone(),
+            ));
+            app.config.adopt_provider(provider);
+            app.config.set_model(model.to_owned());
+            app.router.sync_active(&app.config.provider.key().to_string(), &app.config.model);
+            return Some(model.to_owned());
+        }
+    }
     for entry in &catalog.entries {
+        // Skip unauthenticated cloud endpoints (would fail with missing key).
+        let is_local = entry.base_url.starts_with("http://127.0.0.1")
+            || entry.base_url.starts_with("http://localhost");
+        if matches!(entry.auth, crate::provider::Auth::None) && !is_local {
+            continue;
+        }
+        if entry.models.is_empty() {
+            continue;
+        }
         let provider = std::sync::Arc::new(crate::opencode::OcProvider::new(
             entry.pid.clone(),
             entry.base_url.clone(),
@@ -935,8 +1095,8 @@ async fn try_opencode_fallback(
         ));
         if let Some(first_model) = entry.models.first() {
             app.config.adopt_provider(provider);
-            app.config.model = first_model.clone();
-            app.router.sync_active(&app.config.provider.key(), &app.config.model);
+            app.config.set_model(first_model.clone());
+            app.router.sync_active(&app.config.provider.key().to_string(), &app.config.model);
             return Some(first_model.clone());
         }
     }

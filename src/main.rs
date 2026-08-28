@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
             Ok(Some((provider, model))) => {
                 let pid = provider.key().to_string();
                 config.adopt_provider(provider);
-                config.model = model;
+                config.set_model(model);
                 println!(
                     "{}",
                     paint(
@@ -224,7 +224,7 @@ async fn main() -> Result<()> {
                     govinda_cli::render::dim_color()
                 )
             );
-            config.model = pick.model;
+            config.set_model(pick.model);
         } else if !auto_chain.is_empty() {
             println!(
                 "{}",
@@ -321,7 +321,7 @@ async fn main() -> Result<()> {
                             govinda_cli::render::dim_color()
                         )
                     );
-                    config.model = next;
+                    config.set_model(next);
                 } else {
                     eprintln!(
                         "{}",

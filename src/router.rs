@@ -23,16 +23,34 @@ pub const STRIKES_TO_QUARANTINE: u8 = 3;
 
 /// Categories of failure. Some kinds are recoverable on the same
 /// model (e.g. `RateLimit` after backoff), some are not
-/// (`BadModel`, `Auth`).
+/// (`BadModel`, `Auth`). `Busy` covers gateway capacity errors
+/// (`structure_limit`, `chat_admission_busy`, `overloaded`) that should
+/// back off on the same gateway before consuming a failover slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     Auth,
     RateLimit,
+    Busy,
     Server,
     Timeout,
     BadModel,
     Empty,
     Other,
+}
+
+impl FailureKind {
+    /// Whether this kind is worth retrying on the same model before failover.
+    pub fn is_retryable_on_same_model(self) -> bool {
+        matches!(
+            self,
+            FailureKind::RateLimit | FailureKind::Busy | FailureKind::Server | FailureKind::Timeout | FailureKind::Empty | FailureKind::Other
+        )
+    }
+
+    /// Whether failover should happen immediately even before 3 strikes.
+    pub fn should_promote_immediately(self) -> bool {
+        matches!(self, FailureKind::Auth | FailureKind::BadModel)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -278,6 +296,26 @@ impl Router {
             }
         }
         None
+    }
+
+    /// Returns true if model has enough strikes to warrant promotion.
+    /// `Auth`/`BadModel` promote immediately; others need 3 strikes.
+    pub fn should_promote(&self, model: &str, kind: FailureKind) -> bool {
+        if kind.should_promote_immediately() {
+            return true;
+        }
+        self.health
+            .get(model)
+            .map(|h| h.strikes >= STRIKES_TO_QUARANTINE)
+            .unwrap_or(false)
+    }
+
+    /// Number of non-quarantined candidates (including active).
+    pub fn healthy_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| !self.quarantined.contains(&e.model))
+            .count()
     }
 
     pub fn health(&self, model: &str) -> Option<&Health> {

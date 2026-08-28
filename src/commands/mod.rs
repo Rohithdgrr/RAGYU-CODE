@@ -736,7 +736,9 @@ async fn provider_dispatch(arg: &str, app: &mut App) -> Outcome {
     let key_env_lookup = |var: &str| std::env::var(var).ok();
     match crate::provider::resolve(name, base_url, None, key_env_lookup) {
         Ok(new_provider) => {
-            app.config.provider = new_provider;
+            app.config.adopt_provider(new_provider);
+            app.config.resync_context_tokens();
+            app.router.sync_active(&app.config.provider.key().to_string(), &app.config.model);
             // Cached model ids belong to the old backend.
             app.models_cache = None;
             ok(format!(
@@ -949,7 +951,7 @@ async fn interactive_provider_setup(
 
     // Auto-select first known model if available
     if let Some(first_model) = known_models.first() {
-        app.config.model = first_model.id.to_string();
+        app.config.set_model(first_model.id.to_string());
         ok(format!(
             "Auto-selected model: {} - {}",
             first_model.id, first_model.description

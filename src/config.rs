@@ -272,6 +272,27 @@ impl Config {
         self.provider = provider;
     }
 
+    /// Recomputes `context_tokens` from the current provider+model.
+    /// Call after any model/provider switch so `session::window_with`
+    /// uses a budget matching the active model's real window.
+    pub fn resync_context_tokens(&mut self) {
+        let win = provider::context_window_for(self.provider.key().as_ref(), &self.model);
+        if win > 0 {
+            self.context_tokens = win;
+        } else if self.context_tokens == 0 {
+            self.context_tokens = provider::DEFAULT_CONTEXT_TOKENS;
+        }
+        // If the caller had an explicit `context_tokens` in TOML we still
+        // honor it on the next explicit load; runtime resync prefers the
+        // model's true window so failover doesn't inherit a stale budget.
+    }
+
+    /// Sets the active model and resyncs the context budget atomically.
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.model = model.into();
+        self.resync_context_tokens();
+    }
+
     /// Reads and parses the TOML file. A missing file is normal (no config);
     /// a malformed one is a hard error so typos don't silently change behavior.
     fn read_config_file() -> Result<(FileConfig, Option<PathBuf>)> {

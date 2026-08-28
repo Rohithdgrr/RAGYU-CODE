@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 /// a smaller value in TOML to force aggressive history trimming.
 pub const DEFAULT_CONTEXT_TOKENS: usize = 128_000;
 const MIN_CONTEXT_TOKENS: usize = 256;
-const MAX_CONTEXT_TOKENS: usize = 1_000_000;
+const MAX_CONTEXT_TOKENS: usize = 1_048_576;
 
 /// Clamps a user-supplied context budget into the sane range.
 pub fn clamp_context_tokens(raw: Option<usize>) -> usize {
@@ -281,6 +281,17 @@ pub struct KnownModel {
     pub context_window: usize,
 }
 
+/// Normalizes dynamic provider keys (`opencode-<pid>`) to their registry family.
+/// `opencode-zen`, `opencode-nvidia`, etc. all map to `"opencode"` so
+/// `known_models` / `context_window_for` hit the static table.
+pub fn normalize_provider_key(provider: &str) -> &str {
+    if provider == "opencode" || provider.starts_with("opencode-") {
+        "opencode"
+    } else {
+        provider
+    }
+}
+
 /// Looks up the context window for a specific model on a given provider.
 /// Returns 0 when no metadata is available (caller should then use
 /// [`DEFAULT_CONTEXT_TOKENS`]).
@@ -290,6 +301,7 @@ pub struct KnownModel {
 /// OmniRoute combos are resolved via `OMNIROUTE_COMBOS` first so the
 /// combo table is the single source of truth for their windows.
 pub fn context_window_for(provider: &str, model: &str) -> usize {
+    let provider = normalize_provider_key(provider);
     let bare = model
         .rsplit_once('/')
         .map(|(_, tail)| tail)
@@ -313,6 +325,7 @@ pub fn context_window_for(provider: &str, model: &str) -> usize {
 /// prevent the silent `finish_reason: length` truncation that otherwise
 /// makes the model appear to "stop" mid-answer.
 pub fn max_output_for(provider: &str, model: &str) -> usize {
+    let provider = normalize_provider_key(provider);
     let bare = model
         .rsplit_once('/')
         .map(|(_, tail)| tail)

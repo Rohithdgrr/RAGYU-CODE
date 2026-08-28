@@ -185,7 +185,8 @@ pub(super) async fn set_model(name: &str, app: &mut App) {
     let requested = name.to_owned();
     match resolve_model(&requested, app).await {
         Ok(Some(full_name)) => {
-            app.config.model = full_name.clone();
+            app.config.set_model(full_name.clone());
+            app.router.sync_active(&app.config.provider.key().to_string(), &app.config.model);
             ok(format!("model set to {full_name}"));
         }
         Ok(None) => err(format!(
@@ -196,7 +197,8 @@ pub(super) async fn set_model(name: &str, app: &mut App) {
             dim(format!(
                 "could not verify against API ({e:#}) — setting anyway."
             ));
-            app.config.model = requested.clone();
+            app.config.set_model(requested.clone());
+            app.router.sync_active(&app.config.provider.key().to_string(), &app.config.model);
             ok(format!("model set to {requested}"));
         }
     }

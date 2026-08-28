@@ -318,6 +318,10 @@ fn resolve_endpoint(
         .or_else(|| auth_map.get(pid).cloned());
 
     if let Some(url) = explicit {
+        let local = url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost");
+        if auth.is_none() && !local {
+            return None;
+        }
         return Some((url, auth.unwrap_or(Auth::None)));
     }
     let endpoint = known_endpoint(pid)?;
@@ -352,6 +356,11 @@ pub(crate) fn parse_config_body(body: &Value, auth_map: &BTreeMap<String, Auth>)
                 .map(|k| Auth::Bearer(Zeroizing::new(k.trim().to_owned())))
                 .or_else(|| auth_map.get(pid).cloned())
                 .unwrap_or(Auth::None);
+            let local = base_url.starts_with("http://127.0.0.1")
+                || base_url.starts_with("http://localhost");
+            if matches!(auth, Auth::None) && !local {
+                continue;
+            }
             entries.push(OcEntry {
                 pid: pid.clone(),
                 base_url: base_url.to_owned(),
@@ -656,7 +665,7 @@ mod tests {
         let body = json!({
             "providers": [
                 { "id": "openai", "models": { "gpt-4o": {}, "gpt-4o-mini": {} },
-                  "options": { "baseURL": "https://api.openai.com/v1" } },
+                  "options": { "baseURL": "https://api.openai.com/v1", "apiKey": "sk-test" } },
                 { "id": "custom-local", "models": [{ "id": "qwen3" }],
                   "options": { "baseURL": "http://127.0.0.1:1337/v1" } },
                 { "id": "anthropic", "models": { "claude-x": {} } }

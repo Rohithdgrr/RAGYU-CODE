@@ -121,9 +121,12 @@ async fn reset_streak() {
 async fn soft_compact(app: &mut App, router: &Router) -> bool {
     let summarizer = router.next_summarizer().model.clone();
     let used_before = app.session.approx_tokens();
-    let original_model = std::mem::replace(&mut app.config.model, summarizer);
+    let original_model = std::mem::replace(&mut app.config.model, summarizer.clone());
+    let original_tokens = app.config.context_tokens;
+    app.config.resync_context_tokens();
     crate::commands::generation::compact(app).await;
     app.config.model = original_model;
+    app.config.context_tokens = original_tokens;
     let used_after = app.session.approx_tokens();
     if used_after < used_before {
         app.last_auto_compact_count = app.session.messages().len();

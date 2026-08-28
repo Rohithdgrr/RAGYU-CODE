@@ -156,16 +156,24 @@ pub async fn live_model_ids(http: &reqwest::Client, provider: &dyn Provider) -> 
     if let Some(t) = bearer {
         req = req.bearer_auth(t);
     }
-    let Ok(resp) = tokio::time::timeout(MODELS_TIMEOUT, req.send()).await else {
+    let resp = match tokio::time::timeout(MODELS_TIMEOUT, req.send()).await {
+        Ok(Ok(r)) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    // Parse in-line to avoid a second GET (old impl called list_models which re-fetched).
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(arr) = body.get("data").and_then(|d| d.as_array()) else {
         return Vec::new();
     };
-    let Ok(resp) = resp else { return Vec::new() };
-    if !resp.status().is_success() {
-        return Vec::new();
-    }
-    crate::api::list_models(http, &url, bearer)
-        .await
-        .unwrap_or_default()
+    let mut ids: Vec<String> = arr
+        .iter()
+        .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned()))
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// Filters a static preference list against the live `/v1/models` list.
